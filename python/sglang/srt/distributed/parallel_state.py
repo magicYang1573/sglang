@@ -219,12 +219,14 @@ class GroupCoordinator:
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
+        # use_cxl_shm_communicator: bool,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         pynccl_use_current_stream: bool = False,
         torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
+        use_cxl_shm_communicator = True
         # Set group info
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -279,6 +281,7 @@ class GroupCoordinator:
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
+        self.use_cxl_shm_communicator = use_cxl_shm_communicator
         self.use_message_queue_broadcaster = use_message_queue_broadcaster
 
         # Lazy import to avoid documentation build error
@@ -297,6 +300,9 @@ class GroupCoordinator:
         )
         from sglang.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator,
+        )
+        from sglang.srt.distributed.device_communicators.cxl_shm_communicator import (
+            CxlShmCommunicator,
         )
 
         self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
@@ -382,6 +388,18 @@ class GroupCoordinator:
         self.npu_communicator: Optional[NpuCommunicator] = None
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
+
+        self.cxl_shm_communicator: Optional[CxlShmCommunicator] = None
+        if use_cxl_shm_communicator and self.world_size > 1:
+            try:
+                self.cxl_shm_communicator = CxlShmCommunicator(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize CXL shared-memory communicator: %s", e
+                )
 
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
@@ -548,6 +566,9 @@ class GroupCoordinator:
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
+
+        if self.cxl_shm_communicator is not None and not self.cxl_shm_communicator.disabled:
+            return self.cxl_shm_communicator.all_reduce(input_)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
             return self.xpu_communicator.all_reduce(input_)
@@ -1304,7 +1325,10 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
+    use_cxl_shm_communicator: bool = False,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1317,6 +1341,7 @@ def init_world_group(
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
+        # use_cxl_shm_communicator=use_cxl_shm_communicator,
         group_name="world",
     )
 
@@ -1331,6 +1356,7 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     pynccl_use_current_stream: bool = True,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
+    use_cxl_shm_communicator: Optional[bool] = None,
     torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
@@ -1339,6 +1365,10 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if use_cxl_shm_communicator is None:
+        use_cxl_shm_communicator = get_bool_env_var(
+            "SGLANG_USE_CXL_SHM_COMMUNICATOR", "false"
+        )
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1350,6 +1380,7 @@ def init_model_parallel_group(
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
+        # use_cxl_shm_communicator=use_cxl_shm_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         pynccl_use_current_stream=pynccl_use_current_stream,
