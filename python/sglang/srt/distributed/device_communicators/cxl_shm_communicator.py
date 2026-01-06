@@ -1,177 +1,204 @@
-import ctypes
+"""CXL shared-memory all-reduce communicator.
+
+This module mirrors the CXL helper in mry/cxl_shm_test/pytorch_cxl_test and
+implements a simple TP-style all-reduce:
+
+1) Each rank writes its input shards into a shared CXL pool.
+2) Every rank pulls the shard assigned to it from all peers and sums locally.
+3) Reduced shards are written back to the pool.
+4) Ranks gather the reduced shards to materialize the full tensor.
+
+Synchronization across ranks is handled via a small control block placed at
+the front of the mapped CXL window. The control block stores per-rank stage
+tokens that are polled to form barriers between pipeline stages.
+"""
+
 import logging
-import math
-import mmap
 import os
-from typing import Optional
+import time
+from pathlib import Path
+from typing import Dict, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.utils import is_cuda
+
+
 logger = logging.getLogger(__name__)
 
 
+def _align_up(val: int, align: int) -> int:
+    return ((val + align - 1) // align) * align
+
+
+def _load_cxl_extension() -> object:
+    """Load or build the cxl_mem_ext extension."""
+
+    src_root = (
+        Path("/root/mry/cxl_shm_test/pytorch_cxl_test")
+    )
+    if not src_root.exists():
+        raise ImportError(
+            "cxl_mem_ext is not installed and sources were not found at "
+            f"{src_root}. Set PYTHONPATH to an existing build or install the "
+            "extension manually."
+        )
+
+    try:
+        from torch.utils.cpp_extension import load
+    except Exception as exc:  # pragma: no cover - torch build path
+        raise ImportError("torch.utils.cpp_extension.load is unavailable") from exc
+
+    build_dir = src_root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    return load(
+        name="cxl_mem_ext",
+        sources=[str(src_root / "cxl_mem.cpp"), str(src_root / "cxl_mem_pybind.cpp")],
+        extra_cflags=["-O3", "-std=c++17", "-mclflushopt"],
+        extra_cuda_cflags=["-O3", "-std=c++17"],
+        build_directory=str(build_dir),
+        verbose=False,
+    )
+
+
 class CxlShmCommunicator:
-    """
-    A minimal shared-memory all-reduce over a CXL-backed /dev/dax mapping.
+    """All-reduce over a shared CXL window."""
 
-    The communicator keeps a per-rank slot inside a single mmap region:
-    [control_bytes][slot0][slot1]...[slotN-1]
-
-    Algorithm (host-side reduction):
-    1) Every rank copies its tensor bytes into its slot and flushes.
-    2) Barrier.
-    3) Rank 0 sums all slots into slot0.
-    4) Barrier.
-    5) All ranks read slot0 and copy back to their tensor (CPU or staged GPU).
-    """
+    _ALIGN = 256
 
     def __init__(
         self,
         group: ProcessGroup,
         device: torch.device,
-        dax_path: Optional[str] = None,
-        map_bytes: Optional[int] = None,
-        slot_bytes: Optional[int] = None,
-        ctrl_bytes: Optional[int] = None,
-        offset_bytes: int = 0,
-        barrier_timeout_s: Optional[float] = None,
+        dev_path: str | None = None,
+        map_bytes: int | None = None,
+        map_offset: int | None = None,
+        control_bytes: int | None = None,
+        barrier_sleep: float | None = None,
     ):
+        self.disabled = True
         self.group = group
-        self.device = device
-        self.world_size = dist.get_world_size(group)
-        self.rank = dist.get_rank(group)
+        self.world_size = dist.get_world_size(self.group)
+        self.rank = dist.get_rank(self.group)
+        self.device = torch.device(device)
+
+        if is_cuda():
+            torch.cuda.set_device(self.device)
+
+        try:
+            self.ext = _load_cxl_extension()
+        except Exception as exc:
+            logger.warning("CXL extension unavailable: %s", exc)
+            return
+
+        self.dev_path = dev_path if dev_path is not None else "/dev/dax0.0"
+        self.map_bytes = map_bytes if map_bytes is not None else 16 * 1024 * 1024 * 1024
+        self.map_offset = map_offset if map_offset is not None else 0
+        self.control_bytes = control_bytes if control_bytes is not None else 4096
+        self.barrier_sleep = barrier_sleep if barrier_sleep is not None else 1e-6
+
+        self.control_offset = 0
+        self.data_offset = _align_up(self.control_bytes, self._ALIGN)
+        self.stage_token = 1
+
+        ok = self.ext.cxl_init(
+            dev_path=self.dev_path,
+            map_bytes=self.map_bytes,
+            offset=self.map_offset,
+            register_cuda=bool(is_cuda()),
+            gpu_id=self.device.index,
+        )
+        if not ok:
+            logger.warning("cxl_init failed for %s", self.dev_path)
+            return
+
+        ctrl_init = torch.zeros(self.world_size, dtype=torch.int32, device="cpu")
+        self.ext.tensor_to_cxl(ctrl_init, offset=self.control_offset)
+
+        self._ctrl_readback = torch.empty(
+            self.world_size, dtype=torch.int32, device="cpu"
+        )
+        self._buffer_cache: Dict[Tuple[int, int, torch.dtype], torch.Tensor] = {}
+        self._reduced_cache: Dict[Tuple[int, int, torch.dtype], torch.Tensor] = {}
         self.disabled = False
 
-        if self.world_size <= 1:
-            self.disabled = True
-            return
-
-        dax_path = dax_path or os.environ.get("SGLANG_CXL_DAX_PATH", "/dev/dax0.0")
-        map_bytes = map_bytes or int(
-            os.environ.get("SGLANG_CXL_MAP_BYTES", str(512 * 1024 * 1024))
-        )
-        slot_bytes = slot_bytes or int(
-            os.environ.get("SGLANG_CXL_SLOT_BYTES", str(64 * 1024 * 1024))
-        )
-        ctrl_bytes = ctrl_bytes or int(
-            os.environ.get("SGLANG_CXL_CTRL_BYTES", str(4096 * 4))
-        )
-        self.slot_bytes = slot_bytes
-        self.ctrl_bytes = ctrl_bytes
-        self.barrier_timeout_s = barrier_timeout_s
-
-        required = ctrl_bytes + slot_bytes * self.world_size
-        if map_bytes < required:
-            raise ValueError(
-                f"map_bytes={map_bytes} is smaller than required {required} "
-                f"(ctrl={ctrl_bytes}, slot={slot_bytes}, world={self.world_size})"
-            )
-
-        fd = os.open(dax_path, os.O_RDWR | os.O_SYNC)
-        try:
-            self._mm = mmap.mmap(
-                fd,
-                length=map_bytes,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-                offset=offset_bytes,
-            )
-        except Exception:
-            os.close(fd)
-            raise
-        self._fd = fd
-        self._map_bytes = map_bytes
-
-        # libc.msync for best-effort cache flush (alignment handled internally).
-        self._libc = ctypes.CDLL(None)
-        self._msync = getattr(self._libc, "msync", None)
-        self._pagesize = os.sysconf("SC_PAGESIZE")
-
-        logger.info(
-            "[CXL SHM] mmap path=%s size=%s slot_bytes=%s ctrl_bytes=%s world=%s rank=%s",
-            dax_path,
-            map_bytes,
-            slot_bytes,
-            ctrl_bytes,
-            self.world_size,
-            self.rank,
-        )
-
-    def __del__(self):
-        try:
-            if hasattr(self, "_mm"):
-                self._mm.close()
-        finally:
-            if hasattr(self, "_fd"):
-                os.close(self._fd)
-
-    def _flush_range(self, start: int, length: int):
-        if self._msync is None:
-            return
-        # Align to page boundaries for msync.
-        page_start = (start // self._pagesize) * self._pagesize
-        page_end = math.ceil((start + length) / self._pagesize) * self._pagesize
-        self._msync(
-            ctypes.c_void_p(ctypes.addressof(ctypes.c_char.from_buffer(self._mm, page_start))),
-            ctypes.c_size_t(page_end - page_start),
-            ctypes.c_int(0x4),  # MS_SYNC
-        )
-
-    def _get_slot_bounds(self, rank: int, num_bytes: int):
-        start = self.ctrl_bytes + rank * self.slot_bytes
-        end = start + num_bytes
-        if end > self._map_bytes:
-            raise ValueError("slot write exceeds mmap size")
-        return start, end
-
-    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         if self.disabled:
-            return tensor
-        if tensor.numel() == 0:
-            return tensor
+            return inp
+        if not torch.cuda.is_current_stream_capturing():
+            print("[input] rank", self.rank, inp.sum(), inp.shape)
+        flat_inp = inp.contiguous()
+        total_ele_num = flat_inp.numel()
+        if total_ele_num % self.world_size != 0:
+            logger.warning(
+                "Last dimension (%d) must be divisible by world size (%d); falling back",
+                total_ele_num,
+                self.world_size,
+            )
+            dist.all_reduce(flat_inp, group=dist.group.WORLD)
+            return flat_inp
 
-        # Move to host if needed.
-        if tensor.is_cpu:
-            host_tensor = tensor.contiguous()
-        else:
-            host_tensor = tensor.detach().to("cpu", non_blocking=False).contiguous()
+        shard_h = total_ele_num // self.world_size
+        shard_bytes = shard_h * flat_inp.element_size()
+        slot_bytes = flat_inp.numel() * flat_inp.element_size()
+        reduced_base = self.data_offset + self.world_size * slot_bytes
+        required_bytes = reduced_base + self.world_size * shard_bytes
+        if required_bytes > self.map_bytes:
+            logger.warning(
+                "CXL window too small (need %d bytes, have %d); falling back",
+                required_bytes,
+                self.map_bytes,
+            )
+            dist.all_reduce(flat_inp, group=dist.group.WORLD)
+            return flat_inp
 
-        flat = host_tensor.view(-1)
-        num_bytes = flat.numel() * flat.element_size()
-        if num_bytes > self.slot_bytes:
-            raise ValueError(
-                f"Tensor bytes {num_bytes} exceed CXL slot_bytes={self.slot_bytes}"
+        self.ext.tensor_to_cxl(
+            flat_inp, offset=self.data_offset + self.rank * slot_bytes
+        )
+        self._barrier()
+        print(f"a> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+
+        gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
+        for src in range(self.world_size):
+            shard_offset = self.rank * shard_bytes
+            gather[src] = self.ext.cxl_to_tensor(
+                gather[src],
+                offset=self.data_offset + src * slot_bytes + shard_offset,
             )
 
-        slot_start, slot_end = self._get_slot_bounds(self.rank, num_bytes)
-        mv = memoryview(self._mm)
-        mv[slot_start:slot_end] = flat.view(torch.uint16).numpy().tobytes()
-        self._flush_range(slot_start, num_bytes)
+        reduced_shard = gather.sum(dim=0)
+        self.ext.tensor_to_cxl(
+            reduced_shard, offset=reduced_base + self.rank * shard_bytes
+        )
+        self._barrier()
+        print(f"b> Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
 
-        dist.barrier(self.group, timeout=self.barrier_timeout_s)
+        reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
+        reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
 
-        if self.rank == 0:
-            agg = torch.zeros_like(flat)
-            for r in range(self.world_size):
-                r_start, r_end = self._get_slot_bounds(r, num_bytes)
-                buf = mv[r_start:r_end]
-                tmp = torch.frombuffer(buf, dtype=flat.dtype, count=flat.numel())
-                agg += tmp
-            # Write result into slot0 for everyone to read.
-            mv[self.ctrl_bytes : self.ctrl_bytes + num_bytes] = agg.numpy().tobytes()
-            self._flush_range(self.ctrl_bytes, num_bytes)
+        self._barrier()
+        print(f"c> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        print(reduce_res.shape, inp.shape)
 
-        dist.barrier(self.group, timeout=self.barrier_timeout_s)
+        ret = reduce_res.view_as(inp)
+        if not torch.cuda.is_current_stream_capturing():
+            print("[sum] rank", self.rank, ret.sum(), ret.shape)
+        return ret
 
-        # Read slot0 result.
-        res_buf = mv[self.ctrl_bytes : self.ctrl_bytes + num_bytes]
-        res_flat = torch.frombuffer(res_buf, dtype=flat.dtype, count=flat.numel()).clone()
-        res = res_flat.view(host_tensor.shape)
+    def _barrier(self):
+        token = self.stage_token
+        self.stage_token += 1
+        token_tensor = torch.tensor([token], dtype=torch.int32, device="cpu")
+        self.ext.tensor_to_cxl(
+            token_tensor, offset=self.control_offset + self.rank * token_tensor.element_size()
+        )
 
-        if tensor.is_cpu:
-            tensor.copy_(res)
-            return tensor
-        tensor.copy_(res.to(tensor.device))
-        return tensor
+        while True:
+            self._ctrl_readback = self.ext.cxl_to_tensor(self._ctrl_readback, offset=self.control_offset)
+            if torch.all(self._ctrl_readback >= token):
+                break
+            time.sleep(self.barrier_sleep)
+

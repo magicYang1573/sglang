@@ -63,6 +63,7 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+TP_USE_CXL_SHM_COMMUNICATOR = True
 
 @dataclass
 class GraphCaptureContext:
@@ -219,14 +220,13 @@ class GroupCoordinator:
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
-        # use_cxl_shm_communicator: bool,
+        use_cxl_shm_communicator: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         pynccl_use_current_stream: bool = False,
         torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
-        use_cxl_shm_communicator = True
         # Set group info
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -519,6 +519,9 @@ class GroupCoordinator:
                 yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        print("=============================")
+        # if not torch.cuda.is_current_stream_capturing():
+        #     print("[input] rank", self.rank, input_)
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
@@ -533,6 +536,7 @@ class GroupCoordinator:
         a new tensor in the same op. So we need to figure out if the op is
         in-place or out-of-place ahead of time.
         """
+        # print("all_reduce tensor:", input_.shape, input_.device, input_.dtype)
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
@@ -609,11 +613,14 @@ class GroupCoordinator:
         ):
             outplace_all_reduce_method = "torch_symm_mem"
         if outplace_all_reduce_method is not None:
-            return outplace_all_reduce(
+            ret = outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
+            if not torch.cuda.is_current_stream_capturing():
+                print("[sum] rank", self.rank, ret)
+            return ret
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
@@ -1328,7 +1335,6 @@ def init_world_group(
     ranks: List[int],
     local_rank: int,
     backend: str,
-    use_cxl_shm_communicator: bool = False,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1341,7 +1347,6 @@ def init_world_group(
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
-        # use_cxl_shm_communicator=use_cxl_shm_communicator,
         group_name="world",
     )
 
@@ -1356,7 +1361,7 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     pynccl_use_current_stream: bool = True,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
-    use_cxl_shm_communicator: Optional[bool] = None,
+    use_cxl_shm_communicator: bool = False,
     torch_compile: Optional[bool] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
@@ -1365,10 +1370,7 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
-    if use_cxl_shm_communicator is None:
-        use_cxl_shm_communicator = get_bool_env_var(
-            "SGLANG_USE_CXL_SHM_COMMUNICATOR", "false"
-        )
+
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1380,7 +1382,7 @@ def init_model_parallel_group(
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
-        # use_cxl_shm_communicator=use_cxl_shm_communicator,
+        use_cxl_shm_communicator=use_cxl_shm_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         pynccl_use_current_stream=pynccl_use_current_stream,
@@ -1613,6 +1615,7 @@ def initialize_model_parallel(
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
         torch_compile=torch_compile,
+        use_cxl_shm_communicator=TP_USE_CXL_SHM_COMMUNICATOR,
     )
 
     if duplicate_tp_group:

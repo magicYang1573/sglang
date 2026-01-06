@@ -703,6 +703,8 @@ void transfer_kv_all_layer_direct_lf_pf(
  */
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
 void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
+void cxl_mem_write(const at::Tensor& host_src, int64_t cxl_offset_bytes);
+void cxl_mem_read(at::Tensor& host_dst, int64_t cxl_offset_bytes);
 
 /*
  * From FlashInfer
