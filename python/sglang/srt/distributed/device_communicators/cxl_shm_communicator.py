@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
+# torch.set_printoptions(profile="full")
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
@@ -125,11 +126,15 @@ class CxlShmCommunicator:
         self._reduced_cache: Dict[Tuple[int, int, torch.dtype], torch.Tensor] = {}
         self.disabled = False
 
+        self.all_reduce_num = 0
+
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         if self.disabled:
             return inp
-        if not torch.cuda.is_current_stream_capturing():
-            print("[input] rank", self.rank, inp.sum(), inp.shape)
+        if torch.cuda.is_current_stream_capturing():
+            return torch.zeros_like(inp)
+        # if not torch.cuda.is_current_stream_capturing():
+        #     print(f"[cxl input {self.all_reduce_num}] rank {self.rank}", inp, flush=True)
         flat_inp = inp.contiguous()
         total_ele_num = flat_inp.numel()
         if total_ele_num % self.world_size != 0:
@@ -159,7 +164,7 @@ class CxlShmCommunicator:
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
         self._barrier()
-        print(f"a> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        # print(f"a> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
         for src in range(self.world_size):
@@ -174,18 +179,19 @@ class CxlShmCommunicator:
             reduced_shard, offset=reduced_base + self.rank * shard_bytes
         )
         self._barrier()
-        print(f"b> Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
+        # print(f"b> Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
 
         reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
 
         self._barrier()
-        print(f"c> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
-        print(reduce_res.shape, inp.shape)
+        # print(f"c> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        # print(reduce_res.shape, inp.shape)
 
-        ret = reduce_res.view_as(inp)
-        if not torch.cuda.is_current_stream_capturing():
-            print("[sum] rank", self.rank, ret.sum(), ret.shape)
+        ret = reduce_res.view_as(inp).clone()
+        # if not torch.cuda.is_current_stream_capturing():
+        #     print(f"[cxl sum {self.all_reduce_num}] rank {self.rank}", inp, flush=True)
+        self.all_reduce_num += 1
         return ret
 
     def _barrier(self):

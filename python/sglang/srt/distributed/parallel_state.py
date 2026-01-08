@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 
 import torch
+# torch.set_printoptions(profile="full")
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
@@ -227,6 +228,8 @@ class GroupCoordinator:
         torch_compile: Optional[bool] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
     ):
+        # print("+++++++++++++++++++++=========")
+        # print( f"\ngroup_ranks={group_ranks}, \nlocal_rank={local_rank}, \ntorch_distributed_backend={torch_distributed_backend}, \nuse_pynccl={use_pynccl}, \nuse_pymscclpp={use_pymscclpp}, \nuse_custom_allreduce={use_custom_allreduce}, \nuse_torch_symm_mem_all_reduce={use_torch_symm_mem_all_reduce}, \nuse_hpu_communicator={use_hpu_communicator}, \nuse_xpu_communicator={use_xpu_communicator}, \nuse_npu_communicator={use_npu_communicator}, \nuse_cxl_shm_communicator={use_cxl_shm_communicator}, \nuse_message_queue_broadcaster={use_message_queue_broadcaster}, \ngroup_name={group_name}, \npynccl_use_current_stream={pynccl_use_current_stream}, \ntorch_compile={torch_compile}, \ngloo_timeout={gloo_timeout}")
         # Set group info
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -412,6 +415,8 @@ class GroupCoordinator:
                 self.cpu_group, 1 << 22, 6
             )
 
+        self.all_reduce_num = 0
+
     def __repr__(self):
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
@@ -519,9 +524,10 @@ class GroupCoordinator:
                 yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        print("=============================")
-        # if not torch.cuda.is_current_stream_capturing():
-        #     print("[input] rank", self.rank, input_)
+        # why with this print, the result is correct? but without it, the result is wrong?
+        if not torch.cuda.is_current_stream_capturing():
+            print(f"[input {self.all_reduce_num}] rank {self.rank}", input_, flush=True)        
+  
         """
         User-facing all-reduce function before we actually call the
         all-reduce operation.
@@ -568,11 +574,13 @@ class GroupCoordinator:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
 
+        if self.cxl_shm_communicator is not None and not self.cxl_shm_communicator.disabled:
+            # print("Using CXL SHM communicator for all-reduce", flush=True)
+            # output_cxl = self.cxl_shm_communicator.all_reduce(input_)
+            return self.cxl_shm_communicator.all_reduce(input_)
+        
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
-
-        if self.cxl_shm_communicator is not None and not self.cxl_shm_communicator.disabled:
-            return self.cxl_shm_communicator.all_reduce(input_)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
             return self.xpu_communicator.all_reduce(input_)
@@ -618,9 +626,21 @@ class GroupCoordinator:
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
-            if not torch.cuda.is_current_stream_capturing():
-                print("[sum] rank", self.rank, ret)
-            return ret
+            # print("normal all-reduce used method:", outplace_all_reduce_method, flush=True)
+            # if not torch.cuda.is_current_stream_capturing():
+            #     print(f"[sum {self.all_reduce_num}] rank {self.rank}", ret, ret.shape,flush=True)
+            #     print(f"[cxl sum {self.all_reduce_num}] rank {self.rank}", output_cxl, output_cxl.shape, flush=True)
+            # diff = output_cxl - ret
+            # if not torch.cuda.is_current_stream_capturing():
+            #     max_err = diff.abs().max().item()
+            #     print(f"最大绝对偏差 (Max Abs Diff): {max_err}", flush=True)
+            #     if max_err > 0.0001:
+            #         print(f"[sum {self.all_reduce_num}] rank {self.rank} ERROR!!!!!!!!!!!!!: {max_err}", flush=True)
+            #         # exit(111)
+            # self.all_reduce_num += 1
+
+            # return output_cxl # if return output_cxl then failed inference result
+            return ret  # correct result
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
