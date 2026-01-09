@@ -64,7 +64,9 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
-TP_USE_CXL_SHM_COMMUNICATOR = True
+# TP_USE_CXL_SHM_COMMUNICATOR = True
+TP_USE_CXL_SHM_COMMUNICATOR = False
+
 
 @dataclass
 class GraphCaptureContext:
@@ -525,8 +527,8 @@ class GroupCoordinator:
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         # why with this print, the result is correct? but without it, the result is wrong?
-        if not torch.cuda.is_current_stream_capturing():
-            print(f"[input {self.all_reduce_num}] rank {self.rank}", input_, flush=True)        
+        # if not torch.cuda.is_current_stream_capturing():
+        # print(f"[input {self.all_reduce_num}] rank {self.rank}", input_, flush=True)        
   
         """
         User-facing all-reduce function before we actually call the

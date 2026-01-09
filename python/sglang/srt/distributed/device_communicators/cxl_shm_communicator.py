@@ -62,6 +62,7 @@ def _load_cxl_extension() -> object:
         extra_cuda_cflags=["-O3", "-std=c++17"],
         build_directory=str(build_dir),
         verbose=False,
+        with_cuda=True
     )
 
 
@@ -117,6 +118,7 @@ class CxlShmCommunicator:
             return
 
         ctrl_init = torch.zeros(self.world_size, dtype=torch.int32, device="cpu")
+        
         self.ext.tensor_to_cxl(ctrl_init, offset=self.control_offset)
 
         self._ctrl_readback = torch.empty(
@@ -131,10 +133,7 @@ class CxlShmCommunicator:
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         if self.disabled:
             return inp
-        if torch.cuda.is_current_stream_capturing():
-            return torch.zeros_like(inp)
-        # if not torch.cuda.is_current_stream_capturing():
-        #     print(f"[cxl input {self.all_reduce_num}] rank {self.rank}", inp, flush=True)
+
         flat_inp = inp.contiguous()
         total_ele_num = flat_inp.numel()
         if total_ele_num % self.world_size != 0:
@@ -159,7 +158,7 @@ class CxlShmCommunicator:
             )
             dist.all_reduce(flat_inp, group=dist.group.WORLD)
             return flat_inp
-
+        # torch.cuda.synchronize(self.device)
         self.ext.tensor_to_cxl(
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
@@ -175,6 +174,7 @@ class CxlShmCommunicator:
             )
 
         reduced_shard = gather.sum(dim=0)
+        # torch.cuda.synchronize(self.device)
         self.ext.tensor_to_cxl(
             reduced_shard, offset=reduced_base + self.rank * shard_bytes
         )
@@ -188,16 +188,18 @@ class CxlShmCommunicator:
         # print(f"c> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
         # print(reduce_res.shape, inp.shape)
 
-        ret = reduce_res.view_as(inp).clone()
+        ret = reduce_res.view_as(inp)
         # if not torch.cuda.is_current_stream_capturing():
         #     print(f"[cxl sum {self.all_reduce_num}] rank {self.rank}", inp, flush=True)
         self.all_reduce_num += 1
+
         return ret
 
     def _barrier(self):
         token = self.stage_token
         self.stage_token += 1
         token_tensor = torch.tensor([token], dtype=torch.int32, device="cpu")
+        # torch.cuda.synchronize(self.device)
         self.ext.tensor_to_cxl(
             token_tensor, offset=self.control_offset + self.rank * token_tensor.element_size()
         )
