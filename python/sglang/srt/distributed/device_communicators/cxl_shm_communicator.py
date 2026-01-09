@@ -38,7 +38,7 @@ def _load_cxl_extension() -> object:
     """Load or build the cxl_mem_ext extension."""
 
     src_root = (
-        Path("/root/mry/cxl_shm_test/pytorch_cxl_test")
+        Path("/root/mry/sglang/cxl_shm_test/pytorch_cxl_test")
     )
     if not src_root.exists():
         raise ImportError(
