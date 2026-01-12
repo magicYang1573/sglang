@@ -319,15 +319,22 @@ class CxlShmCommunicator:
     def _barrier(self):
         token = self.stage_token
         self.stage_token += 1
-        token_tensor = torch.tensor([token], dtype=torch.int32, device="cpu")
-        
-        self.ext.tensor_to_cxl(
-            token_tensor, offset=self.control_offset + self.rank * token_tensor.element_size()
+        self.ext.cxl_barrier_tp(
+            token,
+            control_offset=self.control_offset,
+            rank=self.rank,
+            num_ranks=self.world_size,
         )
 
-        while True:
-            self._ctrl_readback = self.ext.cxl_to_tensor(self._ctrl_readback, offset=self.control_offset)
-            if torch.all(self._ctrl_readback >= token):
-                break
-            time.sleep(self.barrier_sleep)
+        # token_tensor = torch.tensor([token], dtype=torch.int32, device="cpu")
+        
+        # self.ext.tensor_to_cxl(
+        #     token_tensor, offset=self.control_offset + self.rank * token_tensor.element_size()
+        # )
+
+        # while True:
+        #     self._ctrl_readback = self.ext.cxl_to_tensor(self._ctrl_readback, offset=self.control_offset)
+        #     if torch.all(self._ctrl_readback >= token):
+        #         break
+        #     time.sleep(self.barrier_sleep)
 

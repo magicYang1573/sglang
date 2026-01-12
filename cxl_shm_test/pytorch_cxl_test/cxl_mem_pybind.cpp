@@ -49,6 +49,7 @@ torch::Tensor cxl_to_tensor(torch::Tensor dst, std::size_t offset) {
     return dst;
 }
 
+
 PYBIND11_MODULE(cxl_mem_ext, m) {
     m.doc() = "PyTorch bindings for CXL shared memory helpers";
 
@@ -74,6 +75,14 @@ PYBIND11_MODULE(cxl_mem_ext, m) {
           pybind11::arg("tensor"),
           pybind11::arg("offset") = 0,
           "Fill a tensor (CPU or CUDA) from the mapped CXL window at the given offset.");
+
+    m.def("cxl_barrier_tp",
+          &cxl_barrier_tp,
+          pybind11::arg("token"),
+          pybind11::arg("control_offset"),
+          pybind11::arg("rank"),
+          pybind11::arg("num_ranks"),
+          "CXL barrier for tensor parallelism.");
 }
 
 }  // namespace

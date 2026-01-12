@@ -218,3 +218,30 @@ bool cxl_close() {
 	return true;
 }
 
+void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ranks) {
+    if (!g_cxl.base) {
+        throw std::runtime_error("CXL not initialized. Call cxl_init first.");
+    }
+
+    // 1. 计算当前 rank 写入的位置并写入 token
+    // 使用 volatile 确保编译器不会优化掉这次内存写入
+    volatile int32_t* control_ptr = (volatile int32_t*)((char*)g_cxl.base + control_offset);
+    control_ptr[rank] = token;
+
+    // 2. 自旋等待所有 rank 到达
+    bool all_ready = false;
+    while (!all_ready) {
+        all_ready = true;
+        for (int i = 0; i < num_ranks; i++) {
+            if (control_ptr[i] < token) {
+                all_ready = false;
+                break;
+            }
+        }
+        
+        if (!all_ready) {
+            // 自旋锁核心指令：提示 CPU 这是一个忙等待循环，降低功耗并加速退出循环
+            _mm_pause(); 
+        }
+    }
+}
