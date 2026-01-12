@@ -133,7 +133,7 @@ class CxlShmCommunicator:
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         if self.disabled:
             return inp
-        print(f"Rank {self.rank} entering all_reduce #{self.all_reduce_num}")
+        # print(f"Rank {self.rank} entering all_reduce #{self.all_reduce_num}")
         flat_inp = inp.contiguous()
         total_ele_num = flat_inp.numel()
         if total_ele_num % self.world_size != 0:
@@ -163,7 +163,7 @@ class CxlShmCommunicator:
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
         self._barrier()
-        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
         for src in range(self.world_size):
@@ -179,13 +179,13 @@ class CxlShmCommunicator:
             reduced_shard, offset=reduced_base + self.rank * shard_bytes
         )
         self._barrier()
-        print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
+        # print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
 
         reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
 
         self._barrier()
-        print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        # print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         ret = reduce_res.view_as(inp)
         self.all_reduce_num += 1
