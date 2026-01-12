@@ -100,7 +100,7 @@ class CxlShmCommunicator:
         self.map_bytes = map_bytes if map_bytes is not None else 16 * 1024 * 1024 * 1024
         self.map_offset = map_offset if map_offset is not None else 0
         self.control_bytes = control_bytes if control_bytes is not None else 4096
-        self.barrier_sleep = barrier_sleep if barrier_sleep is not None else 1e-7
+        self.barrier_sleep = barrier_sleep if barrier_sleep is not None else 1e-8
 
         self.control_offset = 0
         self.data_offset = _align_up(self.control_bytes, self._ALIGN)
@@ -137,6 +137,7 @@ class CxlShmCommunicator:
 
         flat_inp = inp.contiguous()
         total_bytes = flat_inp.numel() * flat_inp.element_size()
+        
 
         # the same strategy as custom_all_reduce
         use_one_stage = False
@@ -147,12 +148,19 @@ class CxlShmCommunicator:
         elif self.world_size == 8 and total_bytes < 256 * 1024:
             use_one_stage = True
 
+        # print(inp.shape, total_bytes)
+        # if use_one_stage:
+        #     print(f"Rank {self.rank} using 1-stage all-reduce for all_reduce #{self.all_reduce_num}")
+        # else:
+        #     print(f"Rank {self.rank} using 2-stage all-reduce for all_reduce #{self.all_reduce_num}")
+
         if use_one_stage:
             return self.all_reduce_1_stage(flat_inp)
         return self.all_reduce_2_stage(flat_inp)
 
     def all_reduce_1_stage(self, inp: torch.Tensor) -> torch.Tensor:
 
+        
         flat_inp = inp.contiguous()
         slot_bytes = flat_inp.numel() * flat_inp.element_size()
         required_bytes = self.data_offset + self.world_size * slot_bytes
@@ -165,23 +173,49 @@ class CxlShmCommunicator:
             dist.all_reduce(flat_inp, group=self.group)
             return flat_inp
 
+        t0 = time.perf_counter()
         self.ext.tensor_to_cxl(
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
+        t_write = time.perf_counter()
         self._barrier()
+        t_barrier1 = time.perf_counter()
 
         gather = torch.empty(
             (self.world_size, flat_inp.numel()),
             dtype=flat_inp.dtype,
             device=self.device,
         )
+        gather[self.rank] = inp.view(-1)
         for src in range(self.world_size):
+            if src == self.rank:
+                continue
             gather[src] = self.ext.cxl_to_tensor(
                 gather[src], offset=self.data_offset + src * slot_bytes
             )
+        t_read = time.perf_counter()
 
         reduced = gather.sum(dim=0)
-        self._barrier()
+        t_reduce = time.perf_counter()
+
+        total = t_reduce - t0
+        other = total - (
+            (t_write - t0)
+            + (t_barrier1 - t_write)
+            + (t_read - t_barrier1)
+            + (t_reduce - t_read)
+        )
+        logger.info(
+            "[%d] Rank %d AR1 timing (us): write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
+            self.all_reduce_num,
+            self.rank,
+            (t_write - t0) * 1e6,
+            (t_barrier1 - t_write) * 1e6,
+            (t_read - t_barrier1) * 1e6,
+            (t_reduce - t_read) * 1e6,
+            other * 1e6,
+            total * 1e6,
+        )
 
         self.all_reduce_num += 1
         return reduced.view_as(inp)
@@ -214,10 +248,13 @@ class CxlShmCommunicator:
             dist.all_reduce(flat_inp, group=dist.group.WORLD)
             return flat_inp
 
+        t0 = time.perf_counter()
         self.ext.tensor_to_cxl(
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
+        t_write = time.perf_counter()
         self._barrier()
+        t_barrier1 = time.perf_counter()
         # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
@@ -227,20 +264,52 @@ class CxlShmCommunicator:
                 gather[src],
                 offset=self.data_offset + src * slot_bytes + shard_offset,
             )
+        t_read = time.perf_counter()
 
         reduced_shard = gather.sum(dim=0)
+        t_reduce = time.perf_counter()
 
         self.ext.tensor_to_cxl(
             reduced_shard, offset=reduced_base + self.rank * shard_bytes
         )
+        t_write_reduce = time.perf_counter()
         self._barrier()
+        t_barrier2 = time.perf_counter()
         # print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
 
         reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
+        t_read_reduce = time.perf_counter()
 
         self._barrier()
+        t_barrier3 = time.perf_counter()
         # print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+
+        total = t_barrier3 - t0
+        other = total - (
+            (t_write - t0)
+            + (t_barrier1 - t_write)
+            + (t_read - t_barrier1)
+            + (t_reduce - t_read)
+            + (t_write_reduce - t_reduce)
+            + (t_barrier2 - t_write_reduce)
+            + (t_read_reduce - t_barrier2)
+            + (t_barrier3 - t_read_reduce)
+        )
+        logger.info(
+            "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f barrier3=%.1f other=%.1f total=%.1f",
+            self.rank,
+            (t_write - t0) * 1e6,
+            (t_barrier1 - t_write) * 1e6,
+            (t_read - t_barrier1) * 1e6,
+            (t_reduce - t_read) * 1e6,
+            (t_write_reduce - t_reduce) * 1e6,
+            (t_barrier2 - t_write_reduce) * 1e6,
+            (t_read_reduce - t_barrier2) * 1e6,
+            (t_barrier3 - t_read_reduce) * 1e6,
+            other * 1e6,
+            total * 1e6,
+        )
 
         ret = reduce_res.view_as(inp)
         self.all_reduce_num += 1
