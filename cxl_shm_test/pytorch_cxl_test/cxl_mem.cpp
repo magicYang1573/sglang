@@ -228,7 +228,8 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
     volatile int32_t* control_ptr = (volatile int32_t*)(static_cast<const std::uint8_t *>(g_cxl.base) + control_offset);
     control_ptr[rank] = token;
 	clflush_range((void*)(control_ptr), sizeof(int32_t) * num_ranks);
-	
+	std::cout<<rank<<": wrote token "<<token<<std::endl;
+
     // 2. 自旋等待所有 rank 到达
     bool all_ready = false;
     while (!all_ready) {
@@ -240,11 +241,12 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
                 break;
             }
         }
-        clflush_range((void*)(control_ptr), sizeof(int32_t) * num_ranks);
 
         if (!all_ready) {
             // 自旋锁核心指令：提示 CPU 这是一个忙等待循环，降低功耗并加速退出循环
             _mm_pause(); 
         }
+
+		clflush_range((void*)(control_ptr), sizeof(int32_t) * num_ranks);
     }
 }
