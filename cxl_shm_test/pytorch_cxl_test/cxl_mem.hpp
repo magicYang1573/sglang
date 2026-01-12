@@ -25,3 +25,5 @@ bool cxl2vram(void *device_dst,
               std::size_t offset = 0);
 
 bool cxl_close();
+
+void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ranks);
