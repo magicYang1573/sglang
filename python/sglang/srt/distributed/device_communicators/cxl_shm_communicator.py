@@ -121,9 +121,6 @@ class CxlShmCommunicator:
         
         self.ext.tensor_to_cxl(ctrl_init, offset=self.control_offset)
 
-        self._ctrl_readback = torch.empty(
-            self.world_size, dtype=torch.int32, device="cpu"
-        )
         self._buffer_cache: Dict[Tuple[int, int, torch.dtype], torch.Tensor] = {}
         self._reduced_cache: Dict[Tuple[int, int, torch.dtype], torch.Tensor] = {}
         self.disabled = False
@@ -180,7 +177,7 @@ class CxlShmCommunicator:
         )
         t_write = time.perf_counter()
         self._barrier()
-        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
         t_barrier1 = time.perf_counter()
 
@@ -263,7 +260,7 @@ class CxlShmCommunicator:
         t_write = time.perf_counter()
         self._barrier()
         t_barrier1 = time.perf_counter()
-        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
         gather = self.ext.cxl_to_tensor(
@@ -287,7 +284,7 @@ class CxlShmCommunicator:
         t_write_reduce = time.perf_counter()
         self._barrier()
         t_barrier2 = time.perf_counter()
-        print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
+        print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier")
 
         reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
@@ -295,7 +292,7 @@ class CxlShmCommunicator:
 
         self._barrier()
         t_barrier3 = time.perf_counter()
-        print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
         total = t_barrier3 - t0
         other = total - (

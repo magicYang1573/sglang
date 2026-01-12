@@ -227,12 +227,12 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
     // 使用 volatile 确保编译器不会优化掉这次内存写入
     volatile int32_t* control_ptr = (volatile int32_t*)(static_cast<const std::uint8_t *>(g_cxl.base) + control_offset);
     control_ptr[rank] = token;
+	clflush_range((void*)(control_ptr), sizeof(int32_t) * num_ranks);
 	
     // 2. 自旋等待所有 rank 到达
     bool all_ready = false;
     while (!all_ready) {
         all_ready = true;
-		clflush_range((void*)(control_ptr), sizeof(int32_t) * num_ranks);
 		// std::cout<<rank<<": "<<control_ptr[0]<<" "<<control_ptr[1]<<" "<<control_ptr[2]<<" "<<control_ptr[3]<<std::endl;
         for (int i = 0; i < num_ranks; i++) {
             if (control_ptr[i] < token) {
@@ -240,7 +240,8 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
                 break;
             }
         }
-        
+        clflush_range((void*)(control_ptr), sizeof(int32_t) * num_ranks);
+
         if (!all_ready) {
             // 自旋锁核心指令：提示 CPU 这是一个忙等待循环，降低功耗并加速退出循环
             _mm_pause(); 
