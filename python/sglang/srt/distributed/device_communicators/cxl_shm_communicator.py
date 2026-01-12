@@ -100,7 +100,7 @@ class CxlShmCommunicator:
         self.map_bytes = map_bytes if map_bytes is not None else 16 * 1024 * 1024 * 1024
         self.map_offset = map_offset if map_offset is not None else 0
         self.control_bytes = control_bytes if control_bytes is not None else 4096
-        self.barrier_sleep = barrier_sleep if barrier_sleep is not None else 1e-6
+        self.barrier_sleep = barrier_sleep if barrier_sleep is not None else 1e-7
 
         self.control_offset = 0
         self.data_offset = _align_up(self.control_bytes, self._ALIGN)
@@ -132,7 +132,62 @@ class CxlShmCommunicator:
 
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         if self.disabled:
+            dist.all_reduce(inp, group=self.group)
             return inp
+
+        flat_inp = inp.contiguous()
+        total_bytes = flat_inp.numel() * flat_inp.element_size()
+
+        # the same strategy as custom_all_reduce
+        use_one_stage = False
+        if self.world_size == 2:
+            use_one_stage = True
+        elif self.world_size == 4 and total_bytes < 512 * 1024:
+            use_one_stage = True
+        elif self.world_size == 8 and total_bytes < 256 * 1024:
+            use_one_stage = True
+
+        if use_one_stage:
+            return self.all_reduce_1_stage(flat_inp)
+        return self.all_reduce_2_stage(flat_inp)
+
+    def all_reduce_1_stage(self, inp: torch.Tensor) -> torch.Tensor:
+
+        flat_inp = inp.contiguous()
+        slot_bytes = flat_inp.numel() * flat_inp.element_size()
+        required_bytes = self.data_offset + self.world_size * slot_bytes
+        if required_bytes > self.map_bytes:
+            logger.warning(
+                "CXL window too small (need %d bytes, have %d); falling back",
+                required_bytes,
+                self.map_bytes,
+            )
+            dist.all_reduce(flat_inp, group=self.group)
+            return flat_inp
+
+        self.ext.tensor_to_cxl(
+            flat_inp, offset=self.data_offset + self.rank * slot_bytes
+        )
+        self._barrier()
+
+        gather = torch.empty(
+            (self.world_size, flat_inp.numel()),
+            dtype=flat_inp.dtype,
+            device=self.device,
+        )
+        for src in range(self.world_size):
+            gather[src] = self.ext.cxl_to_tensor(
+                gather[src], offset=self.data_offset + src * slot_bytes
+            )
+
+        reduced = gather.sum(dim=0)
+        self._barrier()
+
+        self.all_reduce_num += 1
+        return reduced.view_as(inp)
+
+    def all_reduce_2_stage(self, inp: torch.Tensor) -> torch.Tensor:
+
         # print(f"Rank {self.rank} entering all_reduce #{self.all_reduce_num}")
         flat_inp = inp.contiguous()
         total_ele_num = flat_inp.numel()
