@@ -186,13 +186,17 @@ class CxlShmCommunicator:
             dtype=flat_inp.dtype,
             device=self.device,
         )
-        gather[self.rank] = inp.view(-1)
-        for src in range(self.world_size):
-            if src == self.rank:
-                continue
-            gather[src] = self.ext.cxl_to_tensor(
-                gather[src], offset=self.data_offset + src * slot_bytes
-            )
+
+        gather = self.ext.cxl_to_tensor(
+            gather, offset=self.data_offset
+        ).view_as(gather)
+
+        # for src in range(self.world_size):
+        #     if src == self.rank:
+        #         continue
+        #     gather[src] = self.ext.cxl_to_tensor(
+        #         gather[src], offset=self.data_offset + src * slot_bytes
+        #     )
         t_read = time.perf_counter()
 
         reduced = gather.sum(dim=0)
@@ -205,17 +209,18 @@ class CxlShmCommunicator:
             + (t_read - t_barrier1)
             + (t_reduce - t_read)
         )
-        logger.info(
-            "[%d] Rank %d AR1 timing (us): write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
-            self.all_reduce_num,
-            self.rank,
-            (t_write - t0) * 1e6,
-            (t_barrier1 - t_write) * 1e6,
-            (t_read - t_barrier1) * 1e6,
-            (t_reduce - t_read) * 1e6,
-            other * 1e6,
-            total * 1e6,
-        )
+
+        # logger.info(
+        #     "[%d] Rank %d AR1 timing (us): write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
+        #     self.all_reduce_num,
+        #     self.rank,
+        #     (t_write - t0) * 1e6,
+        #     (t_barrier1 - t_write) * 1e6,
+        #     (t_read - t_barrier1) * 1e6,
+        #     (t_reduce - t_read) * 1e6,
+        #     other * 1e6,
+        #     total * 1e6,
+        # )
 
         self.all_reduce_num += 1
         return reduced.view_as(inp)
@@ -258,12 +263,16 @@ class CxlShmCommunicator:
         # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
-        for src in range(self.world_size):
-            shard_offset = self.rank * shard_bytes
-            gather[src] = self.ext.cxl_to_tensor(
-                gather[src],
-                offset=self.data_offset + src * slot_bytes + shard_offset,
-            )
+        gather = self.ext.cxl_to_tensor(
+            gather, offset=self.data_offset
+        ).view_as(gather)
+
+        # for src in range(self.world_size):
+        #     shard_offset = self.rank * shard_bytes
+        #     gather[src] = self.ext.cxl_to_tensor(
+        #         gather[src],
+        #         offset=self.data_offset + src * slot_bytes + shard_offset,
+        #     )
         t_read = time.perf_counter()
 
         reduced_shard = gather.sum(dim=0)

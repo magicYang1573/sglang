@@ -624,14 +624,15 @@ class GroupCoordinator:
         ):
             outplace_all_reduce_method = "torch_symm_mem"
         if outplace_all_reduce_method is not None:
-            t0 = time.perf_counter()
+            # t0 = time.perf_counter()
             ret = outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
-            t1 = time.perf_counter()
-            print(f"all-reduce time: {(t1 - t0)*1e6} us", flush=True)
+            # t1 = time.perf_counter()
+            # print(f"all-reduce time: {(t1 - t0)*1e6} us", flush=True)
+            
             # print("normal all-reduce used method:", outplace_all_reduce_method, flush=True)
             # if not torch.cuda.is_current_stream_capturing():
             #     print(f"[sum {self.all_reduce_num}] rank {self.rank}", ret, ret.shape,flush=True)
