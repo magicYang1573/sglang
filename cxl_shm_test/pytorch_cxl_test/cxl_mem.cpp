@@ -233,6 +233,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
     while (!all_ready) {
         all_ready = true;
 		clflush_range((void*)(control_ptr), sizeof(int32_t) * num_ranks);
+		std::cout<<rank<<": "<<control_ptr[0]<<" "<<control_ptr[1]<<" "<<control_ptr[2]<<" "<<control_ptr[3]<<std::endl;
         for (int i = 0; i < num_ranks; i++) {
             if (control_ptr[i] < token) {
                 all_ready = false;
