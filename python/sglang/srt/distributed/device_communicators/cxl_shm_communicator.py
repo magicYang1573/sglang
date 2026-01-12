@@ -158,12 +158,12 @@ class CxlShmCommunicator:
             )
             dist.all_reduce(flat_inp, group=dist.group.WORLD)
             return flat_inp
-        # torch.cuda.synchronize(self.device)
+
         self.ext.tensor_to_cxl(
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
         self._barrier()
-        # print(f"a> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        print(f"a> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
         for src in range(self.world_size):
@@ -174,23 +174,20 @@ class CxlShmCommunicator:
             )
 
         reduced_shard = gather.sum(dim=0)
-        # torch.cuda.synchronize(self.device)
+
         self.ext.tensor_to_cxl(
             reduced_shard, offset=reduced_base + self.rank * shard_bytes
         )
         self._barrier()
-        # print(f"b> Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
+        print(f"b> Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
 
         reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
 
         self._barrier()
-        # print(f"c> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
-        # print(reduce_res.shape, inp.shape)
+        print(f"c> Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         ret = reduce_res.view_as(inp)
-        # if not torch.cuda.is_current_stream_capturing():
-        #     print(f"[cxl sum {self.all_reduce_num}] rank {self.rank}", inp, flush=True)
         self.all_reduce_num += 1
 
         return ret
@@ -199,7 +196,7 @@ class CxlShmCommunicator:
         token = self.stage_token
         self.stage_token += 1
         token_tensor = torch.tensor([token], dtype=torch.int32, device="cpu")
-        # torch.cuda.synchronize(self.device)
+        
         self.ext.tensor_to_cxl(
             token_tensor, offset=self.control_offset + self.rank * token_tensor.element_size()
         )
