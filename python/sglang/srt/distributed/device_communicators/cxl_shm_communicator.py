@@ -160,6 +160,7 @@ class CxlShmCommunicator:
 
     def all_reduce_1_stage(self, inp: torch.Tensor) -> torch.Tensor:
 
+        print(f"Rank {self.rank} entering all_reduce_1_stage #{self.all_reduce_num}")
         
         flat_inp = inp.contiguous()
         slot_bytes = flat_inp.numel() * flat_inp.element_size()
@@ -179,6 +180,8 @@ class CxlShmCommunicator:
         )
         t_write = time.perf_counter()
         self._barrier()
+        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+
         t_barrier1 = time.perf_counter()
 
         gather = torch.empty(
@@ -227,7 +230,7 @@ class CxlShmCommunicator:
 
     def all_reduce_2_stage(self, inp: torch.Tensor) -> torch.Tensor:
 
-        # print(f"Rank {self.rank} entering all_reduce #{self.all_reduce_num}")
+        print(f"Rank {self.rank} entering all_reduce_2_stage #{self.all_reduce_num}")
         flat_inp = inp.contiguous()
         total_ele_num = flat_inp.numel()
         if total_ele_num % self.world_size != 0:
@@ -260,7 +263,7 @@ class CxlShmCommunicator:
         t_write = time.perf_counter()
         self._barrier()
         t_barrier1 = time.perf_counter()
-        # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
         gather = self.ext.cxl_to_tensor(
@@ -284,7 +287,7 @@ class CxlShmCommunicator:
         t_write_reduce = time.perf_counter()
         self._barrier()
         t_barrier2 = time.perf_counter()
-        # print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
+        print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier,{self._ctrl_readback}")
 
         reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
@@ -292,7 +295,7 @@ class CxlShmCommunicator:
 
         self._barrier()
         t_barrier3 = time.perf_counter()
-        # print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
+        print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier,{self._ctrl_readback}")
 
         total = t_barrier3 - t0
         other = total - (
