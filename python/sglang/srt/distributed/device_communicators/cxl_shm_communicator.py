@@ -58,7 +58,7 @@ def _load_cxl_extension() -> object:
     return load(
         name="cxl_mem_ext",
         sources=[str(src_root / "cxl_mem.cpp"), str(src_root / "cxl_mem_pybind.cpp")],
-        extra_cflags=["-O3", "-std=c++17", "-mclflushopt"],
+        extra_cflags=["-O3", "-std=c++17", "-mclflushopt", "-msse4.1"],
         extra_cuda_cflags=["-O3", "-std=c++17"],
         build_directory=str(build_dir),
         verbose=False,
