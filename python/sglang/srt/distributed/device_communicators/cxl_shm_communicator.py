@@ -181,7 +181,7 @@ class CxlShmCommunicator:
         )
         t_write = time.perf_counter()
         self._barrier()
-        # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
+        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
         t_barrier1 = time.perf_counter()
 

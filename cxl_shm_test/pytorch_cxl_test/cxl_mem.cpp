@@ -28,7 +28,7 @@ inline void clflush_range(const void *addr, std::size_t len) {
 	for (; p < end; p += kCacheLine) {
 		_mm_clflushopt(reinterpret_cast<void *>(p));
 	}
-	_mm_mfence();
+	_mm_sfence();
 }
 
 // Streamed store copy to avoid polluting CPU caches when writing to CXL.
@@ -60,7 +60,7 @@ inline void nt_store_copy(void *dst, const void *src, std::size_t len) {
 	}
 
 	// _mm_sfence();
-	_mm_mfence();
+	_mm_sfence();
 
 }
 
@@ -233,6 +233,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
     // __m128i val_vec = _mm_set1_epi32(token);
 	// _mm_stream_si128(reinterpret_cast<__m128i*>(my_token_ptr), val_vec);
 	// _mm_sfence();
+	_mm_mfence();
 
 	nt_store_copy((void*)my_token_ptr, (void*)&token, sizeof(int32_t));
 
@@ -240,7 +241,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 	// *my_token_ptr = token;
 	// _mm_clwb((void*)my_token_ptr);
 	// _mm_sfence();
-	// std::cout<<"rank "<<rank<<" set token "<<token<<" addr "<<(void*)my_token_ptr<<std::endl;
+	std::cout<<"rank "<<rank<<" set token "<<token<<" addr "<<(void*)my_token_ptr<<std::endl;
 
     while (true) {
         bool all_ready = true;
