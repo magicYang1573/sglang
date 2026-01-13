@@ -28,7 +28,7 @@ inline void clflush_range(const void *addr, std::size_t len) {
 	for (; p < end; p += kCacheLine) {
 		_mm_clflushopt(reinterpret_cast<void *>(p));
 	}
-	_mm_sfence();
+	_mm_mfence();
 }
 
 // Streamed store copy to avoid polluting CPU caches when writing to CXL.
@@ -59,7 +59,9 @@ inline void nt_store_copy(void *dst, const void *src, std::size_t len) {
 		std::memcpy(d8, s8, rem);
 	}
 
-	_mm_sfence();
+	// _mm_sfence();
+	_mm_mfence();
+
 }
 
 inline bool cuda_check(cudaError_t err, const char *what) {
@@ -238,7 +240,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 	// *my_token_ptr = token;
 	// _mm_clwb((void*)my_token_ptr);
 	// _mm_sfence();
-	std::cout<<"rank "<<rank<<" set token "<<token<<" addr "<<(void*)my_token_ptr<<std::endl;
+	// std::cout<<"rank "<<rank<<" set token "<<token<<" addr "<<(void*)my_token_ptr<<std::endl;
 
     while (true) {
         bool all_ready = true;
@@ -266,7 +268,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 		}
 
         if (all_ready) {
-			std::cout<<"rank "<<rank<<" barrier complete for token "<<token<<"read: " ;
+			// std::cout<<"rank "<<rank<<" barrier complete for token "<<token<<"read: " ;
 			for (int t : tokens) {
 				std::cout<<t<<" ";
 			}
