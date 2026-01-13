@@ -267,8 +267,8 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 			std::cout<<"rank "<<rank<<" barrier complete for token "<<token<<"read: " ;
 			for (int t : tokens) {
 				std::cout<<t<<" ";
-				std::cout<<std::endl;
 			}
+			std::cout<<std::endl;
 			break;
 		}
 		_mm_pause();   

@@ -24,8 +24,8 @@ void tensor_to_cxl(torch::Tensor src, std::size_t offset) {
     const std::size_t bytes = static_cast<std::size_t>(t.nbytes());
 
     if (t.is_cuda()) {
-        // throw_if_false(vram2cxl(t.data_ptr(), bytes, offset), "vram2cxl");
-        throw_if_false(vram2cxl_async(t.data_ptr(), bytes, offset), "vram2cxl_async");
+        throw_if_false(vram2cxl(t.data_ptr(), bytes, offset), "vram2cxl");
+        // throw_if_false(vram2cxl_async(t.data_ptr(), bytes, offset), "vram2cxl_async");
     } else {
         throw_if_false(dram2cxl(t.data_ptr(), bytes, offset), "dram2cxl");
     }
