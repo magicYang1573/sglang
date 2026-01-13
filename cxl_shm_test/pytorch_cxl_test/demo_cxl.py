@@ -18,7 +18,7 @@ def build_extension():
             str(ROOT / "cxl_mem.cpp"),
             str(ROOT / "cxl_mem_pybind.cpp"),
         ],
-        extra_cflags=["-O3", "-std=c++17", "-mclflushopt", "-msse4.1"],
+        extra_cflags=["-O3", "-std=c++17", "-mclflushopt", "-mclwb", "-msse4.1"],
         extra_cuda_cflags=["-O3", "-std=c++17"],
         build_directory=str(build_dir),
         verbose=True,
