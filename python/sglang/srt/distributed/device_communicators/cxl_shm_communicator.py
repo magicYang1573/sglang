@@ -157,7 +157,7 @@ class CxlShmCommunicator:
 
     def all_reduce_1_stage(self, inp: torch.Tensor) -> torch.Tensor:
 
-        # print(f"Rank {self.rank} entering all_reduce_1_stage #{self.all_reduce_num}")
+        print(f"Rank {self.rank} entering all_reduce_1_stage #{self.all_reduce_num}")
         
         flat_inp = inp.contiguous()
         slot_bytes = flat_inp.numel() * flat_inp.element_size()
@@ -177,7 +177,7 @@ class CxlShmCommunicator:
         )
         t_write = time.perf_counter()
         self._barrier()
-        # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
+        print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
         t_barrier1 = time.perf_counter()
 

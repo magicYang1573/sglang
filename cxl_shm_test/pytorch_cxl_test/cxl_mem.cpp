@@ -227,10 +227,11 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
     uint8_t* base_ptr = static_cast<uint8_t*>(g_cxl.base) + control_offset;
 
     int32_t* my_token_ptr = reinterpret_cast<int32_t*>(base_ptr + rank * kCacheLine);
-    
-    // _mm_sfence(); // 确保之前的存储操作对后续 flush 可见
-    *my_token_ptr = token;
-	clflush_range((void*)my_token_ptr, sizeof(int32_t));
+    __m128i val_vec = _mm_set1_epi32(token);
+	_mm_stream_si128(reinterpret_cast<__m128i*>(my_token_ptr), val_vec);
+	_mm_sfence();
+
+	// clflush_range((void*)my_token_ptr, sizeof(int32_t));
 
     while (true) {
         bool all_ready = true;
