@@ -235,7 +235,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 	// clflush_range((void*)my_token_ptr, sizeof(int32_t));
 	*my_token_ptr = token;
 	_mm_clflush((void*)my_token_ptr);
-	std::cout<<"rank "<<rank<<" set token "<<token<<std::endl;
+	std::cout<<"rank "<<rank<<" set token "<<token<<" addr "<<(void*)my_token_ptr<<std::endl;
 
     while (true) {
         bool all_ready = true;
@@ -244,16 +244,16 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
             if (i == rank) continue; 
 			
 			
-            int32_t* other_token_ptr = reinterpret_cast<int32_t*>(base_ptr + i * kCacheLine);
-			// clflush_range((void*)other_token_ptr, sizeof(int32_t));
+            volatile int32_t* other_token_ptr = reinterpret_cast<int32_t*>(base_ptr + i * kCacheLine);
+			clflush_range((void*)other_token_ptr, sizeof(int32_t));
 			_mm_clflush((void*)other_token_ptr);
+			volatile int32_t val = *other_token_ptr;
 
 			// nt load
 			// __m128i buffer = _mm_stream_load_si128(reinterpret_cast<__m128i*>(other_token_ptr));
 			// int32_t val = _mm_cvtsi128_si32(buffer);
 			// _mm_lfence();
-
-			int32_t val = *other_token_ptr;
+			
 
 			if (val < token) {
                 all_ready = false;
