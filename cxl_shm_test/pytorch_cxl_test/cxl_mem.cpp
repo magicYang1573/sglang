@@ -249,7 +249,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
             volatile int32_t* other_token_ptr = reinterpret_cast<int32_t*>(base_ptr + i * kCacheLine);
 			// _mm_clflushopt((void*)other_token_ptr);
 			// _mm_sfence();
-			volatile int32_t val = *other_token_ptr;
+			int32_t val = *other_token_ptr;
 			tokens.push_back(val);
 			// nt load
 			// __m128i buffer = _mm_stream_load_si128(reinterpret_cast<__m128i*>(other_token_ptr));
@@ -264,9 +264,11 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 		}
 
         if (all_ready) {
-			atd::cout<<"rank "<<rank<<" barrier complete for token "<<token<<std::endl;
-			for (int t : tokens) 
-				std::cout<<t<<" "<<std::endl;
+			std::cout<<"rank "<<rank<<" barrier complete for token "<<token<<"read: " ;
+			for (int t : tokens) {
+				std::cout<<t<<" ";
+				std::cout<<std::endl;
+			}
 			break;
 		}
 		_mm_pause();   
