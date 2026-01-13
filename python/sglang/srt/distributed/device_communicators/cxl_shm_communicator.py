@@ -117,7 +117,7 @@ class CxlShmCommunicator:
             logger.warning("cxl_init failed for %s", self.dev_path)
             return
 
-        ctrl_init = torch.zeros(self.world_size, dtype=torch.int32, device="cpu")
+        ctrl_init = torch.zeros(self.control_bytes, dtype=torch.int8, device="cpu")
         
         self.ext.tensor_to_cxl(ctrl_init, offset=self.control_offset)
 
