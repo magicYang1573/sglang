@@ -232,7 +232,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 
 
 	// sfence is necessary, first store all the data, then set the token 
-	_mm_sfence();
+	_mm_mfence();
 
 	nt_store_copy((void*)my_token_ptr, (void*)&token, sizeof(int32_t));
 
@@ -256,7 +256,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
         if (all_ready) {
 
 			// lfence is necessary here, first all the token is ready, then read the following data
-			_mm_lfence();
+			_mm_mfence();
 			break;
 		}
 		_mm_pause();   
