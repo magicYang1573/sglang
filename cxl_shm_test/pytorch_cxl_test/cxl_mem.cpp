@@ -236,31 +236,15 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 
 	nt_store_copy((void*)my_token_ptr, (void*)&token, sizeof(int32_t));
 
-	// clflush_range((void*)my_token_ptr, sizeof(int32_t));
-	// *my_token_ptr = token;
-	// _mm_clwb((void*)my_token_ptr);
-	// _mm_sfence();
-
-	// std::cout<<"rank "<<rank<<" set token "<<token<<" addr "<<(void*)my_token_ptr<<std::endl;
-
     while (true) {
         bool all_ready = true;
 		std::vector<int32_t> tokens;
 		clflush_range((void*)(base_ptr+control_offset), num_ranks*kCacheLine);
-        for (int i = 0; i < num_ranks; i++) {
-            // if (i == rank) continue; 
-			
+        for (int i = 0; i < num_ranks; i++) 
 			
             volatile int32_t* other_token_ptr = reinterpret_cast<int32_t*>(base_ptr + i * kCacheLine);
-			// _mm_clflushopt((void*)other_token_ptr);
-			// _mm_sfence();
 			int32_t val = *other_token_ptr;
-			tokens.push_back(val);
-			// nt load
-			// __m128i buffer = _mm_stream_load_si128(reinterpret_cast<__m128i*>(other_token_ptr));
-			// int32_t val = _mm_cvtsi128_si32(buffer);
-			// _mm_lfence();
-			
+			tokens.push_back(val);			
 
 			if (val < token) {
                 all_ready = false;
@@ -269,12 +253,6 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 		}
 
         if (all_ready) {
-			// std::cout<<"rank "<<rank<<" barrier complete for token "<<token<<"read: " ;
-			// for (int t : tokens) {
-			// 	std::cout<<t<<" ";
-			// }
-			// std::cout<<std::endl;
-
 			// lfence is necessary here, first all the token is ready, then read the following data
 			_mm_lfence();
 			break;
