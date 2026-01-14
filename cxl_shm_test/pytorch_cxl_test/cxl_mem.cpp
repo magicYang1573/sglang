@@ -230,10 +230,9 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 
     int32_t* my_token_ptr = reinterpret_cast<int32_t*>(base_ptr + rank * kCacheLine);
 
-    // __m128i val_vec = _mm_set1_epi32(token);
-	// _mm_stream_si128(reinterpret_cast<__m128i*>(my_token_ptr), val_vec);
-	// _mm_sfence();
-	_mm_mfence();
+
+	// sfence is necessary, first store all the data, then set the token 
+	_mm_sfence();
 
 	nt_store_copy((void*)my_token_ptr, (void*)&token, sizeof(int32_t));
 
@@ -275,7 +274,9 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 			// 	std::cout<<t<<" ";
 			// }
 			// std::cout<<std::endl;
-			_mm_mfence();
+
+			// lfence is necessary here, first all the token is ready, then read the following data
+			_mm_lfence();
 			break;
 		}
 		_mm_pause();   
