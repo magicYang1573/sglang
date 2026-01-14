@@ -240,11 +240,12 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
         bool all_ready = true;
 		std::vector<int32_t> tokens;
 		clflush_range((void*)(base_ptr+control_offset), num_ranks*kCacheLine);
-        for (int i = 0; i < num_ranks; i++) 
-			
+        for (int i = 0; i < num_ranks; i++) {
+
             volatile int32_t* other_token_ptr = reinterpret_cast<int32_t*>(base_ptr + i * kCacheLine);
+
 			int32_t val = *other_token_ptr;
-			tokens.push_back(val);			
+			tokens.push_back(val);
 
 			if (val < token) {
                 all_ready = false;
@@ -253,6 +254,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 		}
 
         if (all_ready) {
+
 			// lfence is necessary here, first all the token is ready, then read the following data
 			_mm_lfence();
 			break;
