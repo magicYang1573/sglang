@@ -294,7 +294,7 @@ class CxlShmCommunicator:
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
         t_read_reduce = time.perf_counter()
 
-        # self._barrier()
+        self._barrier()
         t_barrier3 = time.perf_counter()
         # print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
