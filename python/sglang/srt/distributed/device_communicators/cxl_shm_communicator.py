@@ -151,7 +151,7 @@ class CxlShmCommunicator:
         #     print(f"Rank {self.rank} using 1-stage all-reduce for all_reduce #{self.all_reduce_num}")
         # else:
         #     print(f"Rank {self.rank} using 2-stage all-reduce for all_reduce #{self.all_reduce_num}")
-        # use_one_stage = True
+        use_one_stage = True
 
         if use_one_stage:
             ret = self.all_reduce_1_stage(flat_inp)
