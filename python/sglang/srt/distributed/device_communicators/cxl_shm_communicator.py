@@ -146,14 +146,6 @@ class CxlShmCommunicator:
         elif self.world_size == 8 and total_bytes < 256 * 1024:
             use_one_stage = True
 
-        # print(inp.shape, total_bytes)
-        # if use_one_stage:
-        #     print(f"Rank {self.rank} using 1-stage all-reduce for all_reduce #{self.all_reduce_num}")
-        # else:
-        #     print(f"Rank {self.rank} using 2-stage all-reduce for all_reduce #{self.all_reduce_num}")
-        use_one_stage = False
-        # use_one_stage = True
-
 
         if use_one_stage:
             ret = self.all_reduce_1_stage(flat_inp)
@@ -216,17 +208,17 @@ class CxlShmCommunicator:
             + (t_reduce - t_read)
         )
 
-        # logger.info(
-        #     "[%d] Rank %d AR1 timing (us): write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
-        #     self.all_reduce_num,
-        #     self.rank,
-        #     (t_write - t0) * 1e6,
-        #     (t_barrier1 - t_write) * 1e6,
-        #     (t_read - t_barrier1) * 1e6,
-        #     (t_reduce - t_read) * 1e6,
-        #     other * 1e6,
-        #     total * 1e6,
-        # )
+        logger.info(
+            "[%d] Rank %d AR1 timing (us): write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
+            self.all_reduce_num,
+            self.rank,
+            (t_write - t0) * 1e6,
+            (t_barrier1 - t_write) * 1e6,
+            (t_read - t_barrier1) * 1e6,
+            (t_reduce - t_read) * 1e6,
+            other * 1e6,
+            total * 1e6,
+        )
 
         self.all_reduce_num += 1
         return reduced.view_as(inp)
