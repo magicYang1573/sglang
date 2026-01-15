@@ -65,8 +65,10 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
-TP_USE_CXL_SHM_COMMUNICATOR = True
+# TP_USE_CXL_SHM_COMMUNICATOR = True
 # TP_USE_CXL_SHM_COMMUNICATOR = False
+val = os.environ.get("TP_USE_CXL_SHM_COMMUNICATOR", "False").lower()
+TP_USE_CXL_SHM_COMMUNICATOR = val in ("true", "1", "yes", "on")
 
 
 @dataclass
