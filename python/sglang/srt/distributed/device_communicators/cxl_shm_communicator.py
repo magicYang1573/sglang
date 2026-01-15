@@ -269,16 +269,14 @@ class CxlShmCommunicator:
         # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
         gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
-        gather = self.ext.cxl_to_tensor(
-            gather, offset=self.data_offset
-        ).view_as(gather)
 
-        # for src in range(self.world_size):
-        #     shard_offset = self.rank * shard_bytes
-        #     gather[src] = self.ext.cxl_to_tensor(
-        #         gather[src],
-        #         offset=self.data_offset + src * slot_bytes + shard_offset,
-        #     )
+        for src in range(self.world_size):
+            shard_offset = self.rank * shard_bytes
+            gather[src] = self.ext.cxl_to_tensor(
+                gather[src],
+                offset=self.data_offset + src * slot_bytes + shard_offset,
+            )
+            
         t_read = time.perf_counter()
 
         reduced_shard = gather.sum(dim=0)
