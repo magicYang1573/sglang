@@ -276,7 +276,7 @@ class CxlShmCommunicator:
                 gather[src],
                 offset=self.data_offset + src * slot_bytes + shard_offset,
             )
-            
+
         t_read = time.perf_counter()
 
         reduced_shard = gather.sum(dim=0)
@@ -294,11 +294,11 @@ class CxlShmCommunicator:
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
         t_read_reduce = time.perf_counter()
 
-        self._barrier()
-        t_barrier3 = time.perf_counter()
+        # self._barrier()
+        # t_barrier3 = time.perf_counter()
         # print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
-        total = t_barrier3 - t0
+        total = t_read_reduce - t0
         other = total - (
             (t_write - t0)
             + (t_barrier1 - t_write)
