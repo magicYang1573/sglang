@@ -294,10 +294,6 @@ class CxlShmCommunicator:
         reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
         t_read_reduce = time.perf_counter()
 
-        # self._barrier()
-        # t_barrier3 = time.perf_counter()
-        # print(f"c> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
-
         total = t_read_reduce - t0
         other = total - (
             (t_write - t0)
@@ -309,20 +305,19 @@ class CxlShmCommunicator:
             + (t_read_reduce - t_barrier2)
             # + (t_barrier3 - t_read_reduce)
         )
-        # logger.info(
-        #     "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f barrier3=%.1f other=%.1f total=%.1f",
-        #     self.rank,
-        #     (t_write - t0) * 1e6,
-        #     (t_barrier1 - t_write) * 1e6,
-        #     (t_read - t_barrier1) * 1e6,
-        #     (t_reduce - t_read) * 1e6,
-        #     (t_write_reduce - t_reduce) * 1e6,
-        #     (t_barrier2 - t_write_reduce) * 1e6,
-        #     (t_read_reduce - t_barrier2) * 1e6,
-        #     (t_barrier3 - t_read_reduce) * 1e6,
-        #     other * 1e6,
-        #     total * 1e6,
-        # )
+        logger.info(
+            "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f other=%.1f total=%.1f",
+            self.rank,
+            (t_write - t0) * 1e6,
+            (t_barrier1 - t_write) * 1e6,
+            (t_read - t_barrier1) * 1e6,
+            (t_reduce - t_read) * 1e6,
+            (t_write_reduce - t_reduce) * 1e6,
+            (t_barrier2 - t_write_reduce) * 1e6,
+            (t_read_reduce - t_barrier2) * 1e6,
+            other * 1e6,
+            total * 1e6,
+        )
 
         ret = reduce_res.view_as(inp)
         self.all_reduce_num += 1
