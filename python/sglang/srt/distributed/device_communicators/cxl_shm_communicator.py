@@ -208,17 +208,17 @@ class CxlShmCommunicator:
             + (t_reduce - t_read)
         )
 
-        logger.info(
-            "[%d] Rank %d AR1 timing (us): write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
-            self.all_reduce_num,
-            self.rank,
-            (t_write - t0) * 1e6,
-            (t_barrier1 - t_write) * 1e6,
-            (t_read - t_barrier1) * 1e6,
-            (t_reduce - t_read) * 1e6,
-            other * 1e6,
-            total * 1e6,
-        )
+        # logger.info(
+        #     "[%d] Rank %d AR1 timing (us): write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
+        #     self.all_reduce_num,
+        #     self.rank,
+        #     (t_write - t0) * 1e6,
+        #     (t_barrier1 - t_write) * 1e6,
+        #     (t_read - t_barrier1) * 1e6,
+        #     (t_reduce - t_read) * 1e6,
+        #     other * 1e6,
+        #     total * 1e6,
+        # )
 
         self.all_reduce_num += 1
         return reduced.view_as(inp)
@@ -297,19 +297,19 @@ class CxlShmCommunicator:
             + (t_read_reduce - t_barrier2)
             # + (t_barrier3 - t_read_reduce)
         )
-        logger.info(
-            "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f other=%.1f total=%.1f",
-            self.rank,
-            (t_write - t0) * 1e6,
-            (t_barrier1 - t_write) * 1e6,
-            (t_read - t_barrier1) * 1e6,
-            (t_reduce - t_read) * 1e6,
-            (t_write_reduce - t_reduce) * 1e6,
-            (t_barrier2 - t_write_reduce) * 1e6,
-            (t_read_reduce - t_barrier2) * 1e6,
-            other * 1e6,
-            total * 1e6,
-        )
+        # logger.info(
+        #     "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f other=%.1f total=%.1f",
+        #     self.rank,
+        #     (t_write - t0) * 1e6,
+        #     (t_barrier1 - t_write) * 1e6,
+        #     (t_read - t_barrier1) * 1e6,
+        #     (t_reduce - t_read) * 1e6,
+        #     (t_write_reduce - t_reduce) * 1e6,
+        #     (t_barrier2 - t_write_reduce) * 1e6,
+        #     (t_read_reduce - t_barrier2) * 1e6,
+        #     other * 1e6,
+        #     total * 1e6,
+        # )
 
         ret = reduce_res.view_as(inp)
         self.all_reduce_num += 1
