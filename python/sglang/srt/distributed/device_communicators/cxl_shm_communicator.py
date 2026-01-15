@@ -307,7 +307,7 @@ class CxlShmCommunicator:
             + (t_write_reduce - t_reduce)
             + (t_barrier2 - t_write_reduce)
             + (t_read_reduce - t_barrier2)
-            + (t_barrier3 - t_read_reduce)
+            # + (t_barrier3 - t_read_reduce)
         )
         # logger.info(
         #     "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f barrier3=%.1f other=%.1f total=%.1f",
