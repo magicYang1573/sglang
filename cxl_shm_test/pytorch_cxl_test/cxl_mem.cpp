@@ -96,7 +96,9 @@ bool cxl_init(const std::string &dev_path,
 		return true;
 	}
 
-	const int fd = ::open(dev_path.c_str(), O_RDWR | O_SYNC);
+	// const int fd = ::open(dev_path.c_str(), O_RDWR | O_SYNC);
+	const int fd = ::open(dev_path.c_str(), O_RDWR);
+
 	if (fd < 0) {
 		std::cerr << "open " << dev_path << " failed: " << std::strerror(errno) << "\n";
 		return false;
