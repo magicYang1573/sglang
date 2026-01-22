@@ -631,7 +631,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def model_specific_adjustment(self):
         server_args = self.server_args
 
-        if server_args.enable_double_sparsity:
+        if server_args.enable_double_sparsity or server_args.enable_unified_sparsity:
             logger.info(
                 "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
             )

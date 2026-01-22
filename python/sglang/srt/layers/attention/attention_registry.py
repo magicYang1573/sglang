@@ -94,8 +94,14 @@ def create_triton_backend(runner):
         from sglang.srt.layers.attention.double_sparsity_backend import (
             DoubleSparseAttnBackend,
         )
-
         return DoubleSparseAttnBackend(runner)
+    
+    elif runner.server_args.enable_unified_sparsity:
+        from sglang.srt.layers.attention.unified_sparsity_backend import (
+            UnifiedSparsityAttnBackend,
+        )
+        return UnifiedSparsityAttnBackend(runner)
+    
     else:
         from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 
