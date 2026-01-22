@@ -537,6 +537,9 @@ class ServerArgs:
     ds_heavy_channel_type: str = "qk"
     ds_sparse_decode_threshold: int = 4096
 
+    # Unified Sparsity
+    enable_unified_sparsity: bool = False
+
     # Offloading
     cpu_offload_gb: int = 0
     offload_group_size: int = -1
@@ -4077,6 +4080,13 @@ class ServerArgs:
             help="The minimum decode sequence length required before the double-sparsity backend switches from the dense fallback to the sparse decode kernel.",
         )
 
+        # Unified Sparsity
+        parser.add_argument(
+            "--enable-unified-sparsity",
+            action="store_true",
+            help="Enable unified sparsity attention",
+        )
+        
         # Offloading
         parser.add_argument(
             "--cpu-offload-gb",

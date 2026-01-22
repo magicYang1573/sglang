@@ -125,13 +125,21 @@ class DoubleSparseAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+
+        # support GQA
+        kv_group = layer.tp_q_head_num // layer.tp_k_head_num
+        kv_sorted_channels = self.sorted_channels[layer.layer_id][::kv_group]
         k_label = torch.gather(
-            k,
-            2,
-            self.sorted_channels[layer.layer_id]
-            .unsqueeze(0)
-            .expand(k.shape[0], -1, -1),
+            k, 2, kv_sorted_channels.unsqueeze(0).expand(k.shape[0], -1, -1)
         )
+
+        # k_label = torch.gather(
+        #     k,
+        #     2,
+        #     self.sorted_channels[layer.layer_id]
+        #     .unsqueeze(0)
+        #     .expand(k.shape[0], -1, -1),
+        # )
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -193,13 +201,19 @@ class DoubleSparseAttnBackend(AttentionBackend):
             ds_req_to_token,
         ) = self.forward_metadata
 
+        # support GQA
+        kv_group = layer.tp_q_head_num // layer.tp_k_head_num
+        kv_sorted_channels = self.sorted_channels[layer.layer_id][::kv_group]
         k_label = torch.gather(
-            k,
-            2,
-            self.sorted_channels[layer.layer_id]
-            .unsqueeze(0)
-            .expand(k.shape[0], -1, -1),
+            k, 2, kv_sorted_channels.unsqueeze(0).expand(k.shape[0], -1, -1)
         )
+        # k_label = torch.gather(
+        #     k,
+        #     2,
+        #     self.sorted_channels[layer.layer_id]
+        #     .unsqueeze(0)
+        #     .expand(k.shape[0], -1, -1),
+        # )
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
