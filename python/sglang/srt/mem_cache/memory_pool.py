@@ -1926,6 +1926,81 @@ class DoubleSparseTokenToKVPool(KVCache):
         self.label_buffer[layer_id - self.start_layer][loc] = cache_label
 
 
+class UnifiedSparseTokenToKVPool(KVCache):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+        )
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # [size, head_num, head_dim] for each layer
+                self.k_buffer = [
+                    torch.zeros(
+                        (size + page_size, head_num, head_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (size + page_size, head_num, head_dim),
+                        dtype=dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+
+
+    def get_key_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_value_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_kv_buffer(self, layer_id: int):
+        return (
+            self.k_buffer[layer_id - self.start_layer],
+            self.v_buffer[layer_id - self.start_layer],
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        # NOTE(Andy): ignore the dtype check
+        layer_id = layer.layer_id
+        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+
+
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],
     v_buffer: List[torch.Tensor],
