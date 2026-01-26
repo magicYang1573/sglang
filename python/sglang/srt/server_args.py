@@ -539,6 +539,8 @@ class ServerArgs:
 
     # Unified Sparsity
     enable_unified_sparsity: bool = False
+    unified_sparsity_heavy_token_num: int = 256
+    unified_sparsity_decode_threshold: int = 4096
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -4086,7 +4088,19 @@ class ServerArgs:
             action="store_true",
             help="Enable unified sparsity attention",
         )
-        
+        parser.add_argument(
+            "--unified-sparsity-heavy-token-num",
+            type=int,
+            default=ServerArgs.unified_sparsity_heavy_token_num,
+            help="The number of heavy tokens in unified sparsity",
+        )
+        parser.add_argument(
+            "--unified-sparsity-decode-threshold",
+            type=int,
+            default=ServerArgs.unified_sparsity_decode_threshold,
+            help="The minimum decode sequence length required before the unified-sparsity backend switches from the dense fallback to the sparse decode kernel.",
+        )
+    
         # Offloading
         parser.add_argument(
             "--cpu-offload-gb",

@@ -31,10 +31,9 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 		self.extend_attention_fwd = extend_attention_fwd
 		self.num_head = model_runner.model_config.num_attention_heads
 		self.head_dim = model_runner.model_config.hidden_size // self.num_head
-
-		self.sparse_decode_thresold = (
-			model_runner.server_args.ds_sparse_decode_threshold
-		)
+		self.heavy_token_num = model_runner.server_args.unified_sparsity_heavy_token_num
+		self.sparse_decode_threshold = model_runner.server_args.unified_sparsity_decode_threshold
+		
 
 		self.mid_out: torch.Tensor = None
 		self.mid_o_logexpsum: torch.Tensor = None
@@ -63,14 +62,14 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 			max_seq_len = torch.max(forward_batch.seq_lens).item()
 			min_seq_len = torch.min(forward_batch.seq_lens).item()
 			max_extend_len = None
-			ds_req_to_token = forward_batch.req_to_token_pool.req_to_token[
+			req_to_token = forward_batch.req_to_token_pool.req_to_token[
 				forward_batch.req_pool_indices
 			]
 		else:
 			start_loc = attn_logits = max_seq_len = min_seq_len = None
 			prefix_lens = forward_batch.extend_prefix_lens
 			max_extend_len = torch.max(forward_batch.seq_lens - prefix_lens).item()
-			ds_req_to_token = None
+			req_to_token = None
 
 		self.forward_metadata = (
 			start_loc,
@@ -78,7 +77,7 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 			max_seq_len,
 			min_seq_len,
 			max_extend_len,
-			ds_req_to_token,
+			req_to_token,
 		)
 
 	def forward_extend(
@@ -106,7 +105,7 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 			max_seq_len,
 			min_seq_len,
 			max_extend_len,
-			ds_req_to_token,
+			req_to_token,
 		) = self.forward_metadata
 		self.extend_attention_fwd(
 			q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -169,7 +168,7 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 			max_seq_len,
 			min_seq_len,
 			max_extend_len,
-			ds_req_to_token,
+			req_to_token,
 		) = self.forward_metadata
 
 		if save_kv_cache:
@@ -177,15 +176,11 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 				layer, forward_batch.out_cache_loc, k, v
 			)
 
-        # tmp all token for topk_token_indices
-		base_indices = torch.arange(max_seq_len, device=forward_batch.seq_lens.device).unsqueeze(0)
-		mask = base_indices < forward_batch.seq_lens.unsqueeze(1)
-		topk_token_indices = torch.full((forward_batch.batch_size, max_seq_len), -1, device=forward_batch.seq_lens.device)
-		topk_token_indices = torch.where(mask, base_indices, topk_token_indices)
-	
+		print(min_seq_len, max_seq_len, self.heavy_token_num, self.sparse_decode_threshold)
+		
 		if (
-			topk_token_indices is None
-			or max_seq_len < self.sparse_decode_thresold
+			min_seq_len < self.heavy_token_num
+			or max_seq_len < self.sparse_decode_threshold
 		):
 			self.decode_attention_fwd(
 				q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -202,6 +197,30 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 				layer.logit_cap,
 			)
 		else:
+
+			# tmp all token for topk_token_indices
+			base_indices = torch.arange(max_seq_len, device=forward_batch.seq_lens.device).unsqueeze(0)
+			mask = base_indices < forward_batch.seq_lens.unsqueeze(1)
+
+			# topk_token_indices: [H, B, k], Req_to_tokens: [B, S]
+    		# topk_token_indices = torch.arange(0, heavy_token_num, device=q.device).unsqueeze(0).unsqueeze(0).expand(q.shape[1], q.shape[0], -1)
+			
+			# topk_token_indices: [H, B, k], Req_to_tokens: [B, S]
+			k = self.heavy_token_num
+			seq_lens = forward_batch.seq_lens  # [B]
+
+			# 选择每个 seq 的最后 k 个 token
+			start = seq_lens - k  # [B], 已保证 min_seq_len >= k
+			offsets = torch.arange(k, device=seq_lens.device, dtype=seq_lens.dtype)  # [k]
+			topk_token_indices = start.unsqueeze(1) + offsets.unsqueeze(0)  # [B, k]
+
+			# 扩展到 [H, B, k]
+			topk_token_indices = topk_token_indices.unsqueeze(0).expand(
+				layer.tp_q_head_num, -1, -1
+			)
+
+			print(topk_token_indices)
+
 			self._ensure_mid_buffers(
 				q.shape[0],
 				layer.tp_q_head_num,
@@ -213,7 +232,7 @@ class UnifiedSparsityAttnBackend(AttentionBackend):
 				forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
 				forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
 				o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-				ds_req_to_token,
+				req_to_token,
 				topk_token_indices,
 				forward_batch.seq_lens,
 				max_seq_len,
