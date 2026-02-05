@@ -16,15 +16,18 @@
 # Modify details for the adaptation of Qwen2 model.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 import logging
+import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import torch.distributed as dist
 
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -51,11 +54,63 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.models.engram.engram import Engram, backbone_config, engram_cfg
 
 Qwen2Config = None
 
 
 logger = logging.getLogger(__name__)
+
+
+_ENGRAM_LOCAL_GROUPS: Dict[Tuple[int, ...], dist.ProcessGroup] = {}
+
+
+def _get_tp_per_node(tp_group) -> int:
+    local_size = getattr(tp_group, "local_size", 0)
+    if isinstance(local_size, int) and local_size > 0:
+        return local_size
+
+    for key in (
+        "LOCAL_WORLD_SIZE",
+        "LOCAL_SIZE",
+        "MPI_LOCALNRANKS",
+        "OMPI_COMM_WORLD_LOCAL_SIZE",
+        "SLURM_NTASKS_PER_NODE",
+    ):
+        value = os.getenv(key)
+        if value and value.isdigit():
+            return int(value)
+
+    if torch.cuda.is_available():
+        return torch.cuda.device_count()
+
+    return tp_group.world_size
+
+
+def _get_tp_local_group_and_root(tp_group) -> Tuple[Optional[dist.ProcessGroup], int, int]:
+    tp_per_node = _get_tp_per_node(tp_group)
+    tp_rank = get_tensor_model_parallel_rank()
+    root_tp_rank = tp_rank - (tp_rank % tp_per_node)
+    root_global_rank = tp_group.ranks[root_tp_rank]
+
+    if not dist.is_initialized():
+        return None, tp_per_node, root_global_rank
+
+    if tp_per_node <= 0 or tp_per_node >= tp_group.world_size:
+        return tp_group.cpu_group, tp_per_node, root_global_rank
+
+    node_id = root_global_rank // tp_per_node
+    local_ranks = [rank for rank in tp_group.ranks if rank // tp_per_node == node_id]
+    if len(local_ranks) <= 1:
+        return tp_group.cpu_group, tp_per_node, root_global_rank
+
+    group_key = tuple(local_ranks)
+    group = _ENGRAM_LOCAL_GROUPS.get(group_key)
+    if group is None:
+        group = dist.new_group(ranks=local_ranks, backend="gloo")
+        _ENGRAM_LOCAL_GROUPS[group_key] = group
+
+    return group, tp_per_node, root_global_rank
 
 
 class Qwen2MLP(nn.Module):
@@ -406,6 +461,166 @@ class Qwen2Model(nn.Module):
                 raise RuntimeError(
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
+
+
+class Qwen2MoelEngram(Qwen2Model):
+    def __init__(
+        self,
+        config: Qwen2Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        decoder_layer_type: type[nn.Module] = Qwen2DecoderLayer,
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        engram_layer_ids: Optional[List[int]] = None,
+    ) -> None:
+        super().__init__(
+            config,
+            quant_config=quant_config,
+            prefix=prefix,
+            decoder_layer_type=decoder_layer_type,
+            alt_stream=alt_stream,
+        )
+        self.engram_layer_ids = set(engram_layer_ids or engram_cfg.layer_ids)
+        self.engram_modules: Dict[int, Engram] = {}
+        self._init_engram_modules()
+
+    def _init_engram_modules(self) -> None:
+        if not self.engram_layer_ids:
+            return
+
+        tp_group = get_tp_group()
+        local_group, tp_per_node, root_global_rank = _get_tp_local_group_and_root(
+            tp_group
+        )
+
+        if local_group is None or not dist.is_initialized():
+            for layer_id in sorted(self.engram_layer_ids):
+                if self.start_layer <= layer_id < self.end_layer:
+                    self.engram_modules[layer_id] = Engram(layer_id=layer_id)
+            return
+
+        tp_rank = get_tensor_model_parallel_rank()
+        is_root = tp_rank % tp_per_node == 0
+
+        for layer_id in sorted(self.engram_layer_ids):
+            if not (self.start_layer <= layer_id < self.end_layer):
+                continue
+
+            engram_state = None
+            if is_root:
+                engram = Engram(layer_id=layer_id)
+                engram_state = engram.state_dict()
+                self.engram_modules[layer_id] = engram
+
+            obj_list = [engram_state]
+            dist.broadcast_object_list(obj_list, src=root_global_rank, group=local_group)
+
+            if not is_root:
+                engram = Engram(layer_id=layer_id)
+                engram.load_state_dict(obj_list[0])
+                self.engram_modules[layer_id] = engram
+
+    def _prepare_engram_hidden_states(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        if hidden_states.dim() == 4:
+            return hidden_states
+        if hidden_states.dim() == 3:
+            batch_size, seq_len, hidden_size = hidden_states.shape
+            return hidden_states.unsqueeze(2).expand(
+                batch_size, seq_len, backbone_config.hc_mult, hidden_size
+            )
+        if hidden_states.dim() == 2:
+            seq_len, hidden_size = hidden_states.shape
+            return hidden_states.unsqueeze(0).unsqueeze(2).expand(
+                1, seq_len, backbone_config.hc_mult, hidden_size
+            )
+        return None
+
+    def _prepare_engram_input_ids(self, input_ids: Optional[torch.Tensor]) -> Optional[Any]:
+        if input_ids is None:
+            return None
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
+        elif input_ids.dim() > 2:
+            input_ids = input_ids.view(input_ids.size(0), -1)
+        return input_ids.detach().cpu().numpy()
+
+    def _run_engram(
+        self,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        engram = self.engram_modules.get(layer_id)
+        if engram is None:
+            return None
+
+        engram_hidden_states = self._prepare_engram_hidden_states(hidden_states)
+        engram_input_ids = self._prepare_engram_input_ids(input_ids)
+        if engram_hidden_states is None or engram_input_ids is None:
+            return None
+
+        output = engram(engram_hidden_states, engram_input_ids)
+        if output.device != hidden_states.device:
+            output = output.to(hidden_states.device)
+        if output.dtype != hidden_states.dtype:
+            output = output.to(hidden_states.dtype)
+        return output
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
+
+        aux_hidden_states = []
+        for i in range(self.start_layer, self.end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(
+                    hidden_states + residual if residual is not None else hidden_states
+                )
+            if i in self.engram_modules:
+                engram_output = self._run_engram(i, hidden_states, input_ids)
+                if engram_output is not None:
+                    hidden_states = hidden_states + engram_output.sum() * 0
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class Qwen2ForCausalLM(nn.Module):

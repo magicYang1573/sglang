@@ -38,9 +38,17 @@ import torch.nn as nn
 from transformers import AutoTokenizer
 from tokenizers import normalizers, Regex 
 
-from mooncake_engram_store import MooncakeEngramStore, MooncakeStoreConfig, close_mooncake_store
-from cxl_utils.cxl_engram_store import CxlEngramStore, CxlStoreConfig, close_cxl_store
-from local_engram_store import LocalEngramStore
+from .mooncake_engram_store import (
+    MooncakeEngramStore,
+    MooncakeStoreConfig,
+    close_mooncake_store,
+)
+from .cxl_utils.cxl_engram_store import (
+    CxlEngramStore,
+    CxlStoreConfig,
+    close_cxl_store,
+)
+from .local_engram_store import LocalEngramStore
 
 @dataclass
 class EngramConfig:
@@ -54,7 +62,7 @@ class EngramConfig:
     pad_id: int = 2
     seed: int = 0
     kernel_size: int = 4
-    store_backend: str = "cxl_shm"  # "mooncake", "cxl_shm", or "local"
+    store_backend: str = "local"  # "mooncake", "cxl_shm", or "local"
     
 @dataclass
 class BackBoneConfig:
