@@ -54,7 +54,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
-from sglang.srt.models.engram.engram import Engram, backbone_config, engram_cfg
+from sglang.srt.models.engram_pool.engram import Engram, backbone_config, engram_cfg
 
 Qwen2Config = None
 
