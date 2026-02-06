@@ -488,10 +488,26 @@ class Qwen2MoelEngram(Qwen2Model):
         if not self.engram_layer_ids:
             return
 
+        backbone_config.hidden_size = self.config.hidden_size
+        backbone_config.vocab_size = self.config.vocab_size
+        backbone_config.num_layers = self.config.num_hidden_layers
+        if hasattr(self.config, "tokenizer_name_or_path"):
+            engram_cfg.tokenizer_name_or_path = self.config.tokenizer_name_or_path
+        elif hasattr(self.config, "_name_or_path"):
+            engram_cfg.tokenizer_name_or_path = self.config._name_or_path
+        if hasattr(self.config, "pad_token_id") and self.config.pad_token_id is not None:
+            engram_cfg.pad_id = self.config.pad_token_id
+
         tp_group = get_tp_group()
         local_group, tp_per_node, root_global_rank = _get_tp_local_group_and_root(
             tp_group
         )
+        tp_rank = get_tensor_model_parallel_rank()
+        is_root = tp_rank % tp_per_node == 0
+
+        self.engram_local_group = local_group
+        self.engram_root_global_rank = root_global_rank
+        self.engram_is_root = is_root
 
         if local_group is None or not dist.is_initialized():
             for layer_id in sorted(self.engram_layer_ids):
@@ -499,26 +515,10 @@ class Qwen2MoelEngram(Qwen2Model):
                     self.engram_modules[layer_id] = Engram(layer_id=layer_id)
             return
 
-        tp_rank = get_tensor_model_parallel_rank()
-        is_root = tp_rank % tp_per_node == 0
-
-        for layer_id in sorted(self.engram_layer_ids):
-            if not (self.start_layer <= layer_id < self.end_layer):
-                continue
-
-            engram_state = None
-            if is_root:
-                engram = Engram(layer_id=layer_id)
-                engram_state = engram.state_dict()
-                self.engram_modules[layer_id] = engram
-
-            obj_list = [engram_state]
-            dist.broadcast_object_list(obj_list, src=root_global_rank, group=local_group)
-
-            if not is_root:
-                engram = Engram(layer_id=layer_id)
-                engram.load_state_dict(obj_list[0])
-                self.engram_modules[layer_id] = engram
+        if is_root:
+            for layer_id in sorted(self.engram_layer_ids):
+                if self.start_layer <= layer_id < self.end_layer:
+                    self.engram_modules[layer_id] = Engram(layer_id=layer_id)
 
     def _prepare_engram_hidden_states(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         if hidden_states.dim() == 4:
@@ -550,20 +550,32 @@ class Qwen2MoelEngram(Qwen2Model):
         hidden_states: torch.Tensor,
         input_ids: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        engram = self.engram_modules.get(layer_id)
-        if engram is None:
-            return None
+        local_group = getattr(self, "engram_local_group", None)
+        root_global_rank = getattr(self, "engram_root_global_rank", None)
+        is_root = getattr(self, "engram_is_root", True)
 
         engram_hidden_states = self._prepare_engram_hidden_states(hidden_states)
         engram_input_ids = self._prepare_engram_input_ids(input_ids)
-        if engram_hidden_states is None or engram_input_ids is None:
+        if engram_hidden_states is None:
             return None
+        if is_root:
+            engram = self.engram_modules.get(layer_id)
+            if engram is None or engram_input_ids is None:
+                return None
+            output = engram(engram_hidden_states, engram_input_ids)
+            if output.device != hidden_states.device:
+                output = output.to(hidden_states.device)
+            if output.dtype != hidden_states.dtype:
+                output = output.to(hidden_states.dtype)
+            if local_group is not None and dist.is_initialized():
+                dist.broadcast(output, src=root_global_rank, group=local_group)
+            return output
 
-        output = engram(engram_hidden_states, engram_input_ids)
-        if output.device != hidden_states.device:
-            output = output.to(hidden_states.device)
-        if output.dtype != hidden_states.dtype:
-            output = output.to(hidden_states.dtype)
+        if local_group is None or not dist.is_initialized():
+            return None
+        
+        output = torch.empty_like(engram_hidden_states)
+        dist.broadcast(output, src=root_global_rank, group=local_group)
         return output
 
     def forward(
@@ -592,7 +604,7 @@ class Qwen2MoelEngram(Qwen2Model):
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
-            if i in self.engram_modules:
+            if i in self.engram_layer_ids:
                 engram_output = self._run_engram(i, hidden_states, input_ids)
                 if engram_output is not None:
                     hidden_states = hidden_states + engram_output.sum() * 0

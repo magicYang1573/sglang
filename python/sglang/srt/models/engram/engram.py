@@ -151,8 +151,18 @@ class CompressedTokenizer:
         pos_mask = arr >= 0
         out = arr.copy()
         valid_ids = arr[pos_mask]
+        if valid_ids.size == 0:
+            return out
+        vocab_size = self.lookup_table.shape[0]
+        if valid_ids.max(initial=-1) >= vocab_size:
+            if engram_cfg.pad_id is not None:
+                valid_ids = np.where(
+                    valid_ids < vocab_size, valid_ids, int(engram_cfg.pad_id)
+                )
+            else:
+                valid_ids = np.clip(valid_ids, 0, vocab_size - 1)
         out[pos_mask] = self.lookup_table[valid_ids]
-        return out   
+        return out
     
     def __call__(self, input_ids):
         return self._compress(input_ids)
@@ -395,7 +405,8 @@ class MultiHeadEmbedding(nn.Module):
         self.store.put_sharded(vocab_table)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        shifted_input_ids = input_ids + self.offsets
+        offsets = self.offsets.to(device=input_ids.device)
+        shifted_input_ids = input_ids + offsets
         output = self.store.get_many(shifted_input_ids, self.layer_id, device=input_ids.device)
         return output
     
@@ -403,6 +414,22 @@ class Engram(nn.Module):
     def __init__(self, layer_id, vocab_table: Optional[torch.Tensor] = None):
         super().__init__()
         self.layer_id = layer_id
+        print(
+            "[Engram] init",
+            {
+                "layer_id": layer_id,
+                "hidden_size": backbone_config.hidden_size,
+                "hc_mult": backbone_config.hc_mult,
+                "vocab_size": backbone_config.vocab_size,
+                "num_layers": backbone_config.num_layers,
+                "max_ngram_size": engram_cfg.max_ngram_size,
+                "n_embed_per_ngram": engram_cfg.n_embed_per_ngram,
+                "n_head_per_ngram": engram_cfg.n_head_per_ngram,
+                "engram_vocab_size": engram_cfg.engram_vocab_size,
+                "kernel_size": engram_cfg.kernel_size,
+                "store_backend": engram_cfg.store_backend,
+            },
+        )
         self.hash_mapping = NgramHashMapping(
             engram_vocab_size=engram_cfg.engram_vocab_size,
             max_ngram_size = engram_cfg.max_ngram_size,
@@ -415,6 +442,8 @@ class Engram(nn.Module):
         )
 
         list_of_N = [x for y in self.hash_mapping.vocab_size_across_layers[self.layer_id] for x in y]
+
+        
         print("Layer:", self.layer_id, "; Vocab size:", list_of_N)
 
         # random/deterministic vocab table initialization
@@ -448,7 +477,9 @@ class Engram(nn.Module):
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        hash_input_ids = torch.from_numpy(self.hash_mapping.hash(input_ids)[self.layer_id])
+        hash_input_ids = torch.from_numpy(
+            self.hash_mapping.hash(input_ids)[self.layer_id]
+        ).to(device=hidden_states.device)
         embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         if embeddings.dtype != hidden_states.dtype:
             embeddings = embeddings.to(dtype=hidden_states.dtype)
