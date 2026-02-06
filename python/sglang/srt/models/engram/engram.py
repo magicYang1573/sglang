@@ -63,6 +63,7 @@ class EngramConfig:
     seed: int = 0
     kernel_size: int = 4
     store_backend: str = "local"  # "mooncake", "cxl_shm", or "local"
+    enable_prefetch: bool = True
     
 @dataclass
 class BackBoneConfig:
@@ -414,6 +415,13 @@ class Engram(nn.Module):
     def __init__(self, layer_id, vocab_table: Optional[torch.Tensor] = None):
         super().__init__()
         self.layer_id = layer_id
+        self.enable_prefetch = engram_cfg.enable_prefetch
+        self._prefetch_embeddings: Optional[torch.Tensor] = None
+        self._prefetch_event: Optional[torch.cuda.Event] = None
+        self._prefetch_shape: Optional[tuple[int, int]] = None
+        self._prefetch_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream() if torch.cuda.is_available() else None
+        )
         print(
             "[Engram] init",
             {
@@ -471,16 +479,71 @@ class Engram(nn.Module):
         )
         self.norm1 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
         self.norm2 = nn.ModuleList([nn.RMSNorm(backbone_config.hidden_size) for _ in range(backbone_config.hc_mult)])
+
+    def start_prefetch(
+        self,
+        input_ids: np.ndarray,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if not self.enable_prefetch:
+            return
+
+        hash_input_ids = torch.from_numpy(
+            self.hash_mapping.hash(input_ids)[self.layer_id]
+        ).to(device=device)
+
+        if self._prefetch_stream is not None and device.type == "cuda":
+            stream = self._prefetch_stream
+            with torch.cuda.stream(stream):
+                embeddings = self.multi_head_embedding(hash_input_ids).flatten(
+                    start_dim=-2
+                )
+                if embeddings.dtype != dtype:
+                    embeddings = embeddings.to(dtype=dtype)
+            event = torch.cuda.Event()
+            event.record(stream)
+            self._prefetch_event = event
+            self._prefetch_embeddings = embeddings
+        else:
+            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+            if embeddings.dtype != dtype:
+                embeddings = embeddings.to(dtype=dtype)
+            self._prefetch_event = None
+            self._prefetch_embeddings = embeddings
+
+        self._prefetch_shape = tuple(input_ids.shape[:2])
+
+    def _consume_prefetch(self, input_ids: np.ndarray) -> Optional[torch.Tensor]:
+        if not self.enable_prefetch:
+            return None
+        if self._prefetch_embeddings is None:
+            return None
+        if self._prefetch_shape is not None and tuple(input_ids.shape[:2]) != self._prefetch_shape:
+            self._prefetch_embeddings = None
+            self._prefetch_event = None
+            self._prefetch_shape = None
+            return None
+
+        if self._prefetch_event is not None:
+            torch.cuda.current_stream().wait_event(self._prefetch_event)
+        embeddings = self._prefetch_embeddings
+        self._prefetch_embeddings = None
+        self._prefetch_event = None
+        self._prefetch_shape = None
+        return embeddings
     
     def forward(self,hidden_states,input_ids):
         """
         hidden_states: [B, L, HC_MULT, D]
         input_ids: [B, L]
         """
-        hash_input_ids = torch.from_numpy(
-            self.hash_mapping.hash(input_ids)[self.layer_id]
-        ).to(device=hidden_states.device)
-        embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
+        embeddings = self._consume_prefetch(input_ids)
+        if embeddings is None:
+            hash_input_ids = torch.from_numpy(
+                self.hash_mapping.hash(input_ids)[self.layer_id]
+            ).to(device=hidden_states.device)
+            embeddings = self.multi_head_embedding(hash_input_ids).flatten(start_dim=-2)
         if embeddings.dtype != hidden_states.dtype:
             embeddings = embeddings.to(dtype=hidden_states.dtype)
         gates = []

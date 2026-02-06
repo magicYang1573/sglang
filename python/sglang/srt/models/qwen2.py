@@ -555,14 +555,17 @@ class Qwen2MoelEngram(Qwen2Model):
         is_root = getattr(self, "engram_is_root", True)
 
         engram_hidden_states = self._prepare_engram_hidden_states(hidden_states)
-        engram_input_ids = self._prepare_engram_input_ids(input_ids)
         if engram_hidden_states is None:
             return None
         if is_root:
             engram = self.engram_modules.get(layer_id)
-            if engram is None or engram_input_ids is None:
+            if engram is None:
                 return None
-            output = engram(engram_hidden_states, engram_input_ids)
+            engram_input_ids = self._prepare_engram_input_ids(input_ids)
+            if engram_input_ids is None:
+                output = torch.zeros_like(engram_hidden_states)
+            else:
+                output = engram(engram_hidden_states, engram_input_ids)
             if output.device != hidden_states.device:
                 output = output.to(hidden_states.device)
             if output.dtype != hidden_states.dtype:
@@ -577,6 +580,24 @@ class Qwen2MoelEngram(Qwen2Model):
         output = torch.empty_like(engram_hidden_states)
         dist.broadcast(output, src=root_global_rank, group=local_group)
         return output
+
+    def _start_engram_prefetch(
+        self,
+        input_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+    ) -> None:
+        if not getattr(self, "engram_is_root", True):
+            return
+        engram_input_ids = self._prepare_engram_input_ids(input_ids)
+        if engram_input_ids is None:
+            return
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        for layer_id in sorted(self.engram_layer_ids):
+            if self.start_layer <= layer_id < self.end_layer:
+                engram = self.engram_modules.get(layer_id)
+                if engram is not None:
+                    engram.start_prefetch(engram_input_ids, device, dtype)
 
     def forward(
         self,
@@ -597,6 +618,12 @@ class Qwen2MoelEngram(Qwen2Model):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+
+        if (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or forward_batch.forward_mode.is_decode()
+        ):
+            self._start_engram_prefetch(input_ids, hidden_states)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
