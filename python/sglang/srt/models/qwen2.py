@@ -21,13 +21,11 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-import torch.distributed as dist
 
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    get_tp_group,
 )
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -60,57 +58,6 @@ Qwen2Config = None
 
 
 logger = logging.getLogger(__name__)
-
-
-_ENGRAM_LOCAL_GROUPS: Dict[Tuple[int, ...], dist.ProcessGroup] = {}
-
-
-def _get_tp_per_node(tp_group) -> int:
-    local_size = getattr(tp_group, "local_size", 0)
-    if isinstance(local_size, int) and local_size > 0:
-        return local_size
-
-    for key in (
-        "LOCAL_WORLD_SIZE",
-        "LOCAL_SIZE",
-        "MPI_LOCALNRANKS",
-        "OMPI_COMM_WORLD_LOCAL_SIZE",
-        "SLURM_NTASKS_PER_NODE",
-    ):
-        value = os.getenv(key)
-        if value and value.isdigit():
-            return int(value)
-
-    if torch.cuda.is_available():
-        return torch.cuda.device_count()
-
-    return tp_group.world_size
-
-
-def _get_tp_local_group_and_root(tp_group) -> Tuple[Optional[dist.ProcessGroup], int, int]:
-    tp_per_node = _get_tp_per_node(tp_group)
-    tp_rank = get_tensor_model_parallel_rank()
-    root_tp_rank = tp_rank - (tp_rank % tp_per_node)
-    root_global_rank = tp_group.ranks[root_tp_rank]
-
-    if not dist.is_initialized():
-        return None, tp_per_node, root_global_rank
-
-    if tp_per_node <= 0 or tp_per_node >= tp_group.world_size:
-        return tp_group.cpu_group, tp_per_node, root_global_rank
-
-    node_id = root_global_rank // tp_per_node
-    local_ranks = [rank for rank in tp_group.ranks if rank // tp_per_node == node_id]
-    if len(local_ranks) <= 1:
-        return tp_group.cpu_group, tp_per_node, root_global_rank
-
-    group_key = tuple(local_ranks)
-    group = _ENGRAM_LOCAL_GROUPS.get(group_key)
-    if group is None:
-        group = dist.new_group(ranks=local_ranks, backend="gloo")
-        _ENGRAM_LOCAL_GROUPS[group_key] = group
-
-    return group, tp_per_node, root_global_rank
 
 
 class Qwen2MLP(nn.Module):
@@ -480,9 +427,11 @@ class Qwen2MoelEngram(Qwen2Model):
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
         )
+        self.tp_rank = get_tensor_model_parallel_rank()
         self.engram_layer_ids = set(engram_layer_ids or engram_cfg.layer_ids)
         self.engram_modules: Dict[int, Engram] = {}
-        self._init_engram_modules()
+        if self.tp_rank == 0:
+            self._init_engram_modules()
 
     def _init_engram_modules(self) -> None:
         if not self.engram_layer_ids:
@@ -498,27 +447,9 @@ class Qwen2MoelEngram(Qwen2Model):
         if hasattr(self.config, "pad_token_id") and self.config.pad_token_id is not None:
             engram_cfg.pad_id = self.config.pad_token_id
 
-        tp_group = get_tp_group()
-        local_group, tp_per_node, root_global_rank = _get_tp_local_group_and_root(
-            tp_group
-        )
-        tp_rank = get_tensor_model_parallel_rank()
-        is_root = tp_rank % tp_per_node == 0
-
-        self.engram_local_group = local_group
-        self.engram_root_global_rank = root_global_rank
-        self.engram_is_root = is_root
-
-        if local_group is None or not dist.is_initialized():
-            for layer_id in sorted(self.engram_layer_ids):
-                if self.start_layer <= layer_id < self.end_layer:
-                    self.engram_modules[layer_id] = Engram(layer_id=layer_id)
-            return
-
-        if is_root:
-            for layer_id in sorted(self.engram_layer_ids):
-                if self.start_layer <= layer_id < self.end_layer:
-                    self.engram_modules[layer_id] = Engram(layer_id=layer_id)
+        for layer_id in sorted(self.engram_layer_ids):
+            if self.start_layer <= layer_id < self.end_layer:
+                self.engram_modules[layer_id] = Engram(layer_id=layer_id)
 
     def _prepare_engram_hidden_states(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
         if hidden_states.dim() == 4:
@@ -550,35 +481,21 @@ class Qwen2MoelEngram(Qwen2Model):
         hidden_states: torch.Tensor,
         input_ids: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
-        local_group = getattr(self, "engram_local_group", None)
-        root_global_rank = getattr(self, "engram_root_global_rank", None)
-        is_root = getattr(self, "engram_is_root", True)
-
         engram_hidden_states = self._prepare_engram_hidden_states(hidden_states)
         if engram_hidden_states is None:
             return None
-        if is_root:
-            engram = self.engram_modules.get(layer_id)
-            if engram is None:
-                return None
-            engram_input_ids = self._prepare_engram_input_ids(input_ids)
-            if engram_input_ids is None:
-                output = torch.zeros_like(engram_hidden_states)
-            else:
-                output = engram(engram_hidden_states, engram_input_ids)
-            if output.device != hidden_states.device:
-                output = output.to(hidden_states.device)
-            if output.dtype != hidden_states.dtype:
-                output = output.to(hidden_states.dtype)
-            if local_group is not None and dist.is_initialized():
-                dist.broadcast(output, src=root_global_rank, group=local_group)
-            return output
-
-        if local_group is None or not dist.is_initialized():
+        engram = self.engram_modules.get(layer_id)
+        if engram is None:
             return None
-        
-        output = torch.empty_like(engram_hidden_states)
-        dist.broadcast(output, src=root_global_rank, group=local_group)
+        engram_input_ids = self._prepare_engram_input_ids(input_ids)
+        if engram_input_ids is None:
+            output = torch.zeros_like(engram_hidden_states)
+        else:
+            output = engram(engram_hidden_states, engram_input_ids)
+        if output.device != hidden_states.device:
+            output = output.to(hidden_states.device)
+        if output.dtype != hidden_states.dtype:
+            output = output.to(hidden_states.dtype)
         return output
 
     def _start_engram_prefetch(
@@ -586,8 +503,6 @@ class Qwen2MoelEngram(Qwen2Model):
         input_ids: Optional[torch.Tensor],
         hidden_states: torch.Tensor,
     ) -> None:
-        if not getattr(self, "engram_is_root", True):
-            return
         engram_input_ids = self._prepare_engram_input_ids(input_ids)
         if engram_input_ids is None:
             return
@@ -619,11 +534,12 @@ class Qwen2MoelEngram(Qwen2Model):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        if (
-            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or forward_batch.forward_mode.is_decode()
-        ):
-            self._start_engram_prefetch(input_ids, hidden_states)
+        if self.tp_rank == 0:
+            if (
+                forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+                or forward_batch.forward_mode.is_decode()
+            ):
+                self._start_engram_prefetch(input_ids, hidden_states)
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
@@ -632,10 +548,15 @@ class Qwen2MoelEngram(Qwen2Model):
                     hidden_states + residual if residual is not None else hidden_states
                 )
             if i in self.engram_layer_ids:
-                engram_output = self._run_engram(i, hidden_states, input_ids)
-                if engram_output is not None:
-                    hidden_states = hidden_states + engram_output.sum() * 0
+                if self.tp_rank == 0:
+                    engram_output = self._run_engram(i, hidden_states, input_ids)
+                    if engram_output is not None:
+                        hidden_states = hidden_states + engram_output.sum() * 0
+                else:
+                    # TODO: Transfer engram embeddings to other ranks if necessary
+                    pass
             layer = self.layers[i]
+            
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
