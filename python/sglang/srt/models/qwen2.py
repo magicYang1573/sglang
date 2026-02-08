@@ -17,6 +17,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 import logging
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -355,7 +356,10 @@ class Qwen2Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        tp_rank = get_tensor_model_parallel_rank()
+        pp_rank = self.pp_group.rank_in_group
         for i in range(self.start_layer, self.end_layer):
+            start_time = time.perf_counter()
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
@@ -367,6 +371,11 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            # print(
+            #     f"Qwen2Model layer {i} time: {elapsed_ms:.3f} ms "
+            #     f"(pp_rank={pp_rank}, tp_rank={tp_rank})"
+            # )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -466,14 +475,16 @@ class Qwen2MoelEngram(Qwen2Model):
             )
         return None
 
-    def _prepare_engram_input_ids(self, input_ids: Optional[torch.Tensor]) -> Optional[Any]:
+    def _prepare_engram_input_ids(
+        self, input_ids: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
         if input_ids is None:
             return None
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
         elif input_ids.dim() > 2:
             input_ids = input_ids.view(input_ids.size(0), -1)
-        return input_ids.detach().cpu().numpy()
+        return input_ids.detach()
 
     def _run_engram(
         self,
@@ -542,7 +553,9 @@ class Qwen2MoelEngram(Qwen2Model):
                 self._start_engram_prefetch(input_ids, hidden_states)
 
         aux_hidden_states = []
+        pp_rank = self.pp_group.rank_in_group
         for i in range(self.start_layer, self.end_layer):
+            start_time = time.perf_counter()
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
@@ -552,6 +565,11 @@ class Qwen2MoelEngram(Qwen2Model):
                     engram_output = self._run_engram(i, hidden_states, input_ids)
                     if engram_output is not None:
                         hidden_states = hidden_states + engram_output.sum() * 0
+                    elapsed_ms = (time.perf_counter() - start_time) * 1000
+                    # print(
+                    #     f"Engram layer {i} time: {elapsed_ms:.3f} ms "
+                    #     f"(pp_rank={pp_rank}, tp_rank={self.tp_rank})"
+                    # )
                 else:
                     # TODO: Transfer engram embeddings to other ranks if necessary
                     pass
@@ -563,6 +581,11 @@ class Qwen2MoelEngram(Qwen2Model):
                 forward_batch,
                 residual,
             )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            # print(
+            #     f"Qwen2MoelEngram layer {i} time: {elapsed_ms:.3f} ms "
+            #     f"(pp_rank={pp_rank}, tp_rank={self.tp_rank})"
+            # )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
