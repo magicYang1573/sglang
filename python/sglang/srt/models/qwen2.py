@@ -291,6 +291,7 @@ class Qwen2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        print(decoder_layer_type)
         # Use the provided decoder layer type or default to Qwen2DecoderLayer
         decoder_layer_type = decoder_layer_type or Qwen2DecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
@@ -492,21 +493,39 @@ class Qwen2MoelEngram(Qwen2Model):
         hidden_states: torch.Tensor,
         input_ids: Optional[torch.Tensor],
     ) -> Optional[torch.Tensor]:
+        t0 = time.perf_counter()
         engram_hidden_states = self._prepare_engram_hidden_states(hidden_states)
+        t1 = time.perf_counter()
         if engram_hidden_states is None:
             return None
         engram = self.engram_modules.get(layer_id)
+        t2 = time.perf_counter()
         if engram is None:
             return None
+        print(torch.is_grad_enabled())
         engram_input_ids = self._prepare_engram_input_ids(input_ids)
+        t3 = time.perf_counter()
         if engram_input_ids is None:
             output = torch.zeros_like(engram_hidden_states)
         else:
             output = engram(engram_hidden_states, engram_input_ids)
+        t4 = time.perf_counter()
         if output.device != hidden_states.device:
             output = output.to(hidden_states.device)
         if output.dtype != hidden_states.dtype:
             output = output.to(hidden_states.dtype)
+        t5 = time.perf_counter()
+        print(
+            "_run_engram(ms)",
+            {
+                "prep_hidden": round((t1 - t0) * 1000, 3),
+                "get_module": round((t2 - t1) * 1000, 3),
+                "prep_input": round((t3 - t2) * 1000, 3),
+                "engram_forward": round((t4 - t3) * 1000, 3),
+                "cast_output": round((t5 - t4) * 1000, 3),
+                "total": round((t5 - t0) * 1000, 3),
+            },
+        )
         return output
 
     def _start_engram_prefetch(
@@ -582,10 +601,10 @@ class Qwen2MoelEngram(Qwen2Model):
                 residual,
             )
             elapsed_ms = (time.perf_counter() - start_time) * 1000
-            # print(
-            #     f"Qwen2MoelEngram layer {i} time: {elapsed_ms:.3f} ms "
-            #     f"(pp_rank={pp_rank}, tp_rank={self.tp_rank})"
-            # )
+            print(
+                f"Qwen2MoelEngram layer {i} time: {elapsed_ms:.3f} ms "
+                f"(pp_rank={pp_rank}, tp_rank={self.tp_rank})"
+            )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
