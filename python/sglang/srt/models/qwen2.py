@@ -459,6 +459,7 @@ class Qwen2MoelEngram(Qwen2Model):
 
         for layer_id in sorted(self.engram_layer_ids):
             if self.start_layer <= layer_id < self.end_layer:
+                # self.engram_modules[layer_id] = torch.compile(Engram(layer_id=layer_id), mode="max-autotune-no-cudagraphs")
                 self.engram_modules[layer_id] = Engram(layer_id=layer_id)
 
     def _prepare_engram_hidden_states(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
@@ -502,7 +503,6 @@ class Qwen2MoelEngram(Qwen2Model):
         t2 = time.perf_counter()
         if engram is None:
             return None
-        print(torch.is_grad_enabled())
         engram_input_ids = self._prepare_engram_input_ids(input_ids)
         t3 = time.perf_counter()
         if engram_input_ids is None:
