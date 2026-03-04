@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
-# torch.set_printoptions(profile="full")
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
@@ -37,9 +36,7 @@ def _align_up(val: int, align: int) -> int:
 def _load_cxl_extension() -> object:
     """Load or build the cxl_mem_ext extension."""
 
-    src_root = (
-        Path("/root/mry/sglang/cxl_shm_test/pytorch_cxl_test")
-    )
+    src_root = Path("/root/mry/sglang/cxl_shm_test/pytorch_cxl_test")
     if not src_root.exists():
         raise ImportError(
             "cxl_mem_ext is not installed and sources were not found at "
@@ -49,20 +46,34 @@ def _load_cxl_extension() -> object:
 
     try:
         from torch.utils.cpp_extension import load
-    except Exception as exc:  # pragma: no cover - torch build path
+    except Exception as exc:  # pragma: no cover
         raise ImportError("torch.utils.cpp_extension.load is unavailable") from exc
 
     build_dir = src_root / "build"
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    # -mavx2 enables 256-bit streaming stores in nt_store_copy (4x vs scalar).
+    # -mavx512f adds 512-bit streaming stores on Sapphire Rapids and newer.
+    avx_flags = ["-mavx2"]
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["grep", "-m1", "avx512f", "/proc/cpuinfo"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode == 0 and "avx512f" in result.stdout:
+            avx_flags += ["-mavx512f", "-mavx512bw"]
+    except Exception:
+        pass
+
     return load(
         name="cxl_mem_ext",
         sources=[str(src_root / "cxl_mem.cpp"), str(src_root / "cxl_mem_pybind.cpp")],
-        extra_cflags=["-O3", "-std=c++17", "-mclflushopt", "-msse4.1"],
+        extra_cflags=["-O3", "-std=c++17", "-mclflushopt", "-msse4.1"] + avx_flags,
         extra_cuda_cflags=["-O3", "-std=c++17"],
         build_directory=str(build_dir),
         verbose=False,
-        with_cuda=True
+        with_cuda=True,
     )
 
 
@@ -118,26 +129,40 @@ class CxlShmCommunicator:
             return
 
         ctrl_init = torch.zeros(self.control_bytes, dtype=torch.int8, device="cpu")
-        
         self.ext.tensor_to_cxl(ctrl_init, offset=self.control_offset)
 
-        self._buffer_cache: Dict[Tuple[int, int, torch.dtype], torch.Tensor] = {}
-        self._reduced_cache: Dict[Tuple[int, int, torch.dtype], torch.Tensor] = {}
+        # Pre-allocated tensor cache keyed by (shape_tuple, dtype).
+        # Avoids torch.empty() on every all_reduce call.
+        self._buf: Dict[Tuple, torch.Tensor] = {}
         self.disabled = False
-
         self.all_reduce_num = 0
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_buf(self, shape: tuple, dtype: torch.dtype) -> torch.Tensor:
+        """Return a cached GPU tensor for the given shape and dtype."""
+        key = (shape, dtype)
+        if key not in self._buf:
+            self._buf[key] = torch.empty(shape, dtype=dtype, device=self.device)
+        return self._buf[key]
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
-        # print(f"Rank {self.rank} all_reduce #{self.all_reduce_num} {inp}")
         if self.disabled:
             dist.all_reduce(inp, group=self.group)
             return inp
 
         flat_inp = inp.contiguous()
         total_bytes = flat_inp.numel() * flat_inp.element_size()
-        
 
-        # the same strategy as custom_all_reduce
+        # Same heuristic as custom_all_reduce: use 1-stage (all-gather + sum)
+        # for small tensors or 2-rank groups; 2-stage (reduce-scatter + all-
+        # gather) for large tensors with more ranks.
         use_one_stage = False
         if self.world_size == 2:
             use_one_stage = True
@@ -146,17 +171,11 @@ class CxlShmCommunicator:
         elif self.world_size == 8 and total_bytes < 256 * 1024:
             use_one_stage = True
 
-
         if use_one_stage:
-            ret = self.all_reduce_1_stage(flat_inp)
-            # print(f"Rank {self.rank} completed all_reduce #{self.all_reduce_num - 1} {ret}")
-            return ret
+            return self.all_reduce_1_stage(flat_inp)
         return self.all_reduce_2_stage(flat_inp)
 
     def all_reduce_1_stage(self, inp: torch.Tensor) -> torch.Tensor:
-
-        # print(f"Rank {self.rank} entering all_reduce_1_stage #{self.all_reduce_num}")
-        
         flat_inp = inp.contiguous()
         slot_bytes = flat_inp.numel() * flat_inp.element_size()
         required_bytes = self.data_offset + self.world_size * slot_bytes
@@ -170,31 +189,19 @@ class CxlShmCommunicator:
             return flat_inp
 
         t0 = time.perf_counter()
+
+        # Write this rank's full tensor to its slot in the CXL window.
         self.ext.tensor_to_cxl(
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
         t_write = time.perf_counter()
-        self._barrier()
-        # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
+        self._barrier()
         t_barrier1 = time.perf_counter()
 
-        gather = torch.empty(
-            (self.world_size, flat_inp.numel()),
-            dtype=flat_inp.dtype,
-            device=self.device,
-        )
-
-        gather = self.ext.cxl_to_tensor(
-            gather, offset=self.data_offset
-        ).view_as(gather)
-
-        # for src in range(self.world_size):
-        #     if src == self.rank:
-        #         continue
-        #     gather[src] = self.ext.cxl_to_tensor(
-        #         gather[src], offset=self.data_offset + src * slot_bytes
-        #     )
+        # Read all slots in one contiguous CXL read (avoids N separate calls).
+        gather = self._get_buf((self.world_size, flat_inp.numel()), flat_inp.dtype)
+        self.ext.cxl_to_tensor(gather, offset=self.data_offset)
         t_read = time.perf_counter()
 
         reduced = gather.sum(dim=0)
@@ -207,9 +214,9 @@ class CxlShmCommunicator:
             + (t_read - t_barrier1)
             + (t_reduce - t_read)
         )
-        
         logger.info(
-            "[%d] Rank %d AR1 timing (us) %s: write=%.1f barrier1=%.1f read=%.1f reduce=%.1f other=%.1f total=%.1f",
+            "[%d] Rank %d AR1 timing (us) %s: write=%.1f barrier1=%.1f "
+            "read=%.1f reduce=%.1f other=%.1f total=%.1f",
             self.all_reduce_num,
             self.rank,
             inp.shape,
@@ -225,13 +232,11 @@ class CxlShmCommunicator:
         return reduced.view_as(inp)
 
     def all_reduce_2_stage(self, inp: torch.Tensor) -> torch.Tensor:
-
-        # print(f"Rank {self.rank} entering all_reduce_2_stage #{self.all_reduce_num}")
         flat_inp = inp.contiguous()
         total_ele_num = flat_inp.numel()
         if total_ele_num % self.world_size != 0:
             logger.warning(
-                "Last dimension (%d) must be divisible by world size (%d); falling back",
+                "numel (%d) must be divisible by world_size (%d); falling back",
                 total_ele_num,
                 self.world_size,
             )
@@ -253,38 +258,41 @@ class CxlShmCommunicator:
             return flat_inp
 
         t0 = time.perf_counter()
+
+        # Stage 1: every rank writes its full tensor to its CXL slot.
         self.ext.tensor_to_cxl(
             flat_inp, offset=self.data_offset + self.rank * slot_bytes
         )
         t_write = time.perf_counter()
         self._barrier()
         t_barrier1 = time.perf_counter()
-        # print(f"a> [{self.all_reduce_num}] Rank {self.rank} completed data write barrier")
 
-        gather = torch.empty((self.world_size, shard_h), dtype=flat_inp.dtype, device=self.device)
-
-        for src in range(self.world_size):
-            shard_offset = self.rank * shard_bytes
-            gather[src] = self.ext.cxl_to_tensor(
-                gather[src],
-                offset=self.data_offset + src * slot_bytes + shard_offset,
-            )
-
+        # Stage 2: each rank reads its responsible shard from every peer.
+        # Use cxl_to_tensor_shards for parallel multi-threaded CXL reads
+        # (one thread per peer) followed by a single H2D DMA transfer.
+        shard_offset = self.rank * shard_bytes
+        offsets = [
+            self.data_offset + src * slot_bytes + shard_offset
+            for src in range(self.world_size)
+        ]
+        gather = self._get_buf((self.world_size, shard_h), flat_inp.dtype)
+        self.ext.cxl_to_tensor_shards(gather, offsets, shard_bytes)
         t_read = time.perf_counter()
 
         reduced_shard = gather.sum(dim=0)
         t_reduce = time.perf_counter()
 
+        # Stage 3: write the locally-reduced shard back to CXL.
         self.ext.tensor_to_cxl(
             reduced_shard, offset=reduced_base + self.rank * shard_bytes
         )
         t_write_reduce = time.perf_counter()
         self._barrier()
         t_barrier2 = time.perf_counter()
-        # print(f"b> [{self.all_reduce_num}] Rank {self.rank} completed reduce write barrier")
 
-        reduce_res = torch.empty((total_ele_num), dtype=flat_inp.dtype, device=self.device)
-        reduce_res = self.ext.cxl_to_tensor(reduce_res,offset=reduced_base)
+        # Stage 4: read all reduced shards in one contiguous CXL read.
+        reduce_res = self._get_buf((total_ele_num,), flat_inp.dtype)
+        self.ext.cxl_to_tensor(reduce_res, offset=reduced_base)
         t_read_reduce = time.perf_counter()
 
         total = t_read_reduce - t0
@@ -296,10 +304,11 @@ class CxlShmCommunicator:
             + (t_write_reduce - t_reduce)
             + (t_barrier2 - t_write_reduce)
             + (t_read_reduce - t_barrier2)
-            # + (t_barrier3 - t_read_reduce)
         )
         logger.info(
-            "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f other=%.1f total=%.1f",
+            "Rank %d AR2 timing (us): write=%.1f barrier1=%.1f read_shard=%.1f "
+            "reduce=%.1f write_red=%.1f barrier2=%.1f read_red=%.1f "
+            "other=%.1f total=%.1f",
             self.rank,
             (t_write - t0) * 1e6,
             (t_barrier1 - t_write) * 1e6,
@@ -312,10 +321,8 @@ class CxlShmCommunicator:
             total * 1e6,
         )
 
-        ret = reduce_res.view_as(inp)
         self.all_reduce_num += 1
-
-        return ret
+        return reduce_res.view_as(inp)
 
     def _barrier(self):
         token = self.stage_token
@@ -326,16 +333,3 @@ class CxlShmCommunicator:
             rank=self.rank,
             num_ranks=self.world_size,
         )
-
-        # token_tensor = torch.tensor([token], dtype=torch.int32, device="cpu")
-        
-        # self.ext.tensor_to_cxl(
-        #     token_tensor, offset=self.control_offset + self.rank * token_tensor.element_size()
-        # )
-
-        # while True:
-        #     self._ctrl_readback = self.ext.cxl_to_tensor(self._ctrl_readback, offset=self.control_offset)
-        #     if torch.all(self._ctrl_readback >= token):
-        #         break
-        #     time.sleep(self.barrier_sleep)
-
