@@ -32,30 +32,51 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
 void *cxl_base_ptr();
 std::size_t cxl_map_length();
 
-void cxl_read_reduce_shards_to_vram(
-    void *device_dst,
-    std::size_t shard_bytes,
-    const std::size_t *src_offsets,
-    int num_srcs,
-    int elem_type);
+// -----------------------------------------------------------------------
+// GPU-reduce transfer primitives
+// C++ handles all CXL clflush + cudaMemcpy bookkeeping.
+// The caller (Python) performs the actual reduction on the GPU.
+// -----------------------------------------------------------------------
 
-void cxl_allreduce_1stage(
-    void *device_inout,
+// 1-stage: write own slot to CXL, run barrier, bulk-copy all slots to GPU.
+//   device_gather_dst must hold (num_ranks * slot_bytes) bytes on the device.
+void cxl_write_barrier_gather_1stage(
+    void *device_src,
+    void *device_gather_dst,
     std::size_t slot_bytes,
     std::size_t data_offset,
     std::size_t control_offset,
     int rank,
     int num_ranks,
-    int32_t token,
-    int elem_type);
+    int32_t token);
 
-void cxl_allreduce_2stage(
-    void *device_inout,
-    std::size_t total_bytes,
+// 2-stage scatter phase:
+//   - Write full tensor to CXL, run barrier 1.
+//   - Strided-gather "my shard" from every peer into a contiguous GPU buffer
+//     using a single cudaMemcpy2D call.
+//   device_shard_dst must hold (num_ranks * shard_bytes) bytes on the device.
+void cxl_write_barrier_scatter_2stage(
+    void *device_src,
+    void *device_shard_dst,
+    std::size_t slot_bytes,
+    std::size_t shard_bytes,
     std::size_t data_offset,
+    std::size_t control_offset,
+    int rank,
+    int num_ranks,
+    int32_t token);
+
+// 2-stage gather phase:
+//   - Write the GPU-reduced shard to CXL, run barrier 2.
+//   - Bulk-copy all reduced shards (contiguous in CXL) to GPU.
+//   device_result_dst must hold (total_bytes) bytes on the device.
+void cxl_write_barrier_allgather_2stage(
+    void *device_reduced_src,
+    void *device_result_dst,
+    std::size_t shard_bytes,
+    std::size_t total_bytes,
     std::size_t reduced_base,
     std::size_t control_offset,
     int rank,
     int num_ranks,
-    int32_t token_start,
-    int elem_type);
+    int32_t token);
