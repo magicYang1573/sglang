@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cuda_runtime_api.h>
 #include <string>
 #include <sys/types.h>
@@ -27,3 +28,34 @@ bool cxl2vram(void *device_dst,
 bool cxl_close();
 
 void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ranks);
+
+void *cxl_base_ptr();
+std::size_t cxl_map_length();
+
+void cxl_read_reduce_shards_to_vram(
+    void *device_dst,
+    std::size_t shard_bytes,
+    const std::size_t *src_offsets,
+    int num_srcs,
+    int elem_type);
+
+void cxl_allreduce_1stage(
+    void *device_inout,
+    std::size_t slot_bytes,
+    std::size_t data_offset,
+    std::size_t control_offset,
+    int rank,
+    int num_ranks,
+    int32_t token,
+    int elem_type);
+
+void cxl_allreduce_2stage(
+    void *device_inout,
+    std::size_t total_bytes,
+    std::size_t data_offset,
+    std::size_t reduced_base,
+    std::size_t control_offset,
+    int rank,
+    int num_ranks,
+    int32_t token_start,
+    int elem_type);
