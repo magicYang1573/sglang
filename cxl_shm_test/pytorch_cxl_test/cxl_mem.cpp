@@ -241,7 +241,7 @@ void cxl_barrier_tp(int32_t token, int64_t control_offset, int rank, int num_ran
     while (true) {
         bool all_ready = true;
 		std::vector<int32_t> tokens;
-		clflush_range((void*)(base_ptr+control_offset), num_ranks*kCacheLine);
+		clflush_range((void*)(base_ptr), num_ranks*kCacheLine);
         for (int i = 0; i < num_ranks; i++) {
 
             volatile int32_t* other_token_ptr = reinterpret_cast<int32_t*>(base_ptr + i * kCacheLine);
