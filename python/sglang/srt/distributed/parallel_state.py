@@ -552,6 +552,34 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        def _sync_cuda_for_timing(tensor: torch.Tensor) -> bool:
+            if not tensor.is_cuda:
+                return False
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            torch.cuda.synchronize(device=tensor.device)
+            return True
+
+        def _finish_and_log(path: str, t0: float, out: torch.Tensor, synced: bool) -> torch.Tensor:
+            if synced:
+                _sync_cuda_for_timing(out)
+            elapsed_us = (time.perf_counter() - t0) * 1e6
+            logger.info(
+                "[AR][%d] rank=%d path=%s shape=%s dtype=%s elapsed=%.1f us",
+                self.all_reduce_num,
+                self.rank,
+                path,
+                tuple(input_.shape),
+                str(input_.dtype),
+                elapsed_us,
+            )
+            self.all_reduce_num += 1
+            return out
+
+        # Synchronize before starting timer to avoid including previous queued work.
+        synced = _sync_cuda_for_timing(input_)
+        t0 = time.perf_counter()
+
         # On AMD, use the deterministic 1-stage kernel when:
         # - SGLANG_USE_1STAGE_ALLREDUCE=1 (explicitly enabled), OR
         # - SGLANG_USE_1STAGE_ALLREDUCE not set AND --enable-deterministic-inference is on
@@ -565,40 +593,47 @@ class GroupCoordinator:
                 inp_size = input_.numel() * input_.element_size()
                 # Try unregistered mode first (faster for smaller tensors)
                 if inp_size < self.ca_comm.max_size:
-                    return self.ca_comm.deterministic_all_reduce(
+                    ret = self.ca_comm.deterministic_all_reduce(
                         input_, registered=False
                     )
+                    return _finish_and_log("deterministic_ca_unregistered", t0, ret, synced)
                 # Use registered mode for larger tensors
                 self.ca_comm.register_buffer(input_)
-                return self.ca_comm.deterministic_all_reduce(input_, registered=True)
+                ret = self.ca_comm.deterministic_all_reduce(input_, registered=True)
+                return _finish_and_log("deterministic_ca_registered", t0, ret, synced)
 
         if input_.is_cpu:
             if is_shm_available(input_.dtype, self.world_size, self.local_size):
                 torch.ops.sgl_kernel.shm_allreduce(input_, REDUCE_OP_SUM)
+                return _finish_and_log("cpu_shm_allreduce", t0, input_, synced)
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
-            return input_
+                return _finish_and_log("cpu_dist_allreduce", t0, input_, synced)
 
         if self.cxl_shm_communicator is not None and not self.cxl_shm_communicator.disabled:
             # print("Using CXL SHM communicator for all-reduce", flush=True)
             # output_cxl = self.cxl_shm_communicator.all_reduce(input_)
-            return self.cxl_shm_communicator.all_reduce(input_)
+            ret = self.cxl_shm_communicator.all_reduce(input_)
+            return _finish_and_log("cxl_shm", t0, ret, synced)
         
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
-            return self.hpu_communicator.all_reduce(input_)
+            ret = self.hpu_communicator.all_reduce(input_)
+            return _finish_and_log("hpu", t0, ret, synced)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
-            return self.xpu_communicator.all_reduce(input_)
+            ret = self.xpu_communicator.all_reduce(input_)
+            return _finish_and_log("xpu", t0, ret, synced)
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
-            return self.npu_communicator.all_reduce(input_)
+            ret = self.npu_communicator.all_reduce(input_)
+            return _finish_and_log("npu", t0, ret, synced)
 
         if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
             with self.pynccl_comm.change_state(
                 enable=True, stream=get_current_device_stream_fast()
             ):
                 self.pynccl_comm.all_reduce(input_)
-                return input_
+                return _finish_and_log("pynccl", t0, input_, synced)
 
         outplace_all_reduce_method = None
         if (
@@ -649,10 +684,10 @@ class GroupCoordinator:
             # self.all_reduce_num += 1
 
             # return output_cxl # if return output_cxl then failed inference result
-            return ret  # correct result
+            return _finish_and_log(f"outplace_{outplace_all_reduce_method}", t0, ret, synced)
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
-            return input_
+            return _finish_and_log("inplace_default", t0, input_, synced)
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
