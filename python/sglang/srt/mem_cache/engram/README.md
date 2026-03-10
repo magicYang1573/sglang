@@ -134,9 +134,149 @@ Global defaults are defined in `models/engram/engram.py` via the
 | `layer_ids` | `[1, 15]` | Transformer layer indices where Engram is injected |
 | `enable_prefetch` | `True` | Async embedding prefetch on a separate CUDA stream |
 
+## Engram Compute Pipeline
+
+Engram's compute path consists of three stages: **token hashing**, **embedding
+lookup**, and **gated projection**. When prefetch is enabled a fourth
+overlapping stage runs asynchronously on a side CUDA stream.
+
+### Stage 1 — Token compression & n-gram hashing
+
+Before any embedding lookup, raw token IDs are normalised by
+`CompressedTokenizer` (NFKC/NFD normalisation, accent stripping, case folding,
+whitespace collapsing) to collapse semantically equivalent tokens to the same
+compressed ID. This reduces the effective vocabulary and improves hash
+collision quality.
+
+`NgramHashMapping.hash_torch` then computes, for every token position and
+every Engram-injected layer, a set of hash indices using a prime-modulo XOR
+scheme:
+
+```
+mix_n = token[t] * m[0]  XOR  token[t-1] * m[1]  XOR  ...  XOR  token[t-n+1] * m[n-1]
+hash_n_head_j = mix_n  %  prime_j          # prime_j is unique per (layer, ngram, head)
+```
+
+Multipliers `m[k]` are seeded deterministically per layer so each layer
+produces an independent hash space. The output is
+`hash_input_ids: [B, T, num_heads_total]` where
+`num_heads_total = (max_ngram_size - 1) * n_head_per_ngram`.
+
+### Stage 2 — Multi-head embedding lookup
+
+`MultiHeadEmbedding` maps each hash index to a `head_dim`-dimensional vector
+by calling `EngramStore.get_many`. The per-head offsets are added to the raw
+hash indices so that all heads share a single flat embedding table in the
+store. The results are concatenated:
+
+```
+# Tensor shapes with default config (max_ngram_size=3, n_head=8, head_dim=64):
+raw_embeddings : [B, T, 16, 64]   # 16 heads × 64-dim
+embeddings     : [B, T, 1024]     # flattened  (engram_hidden_size)
+```
+
+### Stage 3 — Gated projection & short convolution
+
+The flattened embeddings are projected into the backbone's hidden space and
+combined with the current `hidden_states` via a learned scalar gate:
+
+```
+input_ids [B, T]
+    │
+    ▼
+CompressedTokenizer.compress_torch()       # token-space normalisation
+    │
+    ▼
+NgramHashMapping.hash_torch()              # per-layer prime-modulo XOR hashing
+    │  → hash_input_ids [B, T, num_heads_total]
+    ▼
+MultiHeadEmbedding.forward()               # store.get_many  (CPU DRAM → GPU)
+    │  → raw_embeddings [B, T, num_heads_total, head_dim]
+    │  .flatten(start_dim=-2)
+    │  → embeddings [B, T, engram_hidden_size]
+    ▼
+key_projs_all (Linear)                     # project to [B, T, hc_mult, D]
+    │
+    ├─► parallel_rms_norm (norm1_weight)   # normalise keys
+    │
+hidden_states [B, T, hc_mult, D]
+    │
+    └─► parallel_rms_norm (norm2_weight)   # normalise queries
+    │
+    ▼
+gate = sigmoid( (normed_key · normed_query) / √D )   # scalar gate per head
+    │  shape: [B, T, hc_mult, 1]
+    ▼
+value_proj (Linear)  →  v [B, T, 1, D]
+    │
+    ▼
+value = gate * v                           # gated value
+    │
+    ▼
+output = value + ShortConv(value)          # residual depthwise conv
+    │  shape: [B, T, hc_mult, D]
+    ▼
+added back to hidden_states (hyper-connection residual)
+```
+
+`ShortConv` applies a grouped depthwise 1-D convolution (kernel size 4,
+dilation = `max_ngram_size`) with RMSNorm and SiLU, capturing local sequential
+context on top of the retrieved embeddings.
+
+### Tensor size summary
+
+```
+num_ngram_orders  = max_ngram_size - 1              # e.g. 2  (bigram + trigram)
+num_heads         = n_head_per_ngram                # e.g. 8
+head_dim          = n_embed_per_ngram // num_heads  # e.g. 512 // 8 = 64
+total_heads       = num_ngram_orders * num_heads    # e.g. 16
+engram_hidden_size = num_ngram_orders * n_embed_per_ngram  # e.g. 1024
+```
+
+### Stage 4 — Async prefetch (optional)
+
+When `enable_prefetch=True` (default), Stages 1–2 (hashing + embedding
+lookup) are kicked off on a dedicated side CUDA stream at the very beginning
+of each decode-step forward pass — **before any Transformer layer runs** —
+so that the CPU→GPU embedding transfer overlaps with the entire layer stack:
+
+```
+Qwen2MoelEngram.forward()
+    │
+    ├── embed_tokens(input_ids)                      # (main stream)
+    │
+    ├──[side stream]──► _start_engram_prefetch()     # fired once per forward
+    │                       for each engram layer_id:
+    │                           compress_torch()
+    │                           hash_torch()
+    │                           get_many()  ← CPU DRAM → GPU transfer
+    │                           cuda.Event.record(prefetch_event)
+    │
+    ├── layer 0  (main stream) ◄─── overlaps with side stream above
+    ├── layer 1
+    ├── ...
+    ├── layer N  (Engram-injected)
+    │       └─► Engram.forward()
+    │               └─► _consume_prefetch()
+    │                       main_stream.wait_event(prefetch_event)  # sync
+    │                       return cached embeddings  # Stages 1-2 done
+    │                       → Stage 3: gate + proj + conv
+    ├── ...
+    └── layer M  (next Engram-injected, if any)
+            └─► Engram.forward() → _consume_prefetch() → ...
+```
+
+`_start_engram_prefetch` iterates over all Engram-injected `layer_id`s and
+calls `start_prefetch` on each, so every Engram layer's embeddings are
+prefetched in parallel on the same side stream before the first Transformer
+layer executes. By the time execution reaches an Engram-injected layer, the
+transfer is typically already complete and `_consume_prefetch` only inserts a
+lightweight `wait_event` barrier.
+
+
 ## TODO
 
 - [ ] Support CUDA graph capture with Engram enabled (currently requires `--disable-cuda-graph`)
 - [ ] Production-ready DeepSeek model integration
-- [ ] Custom CUDA kernels for hash mapping and embedding gather
+- [ ] **Custom CUDA kernel for Engram** — replace the current multi-step Python/Triton pipeline with a single fused CUDA kernel covering: token compression, prime-modulo XOR hash computation, multi-head embedding gather (coalesced global-memory reads from CPU-pinned or GPU-resident tables), gate-value computation, and the short depthwise convolution. A fused kernel would eliminate intermediate tensor allocations, reduce kernel-launch overhead, and enable warp-level optimisations for the irregular gather pattern inherent to n-gram hash lookups.
 - [ ] Distributed TP (tensor parallel) support for Engram embeddings across ranks
