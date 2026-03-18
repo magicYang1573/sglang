@@ -102,20 +102,45 @@ def _get_nsa_topk_log_writer():
     return _nsa_topk_log_writer
 
 
+def _should_log_token_pos(token_pos: int) -> bool:
+    """Return True if token_pos should be logged.
+
+    Rules:
+      1. token_pos must be >= 2048.
+      2. token_pos must fall within 64 positions before (inclusive) any
+         1024-aligned boundary, i.e. token_pos in [m-64, m] for some positive
+         integer multiple m of 1024.
+    """
+    if token_pos < 2048:
+        return False
+    # Distance from token_pos to the next 1024-aligned position (inclusive of
+    # the boundary itself, so boundary distance == 0).
+    next_boundary = ((token_pos // 1024) + 1) * 1024
+    dist_to_next = next_boundary - token_pos  # in [1, 1024]
+    # Log if within 64 tokens before the next boundary, or exactly on the
+    # previous boundary (dist_to_next == 1024 means token_pos is a multiple of 1024).
+    return dist_to_next <= 64 or token_pos % 1024 == 0
+
+
 def _log_nsa_topk_indices(
     mode: str,
     forward_batch,
     layer_id: int,
     topk_indices: torch.Tensor,
 ) -> None:
-    """Write one CSV row per token whose request context length exceeds the threshold.
+    """Write one CSV row per token that satisfies the logging filter.
+
+    Filters applied per token:
+      1. ctx_len > _NSA_TOPK_LOG_MIN_CTX  (default 2048)
+      2. token_pos is within 64 positions before (or exactly on) a 1024-aligned
+         boundary: i.e. token_pos % 1024 == 0, or (next_1024_multiple - token_pos) <= 64
 
     Decode mode: topk_indices shape is [batch_size, topk] — one row per request.
     Extend mode: topk_indices shape is [total_tokens, topk] — tokens from all
     requests are flattened together, so we use extend_seq_lens_cpu to slice them
     back per request and write one row per token.
 
-    CSV columns: mode, req_id, layer_id, ctx_len, token_pos_in_ctx, topk_indices
+    CSV columns: mode, req_id, layer_id, ctx_len, token_pos, topk_indices
     """
     writer = _get_nsa_topk_log_writer()
     if writer is None:
@@ -134,16 +159,19 @@ def _log_nsa_topk_indices(
         for i, ctx_len in enumerate(seq_lens_cpu):
             if ctx_len <= _NSA_TOPK_LOG_MIN_CTX:
                 continue
+            # In decode mode the new token sits at position ctx_len - 1
+            token_pos = ctx_len - 1
+            if not _should_log_token_pos(token_pos):
+                continue
             req_id = rids[i] if (rids is not None and i < len(rids)) else i
             indices_str = ";".join(str(x) for x in topk_cpu[i])
-            # token_pos is the last token (0-indexed)
-            writer.writerow([mode, req_id, layer_id, ctx_len, ctx_len - 1, indices_str])
+            writer.writerow([mode, req_id, layer_id, ctx_len, token_pos, indices_str])
 
     else:
         # Extend mode: topk_indices rows are all tokens from all requests, flattened.
-        # extend_seq_lens_cpu[i]   = number of new tokens for request i
+        # extend_seq_lens_cpu[i]    = number of new tokens for request i
         # extend_prefix_lens_cpu[i] = number of already-cached prefix tokens for request i
-        # seq_lens_cpu[i]          = total context length (prefix + new tokens)
+        # seq_lens_cpu[i]           = total context length (prefix + new tokens)
         extend_seq_lens = forward_batch.extend_seq_lens_cpu  # list[int]
         extend_prefix_lens = forward_batch.extend_prefix_lens_cpu  # list[int] or None
 
@@ -153,8 +181,9 @@ def _log_nsa_topk_indices(
             if ctx_len > _NSA_TOPK_LOG_MIN_CTX:
                 req_id = rids[0] if (rids is not None and len(rids) > 0) else 0
                 for tok_offset, row in enumerate(topk_cpu):
-                    indices_str = ";".join(str(x) for x in row)
-                    writer.writerow([mode, req_id, layer_id, ctx_len, tok_offset, indices_str])
+                    if _should_log_token_pos(tok_offset):
+                        indices_str = ";".join(str(x) for x in row)
+                        writer.writerow([mode, req_id, layer_id, ctx_len, tok_offset, indices_str])
             return
 
         token_offset = 0
@@ -170,6 +199,8 @@ def _log_nsa_topk_indices(
                         break
                     # Absolute position of this token in the full context
                     token_pos = prefix_len + j
+                    if not _should_log_token_pos(token_pos):
+                        continue
                     indices_str = ";".join(str(x) for x in topk_cpu[row_idx])
                     writer.writerow([mode, req_id, layer_id, ctx_len, token_pos, indices_str])
 
