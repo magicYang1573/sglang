@@ -180,7 +180,8 @@ def _print_table(w: int, ctx_buckets, layers, arr: np.ndarray):
 
     col_w = 8
     # Header row
-    row = f"{'ctx\\layer':>12}" + "".join(f"{str(l):>{col_w}}" for l in layers)
+    header_label = "ctx\\layer"
+    row = f"{header_label:>12}" + "".join(f"{str(l):>{col_w}}" for l in layers)
     print(row)
     print("-" * len(row))
 
