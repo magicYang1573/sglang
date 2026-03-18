@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import logging
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -70,6 +73,68 @@ global_workspace_buffer = None
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
+
+# ---------------------------------------------------------------------------
+# NSA top-k index logger
+# Logs per-request, per-layer sparse attention top-k indices to a CSV file.
+# Only records entries where the context length exceeds NSA_TOPK_LOG_MIN_CTX
+# (default 2048, matching DeepSeek-V3's sparse KV cache window size).
+# Set env var SGLANG_NSA_TOPK_LOG_PATH to a file path to enable logging.
+# ---------------------------------------------------------------------------
+_NSA_TOPK_LOG_MIN_CTX: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_MIN_CTX", "2048"))
+_NSA_TOPK_LOG_PATH: Optional[str] = os.environ.get("SGLANG_NSA_TOPK_LOG_PATH", None)
+
+_nsa_topk_log_file = None
+_nsa_topk_log_writer = None
+
+
+def _get_nsa_topk_log_writer():
+    global _nsa_topk_log_file, _nsa_topk_log_writer
+    if _nsa_topk_log_writer is not None:
+        return _nsa_topk_log_writer
+    if _NSA_TOPK_LOG_PATH is None:
+        return None
+    _nsa_topk_log_file = open(_NSA_TOPK_LOG_PATH, "w", newline="", buffering=1)
+    _nsa_topk_log_writer = csv.writer(_nsa_topk_log_file)
+    _nsa_topk_log_writer.writerow(
+        ["mode", "req_id", "layer_id", "ctx_len", "topk_indices"]
+    )
+    return _nsa_topk_log_writer
+
+
+def _log_nsa_topk_indices(
+    mode: str,
+    forward_batch,
+    layer_id: int,
+    topk_indices: torch.Tensor,
+) -> None:
+    """Write one CSV row per request whose context length exceeds the threshold.
+
+    Args:
+        mode: "decode" or "extend".
+        forward_batch: the ForwardBatch for this step.
+        layer_id: attention layer index.
+        topk_indices: shape [batch_size, topk] on any device.
+    """
+    writer = _get_nsa_topk_log_writer()
+    if writer is None:
+        return
+
+    seq_lens = forward_batch.seq_lens  # tensor [batch_size]
+    rids = forward_batch.rids  # list[str] or None
+
+    # Move to CPU once for the whole batch
+    seq_lens_cpu = seq_lens.tolist() if seq_lens is not None else []
+    topk_cpu = topk_indices.cpu().tolist()  # list[list[int]]
+
+    batch_size = len(seq_lens_cpu)
+    for i in range(batch_size):
+        ctx_len = seq_lens_cpu[i]
+        if ctx_len <= _NSA_TOPK_LOG_MIN_CTX:
+            continue
+        req_id = rids[i] if (rids is not None and i < len(rids)) else i
+        indices_str = ";".join(str(x) for x in topk_cpu[i])
+        writer.writerow([mode, req_id, layer_id, ctx_len, indices_str])
 
 
 @dataclass(frozen=True)
@@ -1333,6 +1398,10 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
+        # Log top-k sparse attention indices for analysis
+        if topk_indices is not None:
+            _log_nsa_topk_indices("extend", forward_batch, layer.layer_id, topk_indices)
+
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method()
         if envs.SGLANG_NSA_FUSE_TOPK.get():
@@ -1503,6 +1572,10 @@ class NativeSparseAttnBackend(
         # Align topk_indices with q dimensions
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
+        # Log top-k sparse attention indices for analysis
+        if topk_indices is not None:
+            _log_nsa_topk_indices("decode", forward_batch, layer.layer_id, topk_indices)
 
         if envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
