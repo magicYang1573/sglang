@@ -76,17 +76,27 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 # ---------------------------------------------------------------------------
 # NSA top-k index logger
 #
-# Stores per-request sparse attention top-k indices in binary numpy (.npz)
-# format — one file per request, written to SGLANG_NSA_TOPK_LOG_DIR.
+# Stores per-request sparse attention top-k indices as append-only binary files,
+# one file per request, written to SGLANG_NSA_TOPK_LOG_DIR.
 #
-# Each .npz contains a single structured array "records" with dtype:
+# File format  (<req_id>.bin)
+# ────────────────────────────
+# Header (8 bytes, written once on file creation):
+#   magic     : uint32  = 0x4E534154  ("NSAT")
+#   topk_width: uint32  = number of top-k indices per token
+#
+# Records (fixed size, appended immediately on each logged token):
 #   mode      : uint8   (0 = extend, 1 = decode)
 #   layer_id  : uint8
+#   _pad      : uint8 × 2   (alignment)
 #   ctx_len   : int32
 #   token_pos : int32
-#   topk      : int32[<topk_width>]   (topk_width determined on first write)
+#   topk      : int32 × topk_width
 #
-# Filter rules (both must hold to log a token):
+# Records are written directly to disk without buffering, so the file remains
+# valid even if the process is killed mid-run.
+#
+# Filter rules (all must hold to log a token):
 #   1. ctx_len  > _NSA_TOPK_LOG_MIN_CTX  (default 2048)
 #   2. token_pos >= 2048
 #   3. token_pos falls within _NSA_TOPK_LOG_WINDOW positions before (inclusive)
@@ -101,11 +111,13 @@ _NSA_TOPK_LOG_DIR: Optional[str] = os.environ.get("SGLANG_NSA_TOPK_LOG_DIR", Non
 _NSA_TOPK_LOG_BOUNDARY: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_BOUNDARY", "4096"))
 _NSA_TOPK_LOG_WINDOW: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_WINDOW", "8"))
 
-# req_id -> list of raw record tuples accumulated before flush
-# Each tuple: (mode_int, layer_id, ctx_len, token_pos, topk_np_1d)
-_nsa_topk_buffers: Dict[str, list] = {}
-# req_id -> path of the .npz file already written (for append logic)
-_nsa_topk_written: Dict[str, str] = {}
+_NSA_TOPK_MAGIC = 0x4E534154  # "NSAT"
+_NSA_TOPK_HEADER_SIZE = 8     # magic(4) + topk_width(4)
+
+# req_id -> open file handle (opened in "ab" mode for atomic appends)
+_nsa_topk_file_handles: Dict[str, "BinaryIO"] = {}  # type: ignore[name-defined]
+# req_id -> topk_width recorded at file creation (consistency check)
+_nsa_topk_widths: Dict[str, int] = {}
 
 
 def _should_log_token_pos(token_pos: int) -> bool:
@@ -118,42 +130,24 @@ def _should_log_token_pos(token_pos: int) -> bool:
     return (next_boundary - token_pos) <= _NSA_TOPK_LOG_WINDOW
 
 
-def _flush_req_log(req_id: str, records: list) -> None:
-    """Append *records* for *req_id* to its per-request .npz file."""
-    if not records or _NSA_TOPK_LOG_DIR is None:
-        return
+def _get_file_handle(req_id: str, topk_width: int):
+    """Return (and lazily create) the append-mode file handle for *req_id*."""
+    if req_id in _nsa_topk_file_handles:
+        return _nsa_topk_file_handles[req_id]
 
     os.makedirs(_NSA_TOPK_LOG_DIR, exist_ok=True)
+    safe_id = req_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+    path = os.path.join(_NSA_TOPK_LOG_DIR, f"{safe_id}.bin")
 
-    # Infer topk width from first record
-    topk_width = records[0][4].shape[0]
-    dtype = np.dtype([
-        ("mode",      np.uint8),
-        ("layer_id",  np.uint8),
-        ("ctx_len",   np.int32),
-        ("token_pos", np.int32),
-        ("topk",      np.int32, (topk_width,)),
-    ])
+    # Write header only for new files
+    fh = open(path, "ab", buffering=0)  # unbuffered → each write hits the OS immediately
+    if fh.tell() == 0:
+        import struct
+        fh.write(struct.pack("<II", _NSA_TOPK_MAGIC, topk_width))
 
-    arr = np.empty(len(records), dtype=dtype)
-    for idx, (mode_int, layer_id, ctx_len, token_pos, topk_np) in enumerate(records):
-        arr[idx]["mode"]      = mode_int
-        arr[idx]["layer_id"]  = layer_id
-        arr[idx]["ctx_len"]   = ctx_len
-        arr[idx]["token_pos"] = token_pos
-        arr[idx]["topk"]      = topk_np
-
-    # Sanitize req_id for use as a filename
-    safe_id = str(req_id).replace("/", "_").replace("\\", "_").replace(":", "_")
-    path = os.path.join(_NSA_TOPK_LOG_DIR, f"{safe_id}.npz")
-
-    if path in _nsa_topk_written:
-        # Append to existing file by loading, concatenating, and re-saving
-        existing = np.load(path)["records"]
-        arr = np.concatenate([existing, arr])
-
-    np.savez_compressed(path, records=arr)
-    _nsa_topk_written[path] = path
+    _nsa_topk_file_handles[req_id] = fh
+    _nsa_topk_widths[req_id] = topk_width
+    return fh
 
 
 def _collect_token_record(
@@ -164,28 +158,39 @@ def _collect_token_record(
     token_pos: int,
     topk_row,  # list[int] from .cpu().tolist()
 ) -> None:
-    """Buffer one token record; flush when the request is complete."""
+    """Write one token record directly to the per-request binary file."""
     if _NSA_TOPK_LOG_DIR is None:
         return
+
     key = str(req_id)
-    if key not in _nsa_topk_buffers:
-        _nsa_topk_buffers[key] = []
-    _nsa_topk_buffers[key].append(
-        (mode_int, layer_id, ctx_len, token_pos, np.array(topk_row, dtype=np.int32))
+    topk_width = len(topk_row)
+    fh = _get_file_handle(key, topk_width)
+
+    # Pack: mode(u8) layer_id(u8) pad(2×u8) ctx_len(i32) token_pos(i32) topk(topk_width×i32)
+    import struct
+    record = struct.pack(
+        f"<BBxxii{topk_width}i",
+        mode_int,
+        layer_id,
+        ctx_len,
+        token_pos,
+        *topk_row,
     )
+    fh.write(record)
 
 
 def flush_nsa_topk_log(req_id) -> None:
-    """Flush buffered records for *req_id* to disk.  Call after request finishes."""
+    """Close the file handle for *req_id* (no-op if logging is disabled)."""
     key = str(req_id)
-    records = _nsa_topk_buffers.pop(key, None)
-    if records:
-        _flush_req_log(key, records)
+    fh = _nsa_topk_file_handles.pop(key, None)
+    if fh is not None:
+        fh.close()
+    _nsa_topk_widths.pop(key, None)
 
 
 def flush_all_nsa_topk_logs() -> None:
-    """Flush all pending buffers (e.g. at server shutdown)."""
-    for key in list(_nsa_topk_buffers.keys()):
+    """Close all open file handles (call at server shutdown)."""
+    for key in list(_nsa_topk_file_handles.keys()):
         flush_nsa_topk_log(key)
 
 

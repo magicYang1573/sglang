@@ -32,6 +32,7 @@ Usage
 
 import argparse
 import os
+import struct
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -40,10 +41,68 @@ import numpy as np
 
 try:
     import pandas as pd
-
     _HAVE_PANDAS = True
 except ImportError:
     _HAVE_PANDAS = False
+
+_NSA_TOPK_MAGIC = 0x4E534154  # "NSAT"
+_HEADER_FMT = "<II"           # magic(u32) + topk_width(u32)
+_HEADER_SIZE = struct.calcsize(_HEADER_FMT)
+_FIXED_FMT = "<BBxxii"        # mode(u8) layer_id(u8) pad(2) ctx_len(i32) token_pos(i32)
+_FIXED_SIZE = struct.calcsize(_FIXED_FMT)
+
+
+# ---------------------------------------------------------------------------
+# Binary file reader
+# ---------------------------------------------------------------------------
+
+def _read_bin_file(path: str) -> np.ndarray:
+    """Read a .bin log file and return a structured numpy array.
+
+    dtype fields: mode(u8), layer_id(u8), ctx_len(i32), token_pos(i32), topk(i32[K])
+    Returns an empty array on any error.
+    """
+    with open(path, "rb") as fh:
+        header_bytes = fh.read(_HEADER_SIZE)
+        if len(header_bytes) < _HEADER_SIZE:
+            raise ValueError("File too short to contain a valid header")
+
+        magic, topk_width = struct.unpack(_HEADER_FMT, header_bytes)
+        if magic != _NSA_TOPK_MAGIC:
+            raise ValueError(f"Bad magic: 0x{magic:08X} (expected 0x{_NSA_TOPK_MAGIC:08X})")
+
+        record_fmt = f"{_FIXED_FMT}{topk_width}i"
+        record_size = struct.calcsize(record_fmt)
+
+        raw = fh.read()
+
+    n_complete = len(raw) // record_size
+    if n_complete == 0:
+        return np.empty(0, dtype=_make_dtype(topk_width))
+
+    dtype = _make_dtype(topk_width)
+    arr = np.empty(n_complete, dtype=dtype)
+    offset = 0
+    for i in range(n_complete):
+        fields = struct.unpack_from(record_fmt, raw, offset)
+        arr[i]["mode"]      = fields[0]
+        arr[i]["layer_id"]  = fields[1]
+        arr[i]["ctx_len"]   = fields[2]
+        arr[i]["token_pos"] = fields[3]
+        arr[i]["topk"]      = fields[4:]
+        offset += record_size
+
+    return arr
+
+
+def _make_dtype(topk_width: int) -> np.dtype:
+    return np.dtype([
+        ("mode",      np.uint8),
+        ("layer_id",  np.uint8),
+        ("ctx_len",   np.int32),
+        ("token_pos", np.int32),
+        ("topk",      np.int32, (topk_width,)),
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -51,48 +110,40 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 def _topk_sets_for_req(records: np.ndarray, boundary: int, window: int):
-    """Return per-layer list of (ctx_len_bucket, boundary_token_pos, window_sets).
+    """Return per-layer similarity entries for one request.
 
-    window_sets[w] = union of topk sets for positions [token_pos-w .. token_pos-1].
+    Returns list of:
+      (layer_id, ctx_bucket, token_pos, topk_set_t, [union_set_w1, …, union_set_wN])
+    where union_set_wK = union of topk sets for positions [token_pos-K .. token_pos-1].
 
     Only boundary tokens (token_pos % boundary == 0, token_pos > 0) that have
-    all w preceding tokens present in the log are included.
-
-    Returns
-    -------
-    list of (layer_id, ctx_bucket, token_pos, topk_set_t, [union_set_1, …, union_set_window])
+    all `window` preceding tokens present in the log are included.
     """
     results = []
 
-    # Group by layer_id
     for layer_id in np.unique(records["layer_id"]):
-        layer_mask = records["layer_id"] == layer_id
-        layer_recs = records[layer_mask]
+        layer_recs = records[records["layer_id"] == layer_id]
 
-        # Build pos -> topk_set mapping
-        pos_to_topk: dict[int, frozenset] = {}
-        pos_to_ctx: dict[int, int] = {}
+        pos_to_topk: dict = {}
+        pos_to_ctx: dict = {}
         for rec in layer_recs:
             pos = int(rec["token_pos"])
             pos_to_topk[pos] = frozenset(rec["topk"].tolist())
             pos_to_ctx[pos] = int(rec["ctx_len"])
 
-        # Find all boundary positions that have enough preceding tokens logged
         for pos, topk_t in pos_to_topk.items():
             if pos == 0 or pos % boundary != 0:
                 continue
 
-            # Check all preceding window positions are present
             preceding = [pos - j for j in range(1, window + 1)]
             if not all(p in pos_to_topk for p in preceding):
                 continue
 
             ctx_bucket = (pos_to_ctx[pos] // boundary) * boundary
 
-            # Build cumulative union sets for w = 1 … window
             union_sets = []
             cumulative: set = set()
-            for p in preceding:  # p = pos-1, pos-2, …, pos-window
+            for p in preceding:
                 cumulative |= pos_to_topk[p]
                 union_sets.append(frozenset(cumulative))
 
@@ -102,7 +153,7 @@ def _topk_sets_for_req(records: np.ndarray, boundary: int, window: int):
 
 
 def _compute_similarities(log_dir: str, boundary: int, window: int):
-    """Iterate all .npz files and accumulate similarity statistics.
+    """Iterate all .bin files and accumulate similarity statistics.
 
     Returns
     -------
@@ -112,16 +163,17 @@ def _compute_similarities(log_dir: str, boundary: int, window: int):
     sums: dict = defaultdict(float)
     counts: dict = defaultdict(int)
 
-    npz_files = sorted(Path(log_dir).glob("*.npz"))
-    if not npz_files:
-        print(f"[ERROR] No .npz files found in {log_dir}", file=sys.stderr)
+    bin_files = sorted(Path(log_dir).glob("*.bin"))
+    if not bin_files:
+        print(f"[ERROR] No .bin files found in {log_dir}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Found {len(npz_files)} request log file(s) in {log_dir}")
+    print(f"Found {len(bin_files)} request log file(s) in {log_dir}")
 
-    for fpath in npz_files:
+    loaded = 0
+    for fpath in bin_files:
         try:
-            records = np.load(fpath)["records"]
+            records = _read_bin_file(str(fpath))
         except Exception as exc:
             print(f"[WARN] Could not load {fpath}: {exc}", file=sys.stderr)
             continue
@@ -129,17 +181,19 @@ def _compute_similarities(log_dir: str, boundary: int, window: int):
         if records.size == 0:
             continue
 
+        loaded += 1
         entries = _topk_sets_for_req(records, boundary, window)
         for layer_id, ctx_bucket, _pos, topk_t, union_sets in entries:
             denom = len(topk_t)
             if denom == 0:
                 continue
-            for w_idx, union_set in enumerate(union_sets):  # w_idx = 0 → window=1
+            for w_idx, union_set in enumerate(union_sets):
                 overlap = len(topk_t & union_set)
                 key = (w_idx, ctx_bucket, layer_id)
                 sums[key] += overlap / denom
                 counts[key] += 1
 
+    print(f"Successfully loaded {loaded}/{len(bin_files)} file(s).")
     return sums, counts
 
 
@@ -148,7 +202,6 @@ def _compute_similarities(log_dir: str, boundary: int, window: int):
 # ---------------------------------------------------------------------------
 
 def _build_tables(sums, counts, window: int):
-    """Return list of (window_size, ctx_buckets_sorted, layers_sorted, 2-D mean array)."""
     all_ctx = sorted({k[1] for k in counts})
     all_layers = sorted({k[2] for k in counts})
 
@@ -175,16 +228,12 @@ def _fmt_ctx(ctx: int) -> str:
 
 
 def _print_table(w: int, ctx_buckets, layers, arr: np.ndarray):
-    header = f"=== Window w={w}: similarity of boundary token t with union(topk(t-1)…topk(t-{w})) ==="
-    print(header)
-
+    print(f"=== Window w={w}: sim(t, union(topk(t-1)...topk(t-{w}))) ===")
     col_w = 8
-    # Header row
     header_label = "ctx\\layer"
     row = f"{header_label:>12}" + "".join(f"{str(l):>{col_w}}" for l in layers)
     print(row)
     print("-" * len(row))
-
     for ci, ctx in enumerate(ctx_buckets):
         cells = []
         for li in range(len(layers)):
@@ -208,9 +257,7 @@ def _save_csv(output_dir: str, w: int, ctx_buckets, layers, arr: np.ndarray):
     print(f"  Saved {path}")
 
 
-def _save_pandas(output_dir: str, w: int, ctx_buckets, layers, arr: np.ndarray):
-    import pandas as pd
-
+def _save_pandas_csv(output_dir: str, w: int, ctx_buckets, layers, arr: np.ndarray):
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"similarity_window_{w}.csv")
     df = pd.DataFrame(
@@ -236,7 +283,7 @@ def main():
     parser.add_argument(
         "--log-dir",
         default=os.environ.get("SGLANG_NSA_TOPK_LOG_DIR", ""),
-        help="Directory containing per-request .npz log files "
+        help="Directory containing per-request .bin log files "
              "(default: $SGLANG_NSA_TOPK_LOG_DIR)",
     )
     parser.add_argument(
@@ -287,7 +334,7 @@ def main():
         _print_table(w, ctx_buckets, layers, arr)
         if args.csv and args.output_dir:
             if _HAVE_PANDAS:
-                _save_pandas(args.output_dir, w, ctx_buckets, layers, arr)
+                _save_pandas_csv(args.output_dir, w, ctx_buckets, layers, arr)
             else:
                 _save_csv(args.output_dir, w, ctx_buckets, layers, arr)
 
