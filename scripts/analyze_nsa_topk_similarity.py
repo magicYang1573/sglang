@@ -139,7 +139,9 @@ def _topk_sets_for_req(records: np.ndarray, boundary: int, window: int):
             if not all(p in pos_to_topk for p in preceding):
                 continue
 
-            ctx_bucket = (pos_to_ctx[pos] // boundary) * boundary
+            # Use token_pos itself as the bucket label (it is already a multiple
+            # of boundary), so each row represents one specific boundary position.
+            ctx_bucket = pos
 
             union_sets = []
             cumulative: set = set()
@@ -224,7 +226,10 @@ def _build_tables(sums, counts, window: int):
 # ---------------------------------------------------------------------------
 
 def _fmt_ctx(ctx: int) -> str:
-    return f"{ctx // 1024}k" if ctx % 1024 == 0 else str(ctx)
+    """Format a token_pos bucket label.  Multiples of 1024 shown as Nk."""
+    if ctx % 1024 == 0:
+        return f"{ctx // 1024}k"
+    return str(ctx)
 
 
 def _print_table(w: int, ctx_buckets, layers, arr: np.ndarray):
