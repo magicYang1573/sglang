@@ -97,7 +97,7 @@ def _get_nsa_topk_log_writer():
     _nsa_topk_log_file = open(_NSA_TOPK_LOG_PATH, "w", newline="", buffering=1)
     _nsa_topk_log_writer = csv.writer(_nsa_topk_log_file)
     _nsa_topk_log_writer.writerow(
-        ["mode", "req_id", "layer_id", "ctx_len", "topk_indices"]
+        ["mode", "req_id", "layer_id", "ctx_len", "token_pos", "topk_indices"]
     )
     return _nsa_topk_log_writer
 
@@ -108,33 +108,72 @@ def _log_nsa_topk_indices(
     layer_id: int,
     topk_indices: torch.Tensor,
 ) -> None:
-    """Write one CSV row per request whose context length exceeds the threshold.
+    """Write one CSV row per token whose request context length exceeds the threshold.
 
-    Args:
-        mode: "decode" or "extend".
-        forward_batch: the ForwardBatch for this step.
-        layer_id: attention layer index.
-        topk_indices: shape [batch_size, topk] on any device.
+    Decode mode: topk_indices shape is [batch_size, topk] — one row per request.
+    Extend mode: topk_indices shape is [total_tokens, topk] — tokens from all
+    requests are flattened together, so we use extend_seq_lens_cpu to slice them
+    back per request and write one row per token.
+
+    CSV columns: mode, req_id, layer_id, ctx_len, token_pos_in_ctx, topk_indices
     """
     writer = _get_nsa_topk_log_writer()
     if writer is None:
         return
 
-    seq_lens = forward_batch.seq_lens  # tensor [batch_size]
+    seq_lens_cpu = (
+        forward_batch.seq_lens.tolist()
+        if forward_batch.seq_lens is not None
+        else []
+    )
     rids = forward_batch.rids  # list[str] or None
-
-    # Move to CPU once for the whole batch
-    seq_lens_cpu = seq_lens.tolist() if seq_lens is not None else []
     topk_cpu = topk_indices.cpu().tolist()  # list[list[int]]
 
-    batch_size = len(seq_lens_cpu)
-    for i in range(batch_size):
-        ctx_len = seq_lens_cpu[i]
-        if ctx_len <= _NSA_TOPK_LOG_MIN_CTX:
-            continue
-        req_id = rids[i] if (rids is not None and i < len(rids)) else i
-        indices_str = ";".join(str(x) for x in topk_cpu[i])
-        writer.writerow([mode, req_id, layer_id, ctx_len, indices_str])
+    if mode == "decode":
+        # Each request contributes exactly 1 token; rows map 1-to-1 with requests.
+        for i, ctx_len in enumerate(seq_lens_cpu):
+            if ctx_len <= _NSA_TOPK_LOG_MIN_CTX:
+                continue
+            req_id = rids[i] if (rids is not None and i < len(rids)) else i
+            indices_str = ";".join(str(x) for x in topk_cpu[i])
+            # token_pos is the last token (0-indexed)
+            writer.writerow([mode, req_id, layer_id, ctx_len, ctx_len - 1, indices_str])
+
+    else:
+        # Extend mode: topk_indices rows are all tokens from all requests, flattened.
+        # extend_seq_lens_cpu[i]   = number of new tokens for request i
+        # extend_prefix_lens_cpu[i] = number of already-cached prefix tokens for request i
+        # seq_lens_cpu[i]          = total context length (prefix + new tokens)
+        extend_seq_lens = forward_batch.extend_seq_lens_cpu  # list[int]
+        extend_prefix_lens = forward_batch.extend_prefix_lens_cpu  # list[int] or None
+
+        if extend_seq_lens is None:
+            # Fallback: treat the whole tensor as belonging to a single request
+            ctx_len = seq_lens_cpu[0] if seq_lens_cpu else len(topk_cpu)
+            if ctx_len > _NSA_TOPK_LOG_MIN_CTX:
+                req_id = rids[0] if (rids is not None and len(rids) > 0) else 0
+                for tok_offset, row in enumerate(topk_cpu):
+                    indices_str = ";".join(str(x) for x in row)
+                    writer.writerow([mode, req_id, layer_id, ctx_len, tok_offset, indices_str])
+            return
+
+        token_offset = 0
+        for i, new_tok_count in enumerate(extend_seq_lens):
+            ctx_len = seq_lens_cpu[i] if i < len(seq_lens_cpu) else 0
+            prefix_len = extend_prefix_lens[i] if extend_prefix_lens is not None else 0
+            req_id = rids[i] if (rids is not None and i < len(rids)) else i
+
+            if ctx_len > _NSA_TOPK_LOG_MIN_CTX:
+                for j in range(new_tok_count):
+                    row_idx = token_offset + j
+                    if row_idx >= len(topk_cpu):
+                        break
+                    # Absolute position of this token in the full context
+                    token_pos = prefix_len + j
+                    indices_str = ";".join(str(x) for x in topk_cpu[row_idx])
+                    writer.writerow([mode, req_id, layer_id, ctx_len, token_pos, indices_str])
+
+            token_offset += new_tok_count
 
 
 @dataclass(frozen=True)
