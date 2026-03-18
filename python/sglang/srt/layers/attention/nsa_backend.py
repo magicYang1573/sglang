@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import csv
-import logging
 import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
+import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
@@ -76,50 +75,118 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 
 # ---------------------------------------------------------------------------
 # NSA top-k index logger
-# Logs per-request, per-layer sparse attention top-k indices to a CSV file.
-# Only records entries where the context length exceeds NSA_TOPK_LOG_MIN_CTX
-# (default 2048, matching DeepSeek-V3's sparse KV cache window size).
-# Set env var SGLANG_NSA_TOPK_LOG_PATH to a file path to enable logging.
+#
+# Stores per-request sparse attention top-k indices in binary numpy (.npz)
+# format — one file per request, written to SGLANG_NSA_TOPK_LOG_DIR.
+#
+# Each .npz contains a single structured array "records" with dtype:
+#   mode      : uint8   (0 = extend, 1 = decode)
+#   layer_id  : uint8
+#   ctx_len   : int32
+#   token_pos : int32
+#   topk      : int32[<topk_width>]   (topk_width determined on first write)
+#
+# Filter rules (both must hold to log a token):
+#   1. ctx_len  > _NSA_TOPK_LOG_MIN_CTX  (default 2048)
+#   2. token_pos >= 2048
+#   3. token_pos falls within _NSA_TOPK_LOG_WINDOW positions before (inclusive)
+#      any positive multiple of _NSA_TOPK_LOG_BOUNDARY
+#      i.e.  token_pos % BOUNDARY == 0
+#         OR (next_multiple_of_BOUNDARY - token_pos) <= WINDOW
+#
+# Defaults:  BOUNDARY=4096, WINDOW=8
 # ---------------------------------------------------------------------------
 _NSA_TOPK_LOG_MIN_CTX: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_MIN_CTX", "2048"))
-_NSA_TOPK_LOG_PATH: Optional[str] = os.environ.get("SGLANG_NSA_TOPK_LOG_PATH", None)
+_NSA_TOPK_LOG_DIR: Optional[str] = os.environ.get("SGLANG_NSA_TOPK_LOG_DIR", None)
+_NSA_TOPK_LOG_BOUNDARY: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_BOUNDARY", "4096"))
+_NSA_TOPK_LOG_WINDOW: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_WINDOW", "8"))
 
-_nsa_topk_log_file = None
-_nsa_topk_log_writer = None
-
-
-def _get_nsa_topk_log_writer():
-    global _nsa_topk_log_file, _nsa_topk_log_writer
-    if _nsa_topk_log_writer is not None:
-        return _nsa_topk_log_writer
-    if _NSA_TOPK_LOG_PATH is None:
-        return None
-    _nsa_topk_log_file = open(_NSA_TOPK_LOG_PATH, "w", newline="", buffering=1)
-    _nsa_topk_log_writer = csv.writer(_nsa_topk_log_file)
-    _nsa_topk_log_writer.writerow(
-        ["mode", "req_id", "layer_id", "ctx_len", "token_pos", "topk_indices"]
-    )
-    return _nsa_topk_log_writer
+# req_id -> list of raw record tuples accumulated before flush
+# Each tuple: (mode_int, layer_id, ctx_len, token_pos, topk_np_1d)
+_nsa_topk_buffers: Dict[str, list] = {}
+# req_id -> path of the .npz file already written (for append logic)
+_nsa_topk_written: Dict[str, str] = {}
 
 
 def _should_log_token_pos(token_pos: int) -> bool:
-    """Return True if token_pos should be logged.
-
-    Rules:
-      1. token_pos must be >= 2048.
-      2. token_pos must fall within 64 positions before (inclusive) any
-         1024-aligned boundary, i.e. token_pos in [m-64, m] for some positive
-         integer multiple m of 1024.
-    """
+    """Return True if token_pos satisfies the sampling filter."""
     if token_pos < 2048:
         return False
-    # Distance from token_pos to the next 1024-aligned position (inclusive of
-    # the boundary itself, so boundary distance == 0).
-    next_boundary = ((token_pos // 1024) + 1) * 1024
-    dist_to_next = next_boundary - token_pos  # in [1, 1024]
-    # Log if within 64 tokens before the next boundary, or exactly on the
-    # previous boundary (dist_to_next == 1024 means token_pos is a multiple of 1024).
-    return dist_to_next <= 64 or token_pos % 1024 == 0
+    if token_pos % _NSA_TOPK_LOG_BOUNDARY == 0:
+        return True
+    next_boundary = ((token_pos // _NSA_TOPK_LOG_BOUNDARY) + 1) * _NSA_TOPK_LOG_BOUNDARY
+    return (next_boundary - token_pos) <= _NSA_TOPK_LOG_WINDOW
+
+
+def _flush_req_log(req_id: str, records: list) -> None:
+    """Append *records* for *req_id* to its per-request .npz file."""
+    if not records or _NSA_TOPK_LOG_DIR is None:
+        return
+
+    os.makedirs(_NSA_TOPK_LOG_DIR, exist_ok=True)
+
+    # Infer topk width from first record
+    topk_width = records[0][4].shape[0]
+    dtype = np.dtype([
+        ("mode",      np.uint8),
+        ("layer_id",  np.uint8),
+        ("ctx_len",   np.int32),
+        ("token_pos", np.int32),
+        ("topk",      np.int32, (topk_width,)),
+    ])
+
+    arr = np.empty(len(records), dtype=dtype)
+    for idx, (mode_int, layer_id, ctx_len, token_pos, topk_np) in enumerate(records):
+        arr[idx]["mode"]      = mode_int
+        arr[idx]["layer_id"]  = layer_id
+        arr[idx]["ctx_len"]   = ctx_len
+        arr[idx]["token_pos"] = token_pos
+        arr[idx]["topk"]      = topk_np
+
+    # Sanitize req_id for use as a filename
+    safe_id = str(req_id).replace("/", "_").replace("\\", "_").replace(":", "_")
+    path = os.path.join(_NSA_TOPK_LOG_DIR, f"{safe_id}.npz")
+
+    if path in _nsa_topk_written:
+        # Append to existing file by loading, concatenating, and re-saving
+        existing = np.load(path)["records"]
+        arr = np.concatenate([existing, arr])
+
+    np.savez_compressed(path, records=arr)
+    _nsa_topk_written[path] = path
+
+
+def _collect_token_record(
+    req_id,
+    mode_int: int,
+    layer_id: int,
+    ctx_len: int,
+    token_pos: int,
+    topk_row,  # list[int] from .cpu().tolist()
+) -> None:
+    """Buffer one token record; flush when the request is complete."""
+    if _NSA_TOPK_LOG_DIR is None:
+        return
+    key = str(req_id)
+    if key not in _nsa_topk_buffers:
+        _nsa_topk_buffers[key] = []
+    _nsa_topk_buffers[key].append(
+        (mode_int, layer_id, ctx_len, token_pos, np.array(topk_row, dtype=np.int32))
+    )
+
+
+def flush_nsa_topk_log(req_id) -> None:
+    """Flush buffered records for *req_id* to disk.  Call after request finishes."""
+    key = str(req_id)
+    records = _nsa_topk_buffers.pop(key, None)
+    if records:
+        _flush_req_log(key, records)
+
+
+def flush_all_nsa_topk_logs() -> None:
+    """Flush all pending buffers (e.g. at server shutdown)."""
+    for key in list(_nsa_topk_buffers.keys()):
+        flush_nsa_topk_log(key)
 
 
 def _log_nsa_topk_indices(
@@ -128,23 +195,17 @@ def _log_nsa_topk_indices(
     layer_id: int,
     topk_indices: torch.Tensor,
 ) -> None:
-    """Write one CSV row per token that satisfies the logging filter.
+    """Buffer per-token top-k records that satisfy the logging filter.
 
-    Filters applied per token:
-      1. ctx_len > _NSA_TOPK_LOG_MIN_CTX  (default 2048)
-      2. token_pos is within 64 positions before (or exactly on) a 1024-aligned
-         boundary: i.e. token_pos % 1024 == 0, or (next_1024_multiple - token_pos) <= 64
+    Decode mode: topk_indices shape [batch_size, topk]   — 1 token per request.
+    Extend mode: topk_indices shape [total_tokens, topk] — all new tokens flattened.
 
-    Decode mode: topk_indices shape is [batch_size, topk] — one row per request.
-    Extend mode: topk_indices shape is [total_tokens, topk] — tokens from all
-    requests are flattened together, so we use extend_seq_lens_cpu to slice them
-    back per request and write one row per token.
-
-    CSV columns: mode, req_id, layer_id, ctx_len, token_pos, topk_indices
+    Records are flushed to per-request .npz files via flush_nsa_topk_log().
     """
-    writer = _get_nsa_topk_log_writer()
-    if writer is None:
+    if _NSA_TOPK_LOG_DIR is None:
         return
+
+    mode_int = 1 if mode == "decode" else 0
 
     seq_lens_cpu = (
         forward_batch.seq_lens.tolist()
@@ -155,35 +216,26 @@ def _log_nsa_topk_indices(
     topk_cpu = topk_indices.cpu().tolist()  # list[list[int]]
 
     if mode == "decode":
-        # Each request contributes exactly 1 token; rows map 1-to-1 with requests.
         for i, ctx_len in enumerate(seq_lens_cpu):
             if ctx_len <= _NSA_TOPK_LOG_MIN_CTX:
                 continue
-            # In decode mode the new token sits at position ctx_len - 1
             token_pos = ctx_len - 1
             if not _should_log_token_pos(token_pos):
                 continue
             req_id = rids[i] if (rids is not None and i < len(rids)) else i
-            indices_str = ";".join(str(x) for x in topk_cpu[i])
-            writer.writerow([mode, req_id, layer_id, ctx_len, token_pos, indices_str])
+            _collect_token_record(req_id, mode_int, layer_id, ctx_len, token_pos, topk_cpu[i])
 
     else:
-        # Extend mode: topk_indices rows are all tokens from all requests, flattened.
-        # extend_seq_lens_cpu[i]    = number of new tokens for request i
-        # extend_prefix_lens_cpu[i] = number of already-cached prefix tokens for request i
-        # seq_lens_cpu[i]           = total context length (prefix + new tokens)
-        extend_seq_lens = forward_batch.extend_seq_lens_cpu  # list[int]
-        extend_prefix_lens = forward_batch.extend_prefix_lens_cpu  # list[int] or None
+        extend_seq_lens = forward_batch.extend_seq_lens_cpu
+        extend_prefix_lens = forward_batch.extend_prefix_lens_cpu
 
         if extend_seq_lens is None:
-            # Fallback: treat the whole tensor as belonging to a single request
             ctx_len = seq_lens_cpu[0] if seq_lens_cpu else len(topk_cpu)
             if ctx_len > _NSA_TOPK_LOG_MIN_CTX:
                 req_id = rids[0] if (rids is not None and len(rids) > 0) else 0
                 for tok_offset, row in enumerate(topk_cpu):
                     if _should_log_token_pos(tok_offset):
-                        indices_str = ";".join(str(x) for x in row)
-                        writer.writerow([mode, req_id, layer_id, ctx_len, tok_offset, indices_str])
+                        _collect_token_record(req_id, mode_int, layer_id, ctx_len, tok_offset, row)
             return
 
         token_offset = 0
@@ -197,12 +249,10 @@ def _log_nsa_topk_indices(
                     row_idx = token_offset + j
                     if row_idx >= len(topk_cpu):
                         break
-                    # Absolute position of this token in the full context
                     token_pos = prefix_len + j
                     if not _should_log_token_pos(token_pos):
                         continue
-                    indices_str = ";".join(str(x) for x in topk_cpu[row_idx])
-                    writer.writerow([mode, req_id, layer_id, ctx_len, token_pos, indices_str])
+                    _collect_token_record(req_id, mode_int, layer_id, ctx_len, token_pos, topk_cpu[row_idx])
 
             token_offset += new_tok_count
 
