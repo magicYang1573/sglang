@@ -17,9 +17,9 @@ KSE 的设计围绕 KVCache 稀疏化的四个正交维度展开：
 | 维度 | 选项 | KSE 中的对应职责 |
 |---|---|---|
 | **D1: 驱逐策略** | 部分保留（驱逐）/ 全量保留（仅选择） | `EvictionPolicy` — 是否物理释放 KV 槽位 |
-| **D2: 粒度** | Token / Block(Page) / Cluster | `SelectionResult.granularity` — 选择的单位 |
+| **D2: 粒度** | Token / Block(Page) | `SelectionResult.granularity` — 选择的单位 |
 | **D3: 频率** | 每请求 / 每 token（decode step）/ 每层 | `SparsityPolicy.frequency` — 何时执行选择 |
-| **D4: 策略** | 固定策略（滑动窗口、sink）/ 不含 Query / 含 Query（Query-Aware） | `SparsityPolicy.select()` — 如何选择 KV |
+| **D4: 策略** | 固定策略（滑动窗口、sink）/ Query-Unaware（基于统计量选择）/ Query-Aware（当前 Query 作为选择输入） | `SparsityPolicy.select()` — 如何选择 KV |
 
 ### 1.3 在 sglang 拓扑中的位置
 
@@ -80,6 +80,87 @@ graph TB
 - **后端无关** — 适用于任何使用分页/索引 KV 访问的后端
 - **CUDA Graph 兼容** — 元数据缓冲区可预分配并原地重写
 
+### 1.5 稀疏粒度与后端粒度的兼容性约束
+
+稀疏策略的选择粒度（Token / Page）与 attention 后端的索引粒度之间存在严格的兼容性约束。KSE **不进行**跨粒度的自动转换或退化，而是通过明确的兼容性规则在初始化时进行校验。
+
+**后端索引粒度分类：**
+
+sglang 中的 attention 后端在 KV Cache 的索引方式上分为两类：
+
+| 后端 | 索引机制 | 索引粒度 | 说明 |
+|---|---|---|---|
+| **FlashInfer** | `kv_indptr` / `kv_indices` (CSR) | **Token** | `kv_indices` 存储每个 token 的物理槽位索引，可任意选择 token 子集 |
+| **Triton** | `kv_indptr` / `kv_indices` (CSR) | **Token** | 同上 |
+| **FlashAttention (FA3)** | `page_table` / `cache_seqlens` | **Page** | `page_table` 中每个 entry 指向一个 page，最小访问单位为完整的 page |
+
+**兼容性规则：**
+
+KSE 执行以下严格的粒度兼容性约束：
+
+> **规则 1：Token 粒度的稀疏策略仅可在 Token 粒度的后端上运行。**
+
+Token 粒度的稀疏策略（如 H2O、SnapKV）需要精确控制哪些 token 参与 attention。这仅在使用 CSR 索引（`kv_indices`）的后端上可行——FlashInfer 和 Triton 原生支持，因为 `kv_indices` 中只需填入选中 token 的物理索引即可。
+
+对于 Page 粒度的后端（FlashAttention），KSE **不会**采用以下妥协方案，因为每种方案都有不可接受的代价：
+
+- ~~将 `page_size` 设为 1~~：page_size=1 会使 page_table 膨胀到与 token 数量相同，丧失分页带来的内存访问效率（合并读取、TLB 利用率），且部分 FA3 的优化路径（如 CUDA graph 下的 strided 索引）依赖 page_size > 1。
+- ~~将 token 级选择向上对齐到 page 边界~~：如果算法精选了 30% 的 token 但 page 对齐后膨胀到 70% 的 page，选择开销仍在但稀疏加速效果大打折扣，得不偿失。
+
+> **规则 2：Page 粒度的稀疏策略可在任何后端上运行，但稀疏 page 大小必须等于后端 page 大小或其整数倍。**
+
+Page 粒度的稀疏策略（如 Quest、ChunkKV、NSA）选择的单位是 page。对于 Page 粒度后端，必须满足：
+
+```
+sparse_page_size = backend_page_size × N    (N 为正整数)
+```
+
+- **N = 1**（稀疏 page 大小 = 后端 page 大小）：最常见的情况。`MetadataAdapter` 直接将选中的逻辑 page 映射为 `page_table` 中的物理 page 索引，零转换开销。
+- **N > 1**（稀疏 page 大小 = 后端 page 大小的整数倍）：一个稀疏 page 对应 N 个后端 page。`MetadataAdapter` 将一个稀疏 page 的选择展开为 N 个连续的后端 page。例如 `sparse_page_size=128, backend_page_size=16` 时，选中一个稀疏 page 等于写入 8 个连续的 FA3 page 索引。
+- **不允许 sparse_page_size < backend_page_size**：这意味着需要拆分一个后端 page，但后端无法做到——page 是其最小访问单位。
+- **不允许 sparse_page_size 不是 backend_page_size 的整数倍**：这会导致稀疏 page 边界与后端 page 边界不对齐，产生部分 page 的读取问题。
+
+对于 Token 粒度后端（FlashInfer、Triton），page 粒度的稀疏策略自然兼容：选中一个 page 等价于将该 page 内所有 token 的索引写入 `kv_indices`。
+
+**兼容性矩阵总结：**
+
+| 稀疏策略粒度 | FlashInfer (Token) | Triton (Token) | FlashAttention (Page) |
+|---|---|---|---|
+| **Token** | 兼容 | 兼容 | **不兼容** |
+| **Page** | 兼容 | 兼容 | 兼容（需 sparse_page_size ≥ backend_page_size 且为整数倍） |
+
+**初始化校验：**
+
+`KSEController` 在创建时会执行兼容性校验，不满足约束时直接报错而非静默退化：
+
+```python
+def _validate_granularity_compatibility(
+    self, policy: SparsityPolicy, backend_name: str, config: KSEConfig
+):
+    backend_granularity = _get_backend_granularity(backend_name)
+    policy_granularity = policy.granularity()
+
+    if policy_granularity == Granularity.TOKEN and backend_granularity == Granularity.PAGE:
+        raise ValueError(
+            f"Token-granularity sparse policy '{config.policy_name}' is incompatible "
+            f"with page-granularity backend '{backend_name}'. "
+            f"Use a token-granularity backend (FlashInfer, Triton) instead."
+        )
+
+    if policy_granularity == Granularity.PAGE and backend_granularity == Granularity.PAGE:
+        backend_page_size = _get_backend_page_size(backend_name)
+        if config.page_size < backend_page_size:
+            raise ValueError(
+                f"Sparse page_size ({config.page_size}) < backend page_size "
+                f"({backend_page_size}). Must be >= and an integer multiple."
+            )
+        if config.page_size % backend_page_size != 0:
+            raise ValueError(
+                f"Sparse page_size ({config.page_size}) is not an integer multiple "
+                f"of backend page_size ({backend_page_size})."
+            )
+```
+
 ---
 
 ## 2. 核心抽象与接口
@@ -139,6 +220,11 @@ class SparsityPolicy(ABC):
         PER_REQUEST = "per_request"   # prefill 后执行一次，结果复用于所有 decode step
         PER_STEP = "per_step"         # 每个 decode step 执行一次，跨层共享
         PER_LAYER = "per_layer"       # 每个 decode step 的每层执行一次
+
+    @abstractmethod
+    def granularity(self) -> SelectionResult.Granularity:
+        """该策略的选择粒度。用于初始化时与后端进行兼容性校验。"""
+        ...
 
     @abstractmethod
     def frequency(self) -> "SparsityPolicy.Frequency":
@@ -305,6 +391,9 @@ class KSEController:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.config = config
+
+        # 校验稀疏策略粒度与后端粒度的兼容性（见 1.5 节）
+        self._validate_granularity_compatibility(policy, config.backend_name, config)
 
         # 缓存上一次的 SelectionResult，用于 PER_REQUEST 和 PER_STEP 频率
         self._cached_result: Optional[SelectionResult] = None
@@ -509,17 +598,34 @@ def create_kse_controller(
 
 | 算法 | D1 驱逐 | D2 粒度 | D3 频率 | D4 策略 |
 |---|---|---|---|---|
-| **H2O** | 驱逐 | Token | 每步 | Query-Aware（attention score 累积） |
+| **H2O** | 驱逐 | Token | 每步 | Query-Unaware（历史 attention score 累积） |
 | **StreamingLLM** | 驱逐 | Token | 每请求 | 固定策略（sink + 滑动窗口） |
-| **Quest** | 全量保留 | Page | 每层 | Query-Aware（bounding-box） |
-| **SnapKV** | 驱逐 | Token | 每请求 | Query-Aware（观察窗口投票） |
-| **ChunkKV** | 全量保留 | Page/Chunk | 每层 | Query-Aware（chunk 重要性） |
-| **DeepSeek NSA** | 全量保留 | Page | 每层 | 原生（模型内置 indexer） |
+| **Quest** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 bounding-box 评分） |
+| **SnapKV** | 驱逐 | Token | 每请求 | Query-Unaware（prefill 阶段观察窗口投票） |
+| **ChunkKV** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 chunk 评分） |
+| **DeepSeek NSA** | 全量保留 | Page | 每层 | Query-Aware（模型内置学习型 indexer） |
+
+**关于 Query-Aware 的判定标准：**
+
+D4 维度中"Query-Aware"的判定标准是：**每次执行 selection 时，当前的 Query 向量是否作为选择算法的直接输入**。
+
+- **Query-Aware**（含 Query）：`select()` 接收当前 decode step 的 Q 向量，并将其与 KV 的表征进行计算以产生选择结果。例如 Quest 用当前 Q 与 page 的 bounding-box 做内积上界估计；ChunkKV 用当前 Q 对 chunk 评分。
+- **Query-Unaware**（不含 Query）：`select()` 不依赖当前 Q，而是基于预先计算的统计量做选择。例如 H2O 在每次 attention 后累积 token 的历史得分，selection 时仅根据累积得分排序——虽然这些得分的来源是过去的 attention 计算（涉及过去的 Q），但在 selection 那一刻，当前 Q 并未参与决策。SnapKV 在 prefill 阶段利用观察窗口的 attention 模式投票选出重要 token，此后 selection 结果固定不变，decode 时不使用当前 Q。
+- **固定策略**：`select()` 不依赖任何动态信息，仅基于位置规则（如 StreamingLLM 的 sink + 滑动窗口）。
 
 **不支持的组合及原因：**
 
-- **Cluster 粒度 + 每层频率**：Cluster 分配（如 k-means）在每层重新计算的代价过高。框架通过 `Granularity.TOKEN` 配合 cluster-aware 策略来支持——预先将 token 分配到 cluster 并按 cluster 选择，但 cluster 结构本身应在 `on_prefill_complete` 时构建。
 - **驱逐 + 每层频率**：驱逐是破坏性操作，不应在前向传播中途发生。框架强制 `EvictionPolicy.compute_eviction()` 仅在 `after_prefill()` 或 `before_forward()` 中调用，不会在 `before_attention()` 内部调用。
+
+**关于 Cluster 等其他粒度不纳入支持的说明：**
+
+KSE 仅支持 Token 和 Page 两种选择粒度，暂不支持 Cluster（如基于 k-means 聚类的语义分组）等其他粒度。原因如下：
+
+1. **与现有内存管理架构不兼容**：sglang 的整个 KV Cache 内存体系（`ReqToTokenPool`、`TokenToKVPoolAllocator`、`PagedTokenToKVPoolAllocator`）建立在"token 为基本单位、page 为物理分组"的两级索引之上。`req_to_token` 按序列位置顺序映射 token 到 KV 槽位，page 是连续 token 的物理打包。Cluster 粒度要求按语义相似性而非位置顺序对 token 分组，这与现有的顺序映射机制根本冲突，需要引入额外的 cluster→token 间接层。
+
+2. **性能代价不可接受**：Cluster 分组需要在每次选择时维护和查询一个 cluster 到 token 的映射表，这在 attention 的关键路径上引入额外的间接访问和不连续内存读取。更重要的是，attention 后端（FlashInfer、FlashAttention、Triton）的内核均针对连续 page 或 token 索引优化，cluster 产生的不规则访问模式会严重降低 GPU 内存带宽利用率。
+
+3. **可通过现有粒度近似**：实践中，cluster 类方法（如 PQCache 的向量量化）可以在 `SparsityPolicy` 内部维护 cluster 结构作为评分手段，但最终输出仍为 token 或 page 级别的 `SelectionResult`。即：cluster 是策略的内部实现细节，不需要作为框架级粒度暴露。
 
 ---
 
