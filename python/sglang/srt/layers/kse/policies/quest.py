@@ -246,7 +246,7 @@ class QuestPolicy(SparsityPolicy):
         if layer_id in self._page_k_min:
             return
         pool_pages = (
-            self.config.policy_kwargs.get("max_pool_pages", 131072)
+            self.config.policy_kwargs.get("max_pool_pages", 2048)
         )
         self._page_k_min[layer_id] = torch.zeros(
             pool_pages, num_kv_heads, head_dim,
