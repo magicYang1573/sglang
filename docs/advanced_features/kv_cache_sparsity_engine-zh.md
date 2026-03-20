@@ -19,7 +19,7 @@ KSE 的设计围绕 KVCache 稀疏化的四个正交维度展开：
 | **D1: 驱逐策略** | 部分保留（驱逐）/ 全量保留（仅选择） | `EvictionPolicy` — 是否物理释放 KV 槽位 |
 | **D2: 粒度** | Token / Block(Page) | `SelectionResult.granularity` — 选择的单位 |
 | **D3: 频率** | 每请求 / 每 token（decode step）/ 每层 | `SparsityPolicy.frequency` — 何时执行选择 |
-| **D4: 策略** | 固定策略（滑动窗口、sink）/ Query-Unaware（基于统计量选择）/ Query-Aware（当前 Query 作为选择输入） | `SparsityPolicy.select()` — 如何选择 KV |
+| **D4: 策略** | 固定策略（滑动窗口、sink）/ Query-Unaware（基于 K/V 统计量选择）/ Query-Aware（当前 Query 作为选择输入）/ Attention-Score-Dependent（依赖 attention weights，暂不支持） | `SparsityPolicy.select()` — 如何选择 KV |
 
 ### 1.3 在 sglang 拓扑中的位置
 
@@ -100,7 +100,7 @@ KSE 执行以下严格的粒度兼容性约束：
 
 > **规则 1：Token 粒度的稀疏策略仅可在 Token 粒度的后端上运行。**
 
-Token 粒度的稀疏策略（如 H2O、SnapKV）需要精确控制哪些 token 参与 attention。这仅在使用 CSR 索引（`kv_indices`）的后端上可行——FlashInfer 和 Triton 原生支持，因为 `kv_indices` 中只需填入选中 token 的物理索引即可。
+Token 粒度的稀疏策略需要精确控制哪些 token 参与 attention。这仅在使用 CSR 索引（`kv_indices`）的后端上可行——FlashInfer 和 Triton 原生支持，因为 `kv_indices` 中只需填入选中 token 的物理索引即可。注意：部分 Token 粒度算法（如 H2O、SnapKV）因依赖 attention weights 而暂不支持，详见 2.7 节。
 
 对于 Page 粒度的后端（FlashAttention），KSE **不会**采用以下妥协方案，因为每种方案都有不可接受的代价：
 
@@ -596,26 +596,40 @@ def create_kse_controller(
 
 ### 2.7 维度覆盖矩阵
 
-| 算法 | D1 驱逐 | D2 粒度 | D3 频率 | D4 策略 |
-|---|---|---|---|---|
-| **H2O** | 驱逐 | Token | 每步 | Query-Unaware（历史 attention score 累积） |
-| **StreamingLLM** | 驱逐 | Token | 每请求 | 固定策略（sink + 滑动窗口） |
-| **Quest** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 bounding-box 评分） |
-| **SnapKV** | 驱逐 | Token | 每请求 | Query-Unaware（prefill 阶段观察窗口投票） |
-| **ChunkKV** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 chunk 评分） |
-| **DeepSeek NSA** | 全量保留 | Page | 每层 | Query-Aware（模型内置学习型 indexer） |
+| 算法 | D1 驱逐 | D2 粒度 | D3 频率 | D4 策略 | KSE 支持状态 |
+|---|---|---|---|---|---|
+| **StreamingLLM** | 驱逐 | Token | 每请求 | 固定策略（sink + 滑动窗口） | ✅ 支持 |
+| **Quest** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 bounding-box 评分） | ✅ 支持 |
+| **ChunkKV** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 chunk 评分） | ✅ 支持 |
+| **DeepSeek NSA** | 全量保留 | Page | 每层 | Query-Aware（模型内置学习型 indexer） | ✅ 支持 |
+| **H2O** | 驱逐 | Token | 每步 | Attention-Score-Dependent（历史 attention score 累积） | ❌ 暂不支持 |
+| **SnapKV** | 驱逐 | Token | 每请求 | Attention-Score-Dependent（prefill 阶段观察窗口投票） | ❌ 暂不支持 |
 
-**关于 Query-Aware 的判定标准：**
+**关于 D4 策略类型的分类：**
 
-D4 维度中"Query-Aware"的判定标准是：**每次执行 selection 时，当前的 Query 向量是否作为选择算法的直接输入**。
+D4 维度将稀疏策略分为四类，其中前三类为 KSE 当前支持的类型，第四类因后端限制暂不支持：
 
-- **Query-Aware**（含 Query）：`select()` 接收当前 decode step 的 Q 向量，并将其与 KV 的表征进行计算以产生选择结果。例如 Quest 用当前 Q 与 page 的 bounding-box 做内积上界估计；ChunkKV 用当前 Q 对 chunk 评分。
-- **Query-Unaware**（不含 Query）：`select()` 不依赖当前 Q，而是基于预先计算的统计量做选择。例如 H2O 在每次 attention 后累积 token 的历史得分，selection 时仅根据累积得分排序——虽然这些得分的来源是过去的 attention 计算（涉及过去的 Q），但在 selection 那一刻，当前 Q 并未参与决策。SnapKV 在 prefill 阶段利用观察窗口的 attention 模式投票选出重要 token，此后 selection 结果固定不变，decode 时不使用当前 Q。
+- **Query-Aware**（含 Query）：`select()` 接收当前 decode step 的 Q 向量，并将其与 KV 的**预计算表征**进行计算以产生选择结果。例如 Quest 用当前 Q 与 page 的 bounding-box 做内积上界估计；ChunkKV 用当前 Q 对 chunk 评分。这类算法的表征（bounding box、chunk 统计量等）可通过 `on_prefill_complete()` 和 `on_attention_complete()` 中的 K/V buffer 直接构建，不依赖 attention weights。
+- **Query-Unaware**（不含 Query，不依赖 attention weights）：`select()` 不依赖当前 Q，而是基于预先计算的、不依赖 attention weights 的统计量做选择。例如基于 key 的 L2 范数、位置编码衰减等纯 K/V 统计量的策略。
 - **固定策略**：`select()` 不依赖任何动态信息，仅基于位置规则（如 StreamingLLM 的 sink + 滑动窗口）。
+- **Attention-Score-Dependent**（依赖 attention weights，**暂不支持**）：算法的核心逻辑依赖 attention weights（即 softmax(Q·K^T/√d) 的输出）作为输入。例如 H2O 需要在每次 attention 后获取逐 token 的 attention weights 来累积历史重要性分数；SnapKV 需要在 prefill 阶段获取观察窗口内的 attention weights 来投票选出重要 token。此类算法暂不支持的原因详见下文。
 
 **不支持的组合及原因：**
 
 - **驱逐 + 每层频率**：驱逐是破坏性操作，不应在前向传播中途发生。框架强制 `EvictionPolicy.compute_eviction()` 仅在 `after_prefill()` 或 `before_forward()` 中调用，不会在 `before_attention()` 内部调用。
+
+- **依赖 Attention Weights 的算法（H2O、SnapKV 等）暂不支持**：
+
+  sglang 的所有 attention 后端（FlashInfer、FlashAttention/FA3、Triton）均为**融合内核（fused kernel）**实现。融合内核采用 FlashAttention 的 tiling 算法，在 SRAM 中分块计算 softmax 并直接输出 attention output，**不在 global memory 中物化完整的 attention weights 矩阵**。这是融合内核实现高性能的根本原因——避免了 O(n²) 的中间矩阵读写。
+
+  融合内核在计算过程中维护的唯一统计量是 **LSE（Log-Sum-Exp）**，即 log∑exp(q·k/√d)。LSE 是 online softmax 算法的必要中间状态，所有后端均支持返回（FlashInfer 的 `run(return_lse=True)`、FlashAttention 的 `return_softmax_lse=True`），且返回开销几乎为零。但 LSE 是一个 **per-head 标量** `[batch, num_heads]`，仅反映整体 attention "能量"，**无法区分单个 KV token 的贡献**。
+
+  要获取逐 token 的 attention weights，只有两种途径，均不可接受：
+
+  1. **使用非融合的 attention 实现**：即显式计算 `softmax(Q @ K^T / √d)`，产生 `[batch, num_heads, 1, seq_len]` 的 attention weights 矩阵。这需要 O(n) 的额外 global memory 读写（decode 阶段 Q 长度为 1），且无法利用融合内核的 tiling 优化，会显著降低 attention 性能。
+  2. **修改融合内核**：在 FlashAttention tiling 循环内部增加 attention weights 的写出逻辑。这不仅需要修改上游内核代码（FlashInfer、FA3），还会因额外的 global memory 写入破坏内核的内存带宽优化，影响所有用户（包括不使用稀疏的场景）。
+
+  因此，KSE 当前**不提供** attention weights 作为策略的输入。`on_prefill_complete()` 和 `on_attention_complete()` 的参数仅包含 K/V buffer，不包含 attention weights。依赖 attention weights 的算法（H2O、SnapKV 等）需要等待后续支持方案（如利用 block-level LSE 近似、或策略内部自行计算 Q·K^T 等替代方案）成熟后再纳入框架。
 
 **关于 Cluster 等其他粒度不纳入支持的说明：**
 
