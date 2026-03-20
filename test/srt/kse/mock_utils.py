@@ -82,6 +82,21 @@ class MockKVCache:
 
 
 # ---------------------------------------------------------------------------
+# Mock TokenToKVPoolAllocator
+# ---------------------------------------------------------------------------
+
+class MockTokenToKVPoolAllocator:
+    """Mimics ``BaseTokenToKVPoolAllocator`` — tracks freed indices."""
+
+    def __init__(self):
+        self.freed_indices: list[torch.Tensor] = []
+
+    def free(self, free_index: torch.Tensor) -> None:
+        if free_index.numel() > 0:
+            self.freed_indices.append(free_index.clone())
+
+
+# ---------------------------------------------------------------------------
 # Mock ForwardBatch
 # ---------------------------------------------------------------------------
 

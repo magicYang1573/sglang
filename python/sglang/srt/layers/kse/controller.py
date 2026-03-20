@@ -13,6 +13,7 @@ from sglang.srt.layers.kse.config import KSEConfig
 from sglang.srt.layers.kse.types import Frequency, Granularity, SelectionResult
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -40,11 +41,15 @@ def _get_backend_page_size(backend_name: str) -> int:
 class KSEController:
     """Orchestrates sparsity policy, metadata adapter, and eviction.
 
-    Integration points (only 4 call-sites in existing sglang code):
-        1. ``Scheduler.on_prefill_complete()``  → ``controller.after_prefill()``
-        2. ``ModelRunner.forward_decode()``     → ``controller.before_forward()``
-        3. ``AttentionBackend.forward()``       → ``controller.before_attention()``
-        4. ``AttentionBackend.forward()``       → ``controller.after_attention()``
+    Integration points (4 call-sites in sglang):
+        1. After extend forward in ``ModelRunner._forward_raw``
+           → ``controller.after_prefill()``
+        2. Start of ``ModelRunner.forward_decode()``
+           → ``controller.before_forward()``
+        3. ``AttentionBackend.forward()`` before decode kernel
+           → ``controller.before_attention()``
+        4. ``AttentionBackend.forward()`` after decode kernel
+           → ``controller.after_attention()``
     """
 
     def __init__(
@@ -55,12 +60,14 @@ class KSEController:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: KVCache,
         config: KSEConfig,
+        token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
     ):
         self.policy = policy
         self.adapter = adapter
         self.eviction = eviction
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.config = config
 
         self._validate_granularity_compatibility(
@@ -100,6 +107,7 @@ class KSEController:
                 forward_batch,
             )
 
+        # Initial eviction after prefill (e.g. StreamingLLM trims the middle)
         if self.eviction is not None:
             self._do_eviction(forward_batch)
 
@@ -115,10 +123,19 @@ class KSEController:
     # ---- Hook: before decode forward ------------------------------------
 
     def before_forward(self, forward_batch: ForwardBatch) -> None:
-        """Reset per-step caches at the start of each decode step."""
+        """Reset per-step caches and perform periodic eviction."""
         if self.policy.frequency() == Frequency.PER_STEP:
             self._cached_result = None
         self._metadata_saved = False
+
+        # Notify the policy of a new step (for step counting)
+        if hasattr(self.policy, "on_step"):
+            self.policy.on_step()
+
+        # Periodic eviction: policies with should_evict() control timing
+        if self.eviction is not None and hasattr(self.eviction, "should_evict"):
+            if self.eviction.should_evict():
+                self._do_eviction(forward_batch)
 
     # ---- Hook: before each layer's attention ----------------------------
 
@@ -205,16 +222,18 @@ class KSEController:
         return True
 
     def _do_eviction(self, forward_batch: ForwardBatch) -> None:
+        """Evict tokens: compact req_to_token and free physical KV slots."""
         assert self.eviction is not None
         evict_indices = self.eviction.compute_eviction(
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch,
         )
-        # Translate logical positions to physical KV-cache slot indices
-        # and free them via the allocator.
         batch_size = evict_indices.shape[0]
         req_to_token = self.req_to_token_pool.req_to_token
+
+        all_freed_phys = []
+
         for i in range(batch_size):
             mask = evict_indices[i] >= 0
             if not mask.any():
@@ -222,8 +241,11 @@ class KSEController:
             logical_pos = evict_indices[i][mask]
             req_idx = forward_batch.req_pool_indices[i]
             phys_indices = req_to_token[req_idx, logical_pos.long()]
-            # Compact the remaining tokens in req_to_token:
-            # shift the tokens after eviction range to fill the gap.
+
+            # Collect physical indices to free
+            all_freed_phys.append(phys_indices)
+
+            # Compact remaining tokens in req_to_token
             seq_len = forward_batch.seq_lens[i].item()
             all_positions = torch.arange(seq_len, device=evict_indices.device)
             keep_mask = torch.ones(seq_len, dtype=torch.bool, device=evict_indices.device)
@@ -232,8 +254,12 @@ class KSEController:
             kept_phys = req_to_token[req_idx, kept_positions.long()]
             new_len = kept_phys.shape[0]
             req_to_token[req_idx, :new_len] = kept_phys
-            # Update seq_lens
             forward_batch.seq_lens[i] = new_len
+
+        # Free physical KV-cache slots via the allocator
+        if all_freed_phys and self.token_to_kv_pool_allocator is not None:
+            freed = torch.cat(all_freed_phys)
+            self.token_to_kv_pool_allocator.free(freed)
 
     # ---- validation -----------------------------------------------------
 

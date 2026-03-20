@@ -22,6 +22,7 @@ from mock_utils import (
     MockForwardMode,
     MockKVCache,
     MockReqToTokenPool,
+    MockTokenToKVPoolAllocator,
     MockTritonMetadata,
     build_identity_req_to_token,
     make_decode_batch,
@@ -160,7 +161,7 @@ class _NoopAdapter(MetadataAdapter):
 # ---------------------------------------------------------------------------
 
 def _make_controller(policy, adapter=None, eviction=None, backend="triton",
-                     page_size=64, end_layer=-1):
+                     page_size=64, end_layer=-1, allocator=None):
     if adapter is None:
         adapter = _NoopAdapter()
     if eviction is None and isinstance(policy, EvictionPolicy):
@@ -179,6 +180,7 @@ def _make_controller(policy, adapter=None, eviction=None, backend="triton",
         eviction=eviction,
         req_to_token_pool=pool,
         token_to_kv_pool=kv,
+        token_to_kv_pool_allocator=allocator,
         config=cfg,
     )
 
@@ -342,6 +344,38 @@ class TestEviction(unittest.TestCase):
         ctrl._do_eviction(batch)
         # seq_len <= 5, so no eviction
         self.assertEqual(batch.seq_lens[0].item(), 4)
+
+    def test_eviction_frees_physical_slots(self):
+        policy = _StubEvictionPolicy()
+        allocator = MockTokenToKVPoolAllocator()
+        ctrl = _make_controller(policy, allocator=allocator)
+        pool = ctrl.req_to_token_pool
+        kv = ctrl.token_to_kv_pool
+
+        pool.req_to_token[0, :8] = torch.tensor(
+            [100, 101, 102, 103, 104, 105, 106, 107], dtype=torch.int32
+        )
+        batch = make_decode_batch([8], pool, kv)
+
+        ctrl._do_eviction(batch)
+
+        # Allocator should have been called with physical indices [102, 103]
+        self.assertEqual(len(allocator.freed_indices), 1)
+        freed = allocator.freed_indices[0]
+        expected_freed = torch.tensor([102, 103], dtype=torch.int32)
+        self.assertTrue(torch.equal(freed, expected_freed))
+
+    def test_eviction_without_allocator_no_crash(self):
+        policy = _StubEvictionPolicy()
+        ctrl = _make_controller(policy, allocator=None)
+        pool = ctrl.req_to_token_pool
+        kv = ctrl.token_to_kv_pool
+        build_identity_req_to_token(pool, 0, 10)
+        batch = make_decode_batch([10], pool, kv)
+
+        # Should not crash even without allocator
+        ctrl._do_eviction(batch)
+        self.assertEqual(batch.seq_lens[0].item(), 8)
 
 
 class TestBeforeAttention(unittest.TestCase):

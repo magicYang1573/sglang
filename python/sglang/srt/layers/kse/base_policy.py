@@ -90,7 +90,13 @@ class SparsityPolicy(ABC):
 
 
 class EvictionPolicy(ABC):
-    """Mixin for strategies that permanently evict KV-cache entries."""
+    """Mixin for strategies that permanently evict KV-cache entries.
+
+    Eviction physically frees KV-cache slots via the allocator.  For
+    PER_STEP policies, eviction can be performed periodically (controlled
+    by ``should_evict()``) rather than every step, to amortise the cost
+    of compacting ``req_to_token`` and calling ``allocator.free()``.
+    """
 
     @abstractmethod
     def compute_eviction(
@@ -105,3 +111,14 @@ class EvictionPolicy(ABC):
             ``[batch, max_evict]`` logical token positions, padded with -1.
         """
         ...
+
+    def should_evict(self) -> bool:
+        """Whether physical eviction should run this step.
+
+        Override to implement periodic eviction.  The default always
+        returns ``True`` (evict whenever the controller calls).
+        """
+        return True
+
+    def on_step(self) -> None:
+        """Called at the start of each decode step for bookkeeping."""

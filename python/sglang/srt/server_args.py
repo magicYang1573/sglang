@@ -593,6 +593,7 @@ class ServerArgs:
     kse_num_recent_pages: int = 4
     kse_num_sink_tokens: int = 4
     kse_window_size: int = 1024
+    kse_evict_interval: int = 64
 
     # Offloading
     cpu_offload_gb: int = 0
@@ -5032,6 +5033,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kse_window_size,
             help="(StreamingLLM) Sliding window size: number of most-recent tokens to retain.",
+        )
+        parser.add_argument(
+            "--kse-evict-interval",
+            type=int,
+            default=ServerArgs.kse_evict_interval,
+            help="(StreamingLLM) Physical eviction interval in decode steps. "
+            "Between evictions, stale tokens are masked out via select() but not freed. "
+            "Lower values free memory sooner; higher values reduce eviction overhead.",
         )
 
         # Offloading

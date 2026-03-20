@@ -1844,6 +1844,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             policy_kwargs = {
                 "num_sink_tokens": server_args.kse_num_sink_tokens,
                 "window_size": server_args.kse_window_size,
+                "evict_interval": server_args.kse_evict_interval,
             }
 
         kse_config = KSEConfig(
@@ -1860,6 +1861,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
             device=torch.device(self.device),
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
         logger.info(
             "KSE enabled: policy=%s backend=%s page_size=%d min_seq_len=%d",

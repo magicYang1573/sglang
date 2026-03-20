@@ -57,7 +57,7 @@ python -m sglang.launch_server \
     --kse-num-recent-pages 4
 ```
 
-### StreamingLLM (Sink + Sliding Window Eviction)
+### StreamingLLM (Sink + Sliding Window with Periodic Eviction)
 
 ```bash
 python -m sglang.launch_server \
@@ -67,7 +67,8 @@ python -m sglang.launch_server \
     --kse-policy streaming_llm \
     --kse-min-seq-len 2048 \
     --kse-num-sink-tokens 4 \
-    --kse-window-size 1024
+    --kse-window-size 1024 \
+    --kse-evict-interval 64
 ```
 
 ### Quest with FlashAttention backend
@@ -100,6 +101,7 @@ python -m sglang.launch_server \
 | `--kse-num-recent-pages` | `4` | *(Quest)* Recent pages always included regardless of score |
 | `--kse-num-sink-tokens` | `4` | *(StreamingLLM)* Number of initial sink tokens to keep |
 | `--kse-window-size` | `1024` | *(StreamingLLM)* Sliding window size in tokens |
+| `--kse-evict-interval` | `64` | *(StreamingLLM)* Physical eviction interval in decode steps |
 
 ---
 
@@ -196,20 +198,23 @@ The central coordinator. It is wired into 4 call-sites in the sglang forward pat
 
 **Paper**: Xiao et al., *Efficient Streaming Language Models with Attention Sinks*, ICLR 2024
 
-**How it works**: Retains a fixed number of "sink tokens" (initial tokens that absorb attention mass) and a sliding window of the most recent tokens. All tokens between the sink region and the window are **permanently evicted** from the KV Cache after prefill, freeing memory slots. After eviction, `select()` returns the full remaining range with no per-step overhead.
+**How it works**: Retains a fixed number of "sink tokens" (initial tokens that absorb attention mass) and a sliding window of the most recent tokens. As new tokens arrive during decode, the window slides forward. Tokens outside the sink+window range are masked out via `select()` every decode step, and **periodically evicted** (physically freed from KV Cache) every `evict_interval` steps to amortise the compaction overhead.
 
 | Property | Value |
 |---|---|
 | Granularity | TOKEN |
-| Frequency | PER_REQUEST |
-| Eviction | Yes (implements `EvictionPolicy`; frees KV Cache slots) |
+| Frequency | PER_STEP |
+| Eviction | Yes (periodic; implements `EvictionPolicy`) |
 
-**Policy-specific parameters** (via `--kse-num-sink-tokens`, `--kse-window-size`):
+**Design**: Between physical evictions, `select()` already masks out stale tokens so attention correctness is maintained. Physical eviction compacts `req_to_token` and calls `allocator.free()` to reclaim KV-cache memory.
+
+**Policy-specific parameters** (via `--kse-num-sink-tokens`, `--kse-window-size`, `--kse-evict-interval`):
 
 | Parameter | Default | Description |
 |---|---|---|
 | `num_sink_tokens` | `4` | Number of initial sink tokens to keep |
 | `window_size` | `1024` | Sliding window size (most recent tokens to keep) |
+| `evict_interval` | `64` | Physical eviction interval in decode steps |
 
 ---
 
@@ -237,7 +242,9 @@ Prefill phase
 Decode phase  (per step)
     ModelRunner.forward_decode
         └─► controller.before_forward(batch)
-                └─ clear PER_STEP cache
+                ├─ clear PER_STEP cache
+                ├─ policy.on_step()                             [step counter]
+                └─ eviction.should_evict() → _do_eviction()    [periodic eviction]
 
     Per-layer attention  (AttentionBackend.forward)
         ├─► controller.before_attention(q, layer_id, ...)
