@@ -1,34 +1,23 @@
 """Runner script that discovers and executes all KSE unit tests.
 
-Usage:
-    python -m test.srt.kse.run_all_kse_tests          (from repo root)
-    python test/srt/kse/run_all_kse_tests.py           (from repo root)
+Usage (from the repo root):
+    python test/srt/kse/run_all_kse_tests.py
 """
 
+import os
 import sys
 import unittest
+
+# Ensure sglang package and this directory are importable
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
+sys.path.insert(0, _HERE)  # for mock_utils
 
 
 def main():
     loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-
-    test_modules = [
-        "test.srt.kse.test_types_and_config",
-        "test.srt.kse.test_registry",
-        "test.srt.kse.test_controller",
-        "test.srt.kse.test_quest_policy",
-        "test.srt.kse.test_streaming_llm_policy",
-        "test.srt.kse.test_triton_adapter",
-        "test.srt.kse.test_flashattention_adapter",
-    ]
-
-    for mod_name in test_modules:
-        try:
-            suite.addTests(loader.loadTestsFromName(mod_name))
-        except Exception as e:
-            print(f"ERROR loading {mod_name}: {e}", file=sys.stderr)
-            return 1
+    suite = loader.discover(start_dir=_HERE, pattern="test_*.py")
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

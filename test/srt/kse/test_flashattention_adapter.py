@@ -1,6 +1,13 @@
 """Tests for the FlashAttention MetadataAdapter."""
 
+import os
+import sys
 import unittest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
+sys.path.insert(0, _HERE)
 
 import torch
 
@@ -8,7 +15,7 @@ from sglang.srt.layers.kse.adapters.flashattention_adapter import FlashAttention
 from sglang.srt.layers.kse.config import KSEConfig
 from sglang.srt.layers.kse.types import Granularity, SelectionResult
 
-from test.srt.kse.mock_utils import (
+from mock_utils import (
     MockFAMetadata,
     MockKVCache,
     MockReqToTokenPool,

@@ -1,6 +1,13 @@
 """Tests for the Quest sparsity policy."""
 
+import os
+import sys
 import unittest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
+sys.path.insert(0, _HERE)
 
 import torch
 
@@ -8,7 +15,7 @@ from sglang.srt.layers.kse.config import KSEConfig
 from sglang.srt.layers.kse.policies.quest import QuestPolicy
 from sglang.srt.layers.kse.types import Frequency, Granularity
 
-from test.srt.kse.mock_utils import (
+from mock_utils import (
     MockKVCache,
     MockReqToTokenPool,
     build_identity_req_to_token,

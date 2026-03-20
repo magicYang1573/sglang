@@ -1,6 +1,13 @@
 """Tests for KSE core data types and configuration."""
 
+import os
+import sys
 import unittest
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
+sys.path.insert(0, _HERE)
 
 import torch
 
