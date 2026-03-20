@@ -14,12 +14,14 @@
 
 KSE 的设计围绕 KVCache 稀疏化的四个正交维度展开：
 
-| 维度 | 选项 | KSE 中的对应职责 |
-|---|---|---|
-| **D1: 驱逐策略** | 部分保留（驱逐）/ 全量保留（仅选择） | `EvictionPolicy` — 是否物理释放 KV 槽位 |
-| **D2: 粒度** | Token / Block(Page) | `SelectionResult.granularity` — 选择的单位 |
-| **D3: 频率** | 每请求 / 每 token（decode step）/ 每层 | `SparsityPolicy.frequency` — 何时执行选择 |
-| **D4: 策略** | 固定策略（滑动窗口、sink）/ Query-Unaware（基于 K/V 统计量选择）/ Query-Aware（当前 Query 作为选择输入）/ Attention-Score-Dependent（依赖 attention weights，暂不支持） | `SparsityPolicy.select()` — 如何选择 KV |
+
+| 维度           | 选项                                                                                                                               | KSE 中的对应职责                            |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| **D1: 驱逐策略** | 部分保留（驱逐）/ 全量保留（仅选择）                                                                                                              | `EvictionPolicy` — 是否物理释放 KV 槽位       |
+| **D2: 粒度**   | Token / Block(Page)                                                                                                              | `SelectionResult.granularity` — 选择的单位 |
+| **D3: 频率**   | 每请求 / 每 token（decode step）/ 每层                                                                                                   | `SparsityPolicy.frequency` — 何时执行选择   |
+| **D4: 策略**   | 固定策略（滑动窗口、sink）/ Query-Unaware（基于 K/V 统计量选择）/ Query-Aware（当前 Query 作为选择输入）/ Attention-Score-Dependent（依赖 attention weights，暂不支持） | `SparsityPolicy.select()` — 如何选择 KV   |
+
 
 ### 1.3 在 sglang 拓扑中的位置
 
@@ -71,11 +73,14 @@ graph TB
     style EP fill:#fce4ec
 ```
 
+
+
 ### 1.4 核心设计原则：元数据重写
 
 核心洞察在于：所有 attention 后端（FlashInfer、FlashAttention、Triton）最终都消费**索引数组**（`kv_indices`、`page_table`、`kv_indptr`）和**长度数组**（`seq_lens`、`cache_seqlens`）来决定访问哪些 KV 条目。KSE 不触碰 KV 数据本身 — 仅重写这些元数据数组，使其指向选中的子集。
 
 这意味着：
+
 - **零拷贝** — 对于仅选择（非驱逐）的策略，不产生任何 KV 数据搬运
 - **后端无关** — 适用于任何使用分页/索引 KV 访问的后端
 - **CUDA Graph 兼容** — 元数据缓冲区可预分配并原地重写
@@ -88,11 +93,13 @@ graph TB
 
 sglang 中的 attention 后端在 KV Cache 的索引方式上分为两类：
 
-| 后端 | 索引机制 | 索引粒度 | 说明 |
-|---|---|---|---|
-| **FlashInfer** | `kv_indptr` / `kv_indices` (CSR) | **Token** | `kv_indices` 存储每个 token 的物理槽位索引，可任意选择 token 子集 |
-| **Triton** | `kv_indptr` / `kv_indices` (CSR) | **Token** | 同上 |
-| **FlashAttention (FA3)** | `page_table` / `cache_seqlens` | **Page** | `page_table` 中每个 entry 指向一个 page，最小访问单位为完整的 page |
+
+| 后端                       | 索引机制                             | 索引粒度      | 说明                                               |
+| ------------------------ | -------------------------------- | --------- | ------------------------------------------------ |
+| **FlashInfer**           | `kv_indptr` / `kv_indices` (CSR) | **Token** | `kv_indices` 存储每个 token 的物理槽位索引，可任意选择 token 子集   |
+| **Triton**               | `kv_indptr` / `kv_indices` (CSR) | **Token** | 同上                                               |
+| **FlashAttention (FA3)** | `page_table` / `cache_seqlens`   | **Page**  | `page_table` 中每个 entry 指向一个 page，最小访问单位为完整的 page |
+
 
 **兼容性规则：**
 
@@ -124,10 +131,12 @@ sparse_page_size = backend_page_size × N    (N 为正整数)
 
 **兼容性矩阵总结：**
 
-| 稀疏策略粒度 | FlashInfer (Token) | Triton (Token) | FlashAttention (Page) |
-|---|---|---|---|
-| **Token** | 兼容 | 兼容 | **不兼容** |
-| **Page** | 兼容 | 兼容 | 兼容（需 sparse_page_size ≥ backend_page_size 且为整数倍） |
+
+| 稀疏策略粒度    | FlashInfer (Token) | Triton (Token) | FlashAttention (Page)                            |
+| --------- | ------------------ | -------------- | ------------------------------------------------ |
+| **Token** | 兼容                 | 兼容             | **不兼容**                                          |
+| **Page**  | 兼容                 | 兼容             | 兼容（需 sparse_page_size ≥ backend_page_size 且为整数倍） |
+
 
 **初始化校验：**
 
@@ -596,14 +605,16 @@ def create_kse_controller(
 
 ### 2.7 维度覆盖矩阵
 
-| 算法 | D1 驱逐 | D2 粒度 | D3 频率 | D4 策略 | KSE 支持状态 |
-|---|---|---|---|---|---|
-| **StreamingLLM** | 驱逐 | Token | 每请求 | 固定策略（sink + 滑动窗口） | ✅ 支持 |
-| **Quest** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 bounding-box 评分） | ✅ 支持 |
-| **ChunkKV** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 chunk 评分） | ✅ 支持 |
-| **H2O** | 驱逐 | Token | 每步 | Attention-Score-Dependent（历史 attention score 累积） | ❌ 暂不支持 |
-| **SnapKV** | 驱逐 | Token | 每请求 | Attention-Score-Dependent（prefill 阶段观察窗口投票） | ❌ 暂不支持 |
-| **DeepSeek NSA** | 全量保留 | Page | 每层 | 模型原生（内置学习型 indexer + 专用内核） | — 不纳入 KSE 范围 |
+
+| 算法               | D1 驱逐 | D2 粒度 | D3 频率 | D4 策略                                            | KSE 支持状态     |
+| ---------------- | ----- | ----- | ----- | ------------------------------------------------ | ------------ |
+| **StreamingLLM** | 驱逐    | Token | 每请求   | 固定策略（sink + 滑动窗口）                                | ✅ 支持         |
+| **Quest**        | 全量保留  | Page  | 每层    | Query-Aware（当前 Q 与 bounding-box 评分）              | ✅ 支持         |
+| **ChunkKV**      | 全量保留  | Page  | 每层    | Query-Aware（当前 Q 与 chunk 评分）                     | ✅ 支持         |
+| **H2O**          | 驱逐    | Token | 每步    | Attention-Score-Dependent（历史 attention score 累积） | ❌ 暂不支持       |
+| **SnapKV**       | 驱逐    | Token | 每请求   | Attention-Score-Dependent（prefill 阶段观察窗口投票）      | ❌ 暂不支持       |
+| **DeepSeek NSA** | 全量保留  | Page  | 每层    | 模型原生（内置学习型 indexer + 专用内核）                       | — 不纳入 KSE 范围 |
+
 
 **关于 D4 策略类型的分类：**
 
@@ -617,18 +628,12 @@ D4 维度将稀疏策略分为四类，其中前三类为 KSE 当前支持的类
 **不支持的组合及原因：**
 
 - **驱逐 + 每层频率**：驱逐是破坏性操作，不应在前向传播中途发生。框架强制 `EvictionPolicy.compute_eviction()` 仅在 `after_prefill()` 或 `before_forward()` 中调用，不会在 `before_attention()` 内部调用。
-
 - **依赖 Attention Weights 的算法（H2O、SnapKV 等）暂不支持**：
-
   sglang 的所有 attention 后端（FlashInfer、FlashAttention/FA3、Triton）均为**融合内核（fused kernel）**实现。融合内核采用 FlashAttention 的 tiling 算法，在 SRAM 中分块计算 softmax 并直接输出 attention output，**不在 global memory 中物化完整的 attention weights 矩阵**。这是融合内核实现高性能的根本原因——避免了 O(n²) 的中间矩阵读写。
-
   融合内核在计算过程中维护的唯一统计量是 **LSE（Log-Sum-Exp）**，即 log∑exp(q·k/√d)。LSE 是 online softmax 算法的必要中间状态，所有后端均支持返回（FlashInfer 的 `run(return_lse=True)`、FlashAttention 的 `return_softmax_lse=True`），且返回开销几乎为零。但 LSE 是一个 **per-head 标量** `[batch, num_heads]`，仅反映整体 attention "能量"，**无法区分单个 KV token 的贡献**。
-
   要获取逐 token 的 attention weights，只有两种途径，均不可接受：
-
   1. **使用非融合的 attention 实现**：即显式计算 `softmax(Q @ K^T / √d)`，产生 `[batch, num_heads, 1, seq_len]` 的 attention weights 矩阵。这需要 O(n) 的额外 global memory 读写（decode 阶段 Q 长度为 1），且无法利用融合内核的 tiling 优化，会显著降低 attention 性能。
   2. **修改融合内核**：在 FlashAttention tiling 循环内部增加 attention weights 的写出逻辑。这不仅需要修改上游内核代码（FlashInfer、FA3），还会因额外的 global memory 写入破坏内核的内存带宽优化，影响所有用户（包括不使用稀疏的场景）。
-
   因此，KSE 当前**不提供** attention weights 作为策略的输入。`on_prefill_complete()` 和 `on_attention_complete()` 的参数仅包含 K/V buffer，不包含 attention weights。依赖 attention weights 的算法（H2O、SnapKV 等）需要等待后续支持方案（如利用 block-level LSE 近似、或策略内部自行计算 Q·K^T 等替代方案）成熟后再纳入框架。
 
 **关于 Cluster 等其他粒度不纳入支持的说明：**
@@ -636,9 +641,7 @@ D4 维度将稀疏策略分为四类，其中前三类为 KSE 当前支持的类
 KSE 仅支持 Token 和 Page 两种选择粒度，暂不支持 Cluster（如基于 k-means 聚类的语义分组）等其他粒度。原因如下：
 
 1. **与现有内存管理架构不兼容**：sglang 的整个 KV Cache 内存体系（`ReqToTokenPool`、`TokenToKVPoolAllocator`、`PagedTokenToKVPoolAllocator`）建立在"token 为基本单位、page 为物理分组"的两级索引之上。`req_to_token` 按序列位置顺序映射 token 到 KV 槽位，page 是连续 token 的物理打包。Cluster 粒度要求按语义相似性而非位置顺序对 token 分组，这与现有的顺序映射机制根本冲突，需要引入额外的 cluster→token 间接层。
-
 2. **性能代价不可接受**：Cluster 分组需要在每次选择时维护和查询一个 cluster 到 token 的映射表，这在 attention 的关键路径上引入额外的间接访问和不连续内存读取。更重要的是，attention 后端（FlashInfer、FlashAttention、Triton）的内核均针对连续 page 或 token 索引优化，cluster 产生的不规则访问模式会严重降低 GPU 内存带宽利用率。
-
 3. **可通过现有粒度近似**：实践中，cluster 类方法（如 PQCache 的向量量化）可以在 `SparsityPolicy` 内部维护 cluster 结构作为评分手段，但最终输出仍为 token 或 page 级别的 `SelectionResult`。即：cluster 是策略的内部实现细节，不需要作为框架级粒度暴露。
 
 ---
@@ -691,6 +694,8 @@ sequenceDiagram
     Note over Scheduler: 请求完成
     Scheduler->>KSEController: on_request_end(req)
 ```
+
+
 
 ### 3.2 具体示例：Quest 算法
 
@@ -846,12 +851,14 @@ class StreamingLLMPolicy(SparsityPolicy, EvictionPolicy):
 
 KSE 在现有 sglang 代码库中仅需 **4 个最小插入点**：
 
-| 位置 | 改动 | 代码 |
-|---|---|---|
-| `Scheduler.run_batch()` | Prefill 完成后 | `if kse: kse.after_prefill(forward_batch)` |
-| `ModelRunner.forward_decode()` | 模型前向之前 | `if kse: kse.before_forward(forward_batch)` |
+
+| 位置                                  | 改动             | 代码                                                                      |
+| ----------------------------------- | -------------- | ----------------------------------------------------------------------- |
+| `Scheduler.run_batch()`             | Prefill 完成后    | `if kse: kse.after_prefill(forward_batch)`                              |
+| `ModelRunner.forward_decode()`      | 模型前向之前         | `if kse: kse.before_forward(forward_batch)`                             |
 | `AttentionBackend.forward_decode()` | Attention 内核之前 | `if kse: metadata = kse.before_attention(q, layer_id, batch, metadata)` |
-| `AttentionBackend.forward_decode()` | Attention 内核之后 | `if kse: kse.after_attention(layer_id, batch)` |
+| `AttentionBackend.forward_decode()` | Attention 内核之后 | `if kse: kse.after_attention(layer_id, batch)`                          |
+
 
 无需修改 `AttentionBackend` 基类、`KVCache`、`ReqToTokenPool`、`ForwardBatch` 或任何模型代码。
 
@@ -877,13 +884,16 @@ KSE 的设计目标是为**不具备原生稀疏注意力机制的模型**提供
 
 KSE 引入的主要开销是 `SparsityPolicy.select()` 中的**选择计算**。按频率分析如下：
 
-| 频率 | 每 decode step 的开销 | 摊销方式 |
-|---|---|---|
-| PER_REQUEST | 0（在 prefill 时计算一次） | 完全摊销到所有 decode step |
-| PER_STEP | 1 × select() | 跨所有层共享 |
-| PER_LAYER | N_layers × select() | 无摊销 — 每步承担全部开销 |
+
+| 频率          | 每 decode step 的开销   | 摊销方式                |
+| ----------- | ------------------- | ------------------- |
+| PER_REQUEST | 0（在 prefill 时计算一次）  | 完全摊销到所有 decode step |
+| PER_STEP    | 1 × select()        | 跨所有层共享              |
+| PER_LAYER   | N_layers × select() | 无摊销 — 每步承担全部开销      |
+
 
 **定量估算**（Quest，PER_LAYER，batch_size=32，seq_len=8K，page_size=64）：
+
 - 每请求的 page 数：128
 - Score 计算：32 × 128 次 [num_heads, head_dim] 矩阵乘 ≈ 0.1ms（A100）
 - Top-k 选择：32 × topk(128) ≈ 0.01ms
@@ -941,10 +951,12 @@ topk_indices = scores.topk(k, dim=1).indices  # [batch, k]
 
 KSE 本身引入的内存开销极小：
 
-| 组件 | 内存 | 备注 |
-|---|---|---|
-| `SelectionResult` 张量 | O(batch × max_selected) | 跨步复用 |
-| 稠密元数据快照 | O(batch × max_pages) | page_table 的一份拷贝 |
-| 策略表征 | 取决于算法 | Quest: O(num_pages × num_heads × head_dim × num_layers) |
+
+| 组件                   | 内存                      | 备注                                                      |
+| -------------------- | ----------------------- | ------------------------------------------------------- |
+| `SelectionResult` 张量 | O(batch × max_selected) | 跨步复用                                                    |
+| 稠密元数据快照              | O(batch × max_pages)    | page_table 的一份拷贝                                        |
+| 策略表征                 | 取决于算法                   | Quest: O(num_pages × num_heads × head_dim × num_layers) |
+
 
 以 Quest 为例，100K pages、8 heads、128 dim、80 layers：表征约 8GB。可通过跨 GQA 组共享表征或使用低精度（FP16 → FP8）来减少。
