@@ -1,4 +1,4 @@
-"""Abstract base classes for sparsity and eviction policies."""
+"""Abstract base classes for sparsity policies."""
 
 from __future__ import annotations
 
@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 
 class SparsityPolicy(ABC):
     """Algorithm-agnostic interface for all KV-cache sparsity strategies.
+
+    KSE operates purely via **metadata rewriting** — ``select()`` produces
+    a mask that determines which KV entries the attention kernel sees.
+    No physical KV data is moved, freed, or evicted.
 
     Lifecycle:
         1. ``__init__(config, device)``     — parse config, allocate buffers
@@ -87,38 +91,3 @@ class SparsityPolicy(ABC):
         forward_batch: ForwardBatch,
     ) -> None:
         """Called after each decode attention to incrementally update state."""
-
-
-class EvictionPolicy(ABC):
-    """Mixin for strategies that permanently evict KV-cache entries.
-
-    Eviction physically frees KV-cache slots via the allocator.  For
-    PER_STEP policies, eviction can be performed periodically (controlled
-    by ``should_evict()``) rather than every step, to amortise the cost
-    of compacting ``req_to_token`` and calling ``allocator.free()``.
-    """
-
-    @abstractmethod
-    def compute_eviction(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """Return per-request token positions to evict.
-
-        Returns:
-            ``[batch, max_evict]`` logical token positions, padded with -1.
-        """
-        ...
-
-    def should_evict(self) -> bool:
-        """Whether physical eviction should run this step.
-
-        Override to implement periodic eviction.  The default always
-        returns ``True`` (evict whenever the controller calls).
-        """
-        return True
-
-    def on_step(self) -> None:
-        """Called at the start of each decode step for bookkeeping."""

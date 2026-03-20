@@ -7,12 +7,11 @@ from typing import TYPE_CHECKING, Dict, Type
 import torch
 
 from sglang.srt.layers.kse.base_adapter import MetadataAdapter
-from sglang.srt.layers.kse.base_policy import EvictionPolicy, SparsityPolicy
+from sglang.srt.layers.kse.base_policy import SparsityPolicy
 from sglang.srt.layers.kse.config import KSEConfig
 from sglang.srt.layers.kse.controller import KSEController
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 
 _POLICY_REGISTRY: Dict[str, Type[SparsityPolicy]] = {}
@@ -44,7 +43,6 @@ def create_kse_controller(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool: KVCache,
     device: torch.device,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None,
 ) -> KSEController:
     """Instantiate a fully wired ``KSEController``."""
     if config.policy_name not in _POLICY_REGISTRY:
@@ -63,14 +61,11 @@ def create_kse_controller(
 
     policy = policy_cls(config, device)
     adapter = adapter_cls(config, device)
-    eviction = policy if isinstance(policy, EvictionPolicy) else None
 
     return KSEController(
         policy=policy,
         adapter=adapter,
-        eviction=eviction,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool=token_to_kv_pool,
-        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         config=config,
     )

@@ -17,7 +17,7 @@ KSE 的设计围绕 KVCache 稀疏化的四个正交维度展开：
 
 | 维度           | 选项                                                                                                                               | KSE 中的对应职责                            |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
-| **D1: 驱逐策略** | 部分保留（驱逐）/ 全量保留（仅选择）                                                                                                              | `EvictionPolicy` — 是否物理释放 KV 槽位       |
+| **D1: 保留策略** | 部分保留（仅选择可见子集）/ 全量保留                                                                                                              | `SparsityPolicy.select()` — 选择可见的 KV 子集 |
 | **D2: 粒度**   | Token / Block(Page)                                                                                                              | `SelectionResult.granularity` — 选择的单位 |
 | **D3: 频率**   | 每请求 / 每 token（decode step）/ 每层                                                                                                   | `SparsityPolicy.frequency` — 何时执行选择   |
 | **D4: 策略**   | 固定策略（滑动窗口、sink）/ Query-Unaware（基于 K/V 统计量选择）/ Query-Aware（当前 Query 作为选择输入）/ Attention-Score-Dependent（依赖 attention weights，暂不支持） | `SparsityPolicy.select()` — 如何选择 KV   |
@@ -54,12 +54,9 @@ graph TB
         KSE_CTRL[KSEController]
         SP[SparsityPolicy]
         MA[MetadataAdapter]
-        EP[EvictionPolicy]
     end
 
     S -. "on_prefill_complete()" .-> KSE_CTRL
-    KSE_CTRL -. "evict()" .-> EP
-    EP -. "释放 token 槽位" .-> S
 
     FB -. "on_forward_begin()" .-> KSE_CTRL
     L1 -. "on_attention_begin(q, layer)" .-> KSE_CTRL
@@ -70,7 +67,6 @@ graph TB
     style KSE_CTRL fill:#e1f5fe
     style SP fill:#e8f5e9
     style MA fill:#fff3e0
-    style EP fill:#fce4ec
 ```
 
 
@@ -297,46 +293,7 @@ class SparsityPolicy(ABC):
         pass
 ```
 
-### 2.3 EvictionPolicy（可选 Mixin）
-
-用于永久删除 KV 条目的算法（D1: 部分保留）。
-
-```python
-class EvictionPolicy(ABC):
-    """用于永久驱逐 KV Cache 条目的策略 Mixin。
-
-    驱逐会物理释放 TokenToKVPoolAllocator 中的 token 槽位，
-    降低内存压力，但被驱逐的 token 不可恢复。
-
-    对于 PER_STEP 策略，物理驱逐可通过 should_evict() 控制周期性执行，
-    在两次驱逐之间通过 select() 的 mask 屏蔽应驱逐的 token。
-    """
-
-    @abstractmethod
-    def compute_eviction(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        """返回每个请求需要驱逐的 token 位置。
-
-        Returns:
-            evict_indices: [batch, max_evict] 逻辑 token 位置，用 -1 填充
-        """
-        ...
-
-    def should_evict(self) -> bool:
-        """当前步是否应执行物理驱逐。默认始终返回 True。
-        子类可覆盖以实现周期性驱逐（如每 N 步驱逐一次）。
-        """
-        return True
-
-    def on_step(self) -> None:
-        """每个 decode step 开始时调用，用于步数计数等簿记。"""
-```
-
-### 2.4 MetadataAdapter
+### 2.3 MetadataAdapter
 
 将 `SelectionResult` 转换为后端特定的元数据重写。
 
@@ -379,7 +336,7 @@ class MetadataAdapter(ABC):
         ...
 ```
 
-### 2.5 KSEController
+### 2.4 KSEController
 
 连接策略、适配器和前向路径的中央协调器。
 
@@ -401,14 +358,12 @@ class KSEController:
         self,
         policy: SparsityPolicy,
         adapter: MetadataAdapter,
-        eviction: Optional[EvictionPolicy],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: KVCache,
         config: KSEConfig,
     ):
         self.policy = policy
         self.adapter = adapter
-        self.eviction = eviction
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.config = config
@@ -435,7 +390,7 @@ class KSEController:
         self,
         forward_batch: ForwardBatch,
     ) -> None:
-        """在 prefill 完成后调用。触发表征构建和可选的驱逐。"""
+        """在 prefill 完成后调用。触发表征构建。"""
         for layer_id in range(self.config.start_layer, self.config.end_layer):
             k_buf = self.token_to_kv_pool.get_key_buffer(layer_id)
             v_buf = self.token_to_kv_pool.get_value_buffer(layer_id)
@@ -446,9 +401,6 @@ class KSEController:
                 k_buf, v_buf,
                 forward_batch,
             )
-
-        if self.eviction is not None:
-            self._do_eviction(forward_batch)
 
         # 对于 PER_REQUEST 策略，仅计算一次选择
         if self.policy.frequency() == SparsityPolicy.Frequency.PER_REQUEST:
@@ -468,15 +420,6 @@ class KSEController:
         if self.policy.frequency() == Frequency.PER_STEP:
             self._cached_result = None  # 将在第一次 attention_begin 时计算
         self._metadata_saved = False
-
-        # 通知策略新的 decode step（用于步数计数）
-        if hasattr(self.policy, "on_step"):
-            self.policy.on_step()
-
-        # 周期性驱逐：策略通过 should_evict() 控制驱逐时机
-        if self.eviction is not None and hasattr(self.eviction, "should_evict"):
-            if self.eviction.should_evict():
-                self._do_eviction(forward_batch)
 
     # ---- Hook: 每层 Attention 之前 ----
 
@@ -556,21 +499,9 @@ class KSEController:
             return False
         return True
 
-    def _do_eviction(self, forward_batch):
-        evict_indices = self.eviction.compute_eviction(
-            forward_batch.req_pool_indices,
-            forward_batch.seq_lens,
-            forward_batch,
-        )
-        # 对每个请求：
-        #   1. 将逻辑位置映射到物理 KV 槽位
-        #   2. 压缩 req_to_token（保留的 token 前移填补空隙）
-        #   3. 更新 seq_lens
-        # 最后通过 allocator.free() 释放所有被驱逐的物理槽位
-        ...
 ```
 
-### 2.6 KSEConfig 与工厂
+### 2.5 KSEConfig 与工厂
 
 ```python
 @dataclass
@@ -615,24 +546,22 @@ def create_kse_controller(
 
     policy = policy_cls(config, device)
     adapter = adapter_cls(device)
-    eviction = policy if isinstance(policy, EvictionPolicy) else None
 
     return KSEController(
         policy=policy,
         adapter=adapter,
-        eviction=eviction,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool=token_to_kv_pool,
         config=config,
     )
 ```
 
-### 2.7 维度覆盖矩阵
+### 2.6 维度覆盖矩阵
 
 
 | 算法               | D1 驱逐 | D2 粒度 | D3 频率 | D4 策略                                            | KSE 支持状态     |
 | ---------------- | ----- | ----- | ----- | ------------------------------------------------ | ------------ |
-| **StreamingLLM** | 驱逐    | Token | 每步    | 固定策略（sink + 滑动窗口），周期性物理驱逐                       | ✅ 支持         |
+| **StreamingLLM** | 部分保留  | Token | 每步    | 固定策略（sink + 滑动窗口），仅 mask 不物理驱逐                   | ✅ 支持         |
 | **Quest**        | 全量保留  | Page  | 每层    | Query-Aware（当前 Q 与 bounding-box 评分）              | ✅ 支持         |
 | **ChunkKV**      | 全量保留  | Page  | 每层    | Query-Aware（当前 Q 与 chunk 评分）                     | ✅ 支持         |
 | **H2O**          | 驱逐    | Token | 每步    | Attention-Score-Dependent（历史 attention score 累积） | ❌ 暂不支持       |
@@ -651,7 +580,7 @@ D4 维度将稀疏策略分为四类，其中前三类为 KSE 当前支持的类
 
 **不支持的组合及原因：**
 
-- **驱逐 + 每层频率**：驱逐是破坏性操作，不应在前向传播中途发生。框架强制 `EvictionPolicy.compute_eviction()` 仅在 `after_prefill()` 或 `before_forward()` 中调用，不会在 `before_attention()` 内部调用。对于 PER_STEP 的驱逐策略（如 StreamingLLM），物理驱逐通过 `should_evict()` 控制周期性执行（默认每 64 步），在两次驱逐之间通过 `select()` 的 mask 屏蔽应驱逐的 token，兼顾正确性与性能。
+- **物理驱逐（当前不支持）**：KSE 当前仅通过 `select()` 的 mask 控制 token 可见性，不物理释放 KV Cache 槽位。原因是 sglang 的 scheduler 通过 `Req.kv_committed_len` 跟踪每个请求的 KV 分配量，而 model runner 侧无法安全地修改此字段。如果 KSE 调用 `allocator.free()` 释放槽位但不同步 `kv_committed_len`，请求结束时 radix cache 会再次释放相同槽位，导致 double-free 和内存泄漏检测报错。未来可在 scheduler 层面集成物理驱逐。
 - **依赖 Attention Weights 的算法（H2O、SnapKV 等）暂不支持**：
   sglang 的所有 attention 后端（FlashInfer、FlashAttention/FA3、Triton）均为**融合内核（fused kernel）**实现。融合内核采用 FlashAttention 的 tiling 算法，在 SRAM 中分块计算 softmax 并直接输出 attention output，**不在 global memory 中物化完整的 attention weights 矩阵**。这是融合内核实现高性能的根本原因——避免了 O(n²) 的中间矩阵读写。
   融合内核在计算过程中维护的唯一统计量是 **LSE（Log-Sum-Exp）**，即 log∑exp(q·k/√d)。LSE 是 online softmax 算法的必要中间状态，所有后端均支持返回（FlashInfer 的 `run(return_lse=True)`、FlashAttention 的 `return_softmax_lse=True`），且返回开销几乎为零。但 LSE 是一个 **per-head 标量** `[batch, num_heads]`，仅反映整体 attention "能量"，**无法区分单个 KV token 的贡献**。
@@ -695,13 +624,11 @@ sequenceDiagram
     Note over Scheduler: Prefill 完成后
     Scheduler->>KSEController: after_prefill(batch)
     KSEController->>SparsityPolicy: on_prefill_complete(layer, ...)
-    Note over KSEController: [若为驱逐策略] 驱逐 token
 
     Note over Scheduler: Decode 阶段开始
     loop 每个 decode step
         Scheduler->>ModelRunner: forward_decode(batch)
         ModelRunner->>KSEController: before_forward(batch)
-        Note over KSEController: [若为周期性驱逐策略] 每 N 步驱逐一次
 
         loop 每层
             ModelRunner->>AttentionBackend: forward_decode(q, k, v, layer, batch)
@@ -832,24 +759,22 @@ class FlashAttentionAdapter(MetadataAdapter):
         return forward_metadata
 ```
 
-### 3.3 具体示例：StreamingLLM（驱逐策略）
+### 3.3 具体示例：StreamingLLM（Masking-only 策略）
 
-StreamingLLM 保留固定数量的 "sink" token（初始 token）加上一个滑动窗口的最近 token。随着每个 decode step 产生新 token，窗口向前滑动，超出窗口的 token 需要被驱逐。
+StreamingLLM 保留固定数量的 "sink" token（初始 token）加上一个滑动窗口的最近 token。随着每个 decode step 产生新 token，窗口向前滑动，超出窗口的 token 被 mask 掉。
 
 **设计要点：**
 
 1. **频率为 PER_STEP**：每个 decode step 都调用 `select()` 重新计算 sink + 窗口的 token 集合，确保 attention 只看到正确的 token 范围。
-2. **周期性物理驱逐**：每 `evict_interval`（默认 64）个 decode step 执行一次 `compute_eviction()`，物理压缩 `req_to_token` 并通过 allocator 释放 KV Cache 槽位。在两次驱逐之间，`select()` 的 mask 已经屏蔽了应驱逐的 token，保证正确性。
-3. **开销分析**：`select()` 每步仅做简单的 arange + cat，开销极低。物理驱逐涉及 `req_to_token` 压缩和 allocator.free()，通过间隔执行将开销摊薄。
+2. **仅 mask，不物理驱逐**：被 mask 的 token 仍占用 KV Cache 物理槽位，直到请求结束由 radix cache 统一释放。这避免了与 scheduler 的 `Req.kv_committed_len` 簿记冲突。
+3. **开销分析**：`select()` 每步仅做简单的 arange + cat，开销极低。主要收益来自 attention 计算量的减少（只对选中的 token 做 attention）。
 
 ```python
 @register_policy("streaming_llm")
-class StreamingLLMPolicy(SparsityPolicy, EvictionPolicy):
+class StreamingLLMPolicy(SparsityPolicy):
     def __init__(self, config: KSEConfig, device: torch.device):
         self.num_sink_tokens = config.policy_kwargs.get("num_sink_tokens", 4)
         self.window_size = config.policy_kwargs.get("window_size", 1024)
-        self.evict_interval = config.policy_kwargs.get("evict_interval", 64)
-        self._step_counter = 0
 
     def frequency(self) -> Frequency:
         return Frequency.PER_STEP
@@ -857,7 +782,7 @@ class StreamingLLMPolicy(SparsityPolicy, EvictionPolicy):
     def select(self, query, layer_id, req_pool_indices, seq_lens,
                forward_batch, **kwargs) -> SelectionResult:
         # 每步选择 sink tokens + 最近 window_size 个 token
-        # 中间的 token 被 mask 掉（不参与 attention）
+        # 中间的 token 被 mask 掉（不参与 attention，但物理 KV 槽位不释放）
         for i in range(bs):
             n = seq_lens[i]
             if n <= num_sink_tokens + window_size:
@@ -867,21 +792,6 @@ class StreamingLLMPolicy(SparsityPolicy, EvictionPolicy):
                 window = arange(n - window_size, n)
                 selected = cat([sink, window])
         ...
-
-    def should_evict(self) -> bool:
-        return self._step_counter % self.evict_interval == 0
-
-    def on_step(self) -> None:
-        self._step_counter += 1
-
-    def compute_eviction(self, req_pool_indices, seq_lens, forward_batch):
-        # 驱逐 sink 和窗口之间的 token，释放物理 KV Cache 槽位
-        for i in range(bs):
-            n = seq_lens[i]
-            if n <= num_sink_tokens + window_size:
-                continue
-            evict_range = arange(num_sink_tokens, n - window_size)
-            ...
 ```
 
 ### 3.4 现有代码中的集成点
@@ -958,15 +868,11 @@ def fused_page_score_topk_kernel(
 
 对于 PER_STEP 策略，选择仅计算一次并跨所有层复用。`KSEController._cached_result` 机制确保零冗余计算。例如 StreamingLLM 的 `select()` 每步仅做 `arange` + `cat`（sink + window），计算量极低。
 
-**3. 周期性物理驱逐**
-
-对于带驱逐的 PER_STEP 策略（如 StreamingLLM），物理驱逐（压缩 `req_to_token` + `allocator.free()`）不在每步执行，而是通过 `should_evict()` 控制周期性执行（默认每 64 步）。在两次驱逐之间，`select()` 的 mask 已屏蔽应驱逐的 token，保证 attention 正确性。这将驱逐开销摊薄了 64 倍。
-
-**4. CUDA Graph 兼容性**
+**3. CUDA Graph 兼容性**
 
 元数据重写操作的是预分配的张量（`page_table`、`kv_indptr`、`cache_seqlens`），这些张量已经是 CUDA Graph 捕获的一部分。适配器执行原地更新，使其与 CUDA Graph 回放兼容，无需重新捕获。
 
-**5. 异步表征更新**
+**4. 异步表征更新**
 
 对于在 attention 后更新表征的算法（例如 Quest 为新 token 更新 page bounding box），更新可以与同一层的 MLP 计算使用 CUDA stream 重叠：
 

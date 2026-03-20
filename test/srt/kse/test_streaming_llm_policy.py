@@ -1,4 +1,4 @@
-"""Tests for the StreamingLLM sparsity/eviction policy."""
+"""Tests for the StreamingLLM sparsity policy."""
 
 import os
 import sys
@@ -11,7 +11,7 @@ sys.path.insert(0, _HERE)
 
 import torch
 
-from sglang.srt.layers.kse.base_policy import EvictionPolicy
+from sglang.srt.layers.kse.base_policy import SparsityPolicy
 from sglang.srt.layers.kse.config import KSEConfig
 from sglang.srt.layers.kse.policies.streaming_llm import StreamingLLMPolicy
 from sglang.srt.layers.kse.types import Frequency, Granularity
@@ -24,14 +24,13 @@ from mock_utils import (
 )
 
 
-def _make_policy(num_sink_tokens=4, window_size=8, evict_interval=64):
+def _make_policy(num_sink_tokens=4, window_size=8):
     cfg = KSEConfig(
         policy_name="streaming_llm",
         backend_name="triton",
         policy_kwargs={
             "num_sink_tokens": num_sink_tokens,
             "window_size": window_size,
-            "evict_interval": evict_interval,
         },
     )
     return StreamingLLMPolicy(cfg, torch.device("cpu"))
@@ -57,9 +56,9 @@ class TestStreamingLLMBasic(unittest.TestCase):
         p = _make_policy()
         self.assertEqual(p.frequency(), Frequency.PER_STEP)
 
-    def test_is_eviction_policy(self):
+    def test_is_sparsity_policy(self):
         p = _make_policy()
-        self.assertIsInstance(p, EvictionPolicy)
+        self.assertIsInstance(p, SparsityPolicy)
 
 
 class TestStreamingLLMSelect(unittest.TestCase):
@@ -147,94 +146,27 @@ class TestStreamingLLMSelect(unittest.TestCase):
         self.assertFalse(result.sparse_mask[2].item())
         self.assertEqual(result.valid_lengths[2].item(), 6)
 
-
-class TestComputeEviction(unittest.TestCase):
-    def test_long_seq(self):
-        p = _make_policy(num_sink_tokens=4, window_size=8)
-        pool, kv, batch = _make_env([32])
-
-        evict = p.compute_eviction(
-            batch.req_pool_indices, batch.seq_lens, batch
-        )
-
-        # Should evict positions [4, 5, ..., 23] (32 - 8 = 24, so range [4, 24))
-        valid = evict[0][evict[0] >= 0]
-        expected = torch.arange(4, 24, dtype=torch.int32)
-        self.assertTrue(torch.equal(valid, expected))
-
-    def test_short_seq_no_evict(self):
-        p = _make_policy(num_sink_tokens=4, window_size=8)
-        pool, kv, batch = _make_env([10])  # 10 <= 4 + 8
-
-        evict = p.compute_eviction(
-            batch.req_pool_indices, batch.seq_lens, batch
-        )
-
-        self.assertTrue((evict == -1).all())
-
-    def test_exact_threshold_no_evict(self):
-        p = _make_policy(num_sink_tokens=4, window_size=8)
-        pool, kv, batch = _make_env([12])  # 12 == 4 + 8
-
-        evict = p.compute_eviction(
-            batch.req_pool_indices, batch.seq_lens, batch
-        )
-        self.assertTrue((evict == -1).all())
-
-    def test_batch_mixed(self):
+    def test_window_slides_with_growing_seq(self):
+        """Verify the window moves forward as seq_len increases."""
         p = _make_policy(num_sink_tokens=2, window_size=4)
-        pool, kv, batch = _make_env([5, 20, 6])
 
-        evict = p.compute_eviction(
-            batch.req_pool_indices, batch.seq_lens, batch
-        )
+        # Step 1: seq_len = 10
+        pool, kv, batch = _make_env([10])
+        r1 = p.select(None, -1, batch.req_pool_indices, batch.seq_lens, batch)
+        valid_1 = r1.selected_indices[0, :6]
+        # sink=[0,1], window=[6,7,8,9]
+        self.assertTrue(torch.equal(
+            valid_1, torch.tensor([0, 1, 6, 7, 8, 9], dtype=torch.int32)
+        ))
 
-        # Request 0: 5 <= 2+4=6 → no eviction
-        self.assertTrue((evict[0] == -1).all())
-
-        # Request 1: 20 > 6 → evict [2, 3, ..., 15]
-        valid_1 = evict[1][evict[1] >= 0]
-        expected_1 = torch.arange(2, 16, dtype=torch.int32)
-        self.assertTrue(torch.equal(valid_1, expected_1))
-
-        # Request 2: 6 <= 6 → no eviction
-        self.assertTrue((evict[2] == -1).all())
-
-
-class TestPeriodicEviction(unittest.TestCase):
-    """Test the should_evict / on_step periodic eviction mechanism."""
-
-    def test_default_evict_interval(self):
-        p = _make_policy()
-        self.assertEqual(p.evict_interval, 64)
-
-    def test_custom_evict_interval(self):
-        p = _make_policy(evict_interval=16)
-        self.assertEqual(p.evict_interval, 16)
-
-    def test_should_evict_timing(self):
-        p = _make_policy(evict_interval=4)
-        # Step counter starts at 0, should_evict checks counter % interval == 0
-        # After on_step, counter becomes 1
-        p.on_step()
-        self.assertFalse(p.should_evict())  # step 1
-
-        p.on_step()
-        self.assertFalse(p.should_evict())  # step 2
-
-        p.on_step()
-        self.assertFalse(p.should_evict())  # step 3
-
-        p.on_step()
-        self.assertTrue(p.should_evict())  # step 4 → 4 % 4 == 0
-
-        p.on_step()
-        self.assertFalse(p.should_evict())  # step 5
-
-    def test_should_evict_at_step_zero(self):
-        """Step 0 (initial state) should trigger eviction (for after_prefill)."""
-        p = _make_policy(evict_interval=4)
-        self.assertTrue(p.should_evict())  # counter=0, 0%4==0
+        # Step 2: seq_len = 12 (2 new tokens arrived)
+        batch.seq_lens[0] = 12
+        r2 = p.select(None, -1, batch.req_pool_indices, batch.seq_lens, batch)
+        valid_2 = r2.selected_indices[0, :6]
+        # sink=[0,1], window=[8,9,10,11]
+        self.assertTrue(torch.equal(
+            valid_2, torch.tensor([0, 1, 8, 9, 10, 11], dtype=torch.int32)
+        ))
 
 
 if __name__ == "__main__":
