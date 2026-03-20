@@ -597,11 +597,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
-        # Init KVCache Sparsity Engine (KSE)
-        self.kse_controller: Optional[KSEController] = None
-        if server_args.enable_kse:
-            self.init_kse_controller(server_args)
-
         # Enable batch invariant mode
         if server_args.enable_deterministic_inference:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
@@ -632,6 +627,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
+
+        # Init KVCache Sparsity Engine (KSE) — must run after init_memory_pool
+        # and init_attention_backend so that token_to_kv_pool and
+        # server_args.attention_backend are both available.
+        self.kse_controller: Optional[KSEController] = None
+        if server_args.enable_kse:
+            self.init_kse_controller(server_args)
 
         if server_args.forward_hooks:
             register_forward_hooks(self.model, server_args.forward_hooks)
