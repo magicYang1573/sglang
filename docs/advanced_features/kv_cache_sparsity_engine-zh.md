@@ -4,7 +4,7 @@
 
 ### 1.1 问题陈述
 
-随着上下文长度的增长，attention 计算复杂度以 O(n²) 增长，KV Cache 存储需求以 O(n) 线性增长。KVCache 稀疏化技术通过仅选择部分 KV 条目参与 attention 计算来解决这一问题，但 sglang 中现有的实现（Double Sparsity、NSA、Hierarchical Sparse）与特定后端和算法紧密耦合。本文档提出一个**统一的 KVCache 稀疏引擎 (KSE)**，目标是：
+随着上下文长度的增长，attention 计算复杂度以 O(n²) 增长，KV Cache 存储需求以 O(n) 线性增长。KVCache 稀疏化技术通过仅选择部分 KV 条目参与 attention 计算来解决这一问题，但 sglang 中现有的实现（Double Sparsity、Hierarchical Sparse 等）与特定后端和算法紧密耦合。本文档提出一个**统一的 KVCache 稀疏引擎 (KSE)**，聚焦于为**不具备原生稀疏注意力机制的模型**提供通用的 KV Cache 稀疏化能力。目标是：
 
 - 支持稀疏化维度（驱逐策略、粒度、频率、选择策略）的任意组合
 - 对现有 sglang 前向路径的改动最小化
@@ -109,7 +109,7 @@ Token 粒度的稀疏策略需要精确控制哪些 token 参与 attention。这
 
 > **规则 2：Page 粒度的稀疏策略可在任何后端上运行，但稀疏 page 大小必须等于后端 page 大小或其整数倍。**
 
-Page 粒度的稀疏策略（如 Quest、ChunkKV、NSA）选择的单位是 page。对于 Page 粒度后端，必须满足：
+Page 粒度的稀疏策略（如 Quest、ChunkKV）选择的单位是 page。对于 Page 粒度后端，必须满足：
 
 ```
 sparse_page_size = backend_page_size × N    (N 为正整数)
@@ -601,9 +601,9 @@ def create_kse_controller(
 | **StreamingLLM** | 驱逐 | Token | 每请求 | 固定策略（sink + 滑动窗口） | ✅ 支持 |
 | **Quest** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 bounding-box 评分） | ✅ 支持 |
 | **ChunkKV** | 全量保留 | Page | 每层 | Query-Aware（当前 Q 与 chunk 评分） | ✅ 支持 |
-| **DeepSeek NSA** | 全量保留 | Page | 每层 | Query-Aware（模型内置学习型 indexer） | ✅ 支持 |
 | **H2O** | 驱逐 | Token | 每步 | Attention-Score-Dependent（历史 attention score 累积） | ❌ 暂不支持 |
 | **SnapKV** | 驱逐 | Token | 每请求 | Attention-Score-Dependent（prefill 阶段观察窗口投票） | ❌ 暂不支持 |
+| **DeepSeek NSA** | 全量保留 | Page | 每层 | 模型原生（内置学习型 indexer + 专用内核） | — 不纳入 KSE 范围 |
 
 **关于 D4 策略类型的分类：**
 
@@ -859,51 +859,19 @@ KSE 在现有 sglang 代码库中仅需 **4 个最小插入点**：
 
 ## 4. 可扩展性与性能
 
-### 4.1 原生稀疏注意力（DeepSeek NSA）支持
+### 4.1 框架定位：聚焦于无原生稀疏注意力的模型
 
-DeepSeek NSA 是一种**模型原生**的稀疏注意力机制，其稀疏模式由模型架构内部的学习型 indexer 模块决定（而非事后优化）。这带来了独特的挑战：indexer 作为模型前向传播的一部分运行，产生的稀疏索引直接输入到专用的 sparse MLA 内核中。
+KSE 的设计目标是为**不具备原生稀疏注意力机制的模型**提供通用的 KV Cache 稀疏化能力。这意味着 KSE 主要服务于使用标准稠密 attention 的模型（如 LLaMA、Qwen、Mistral 等），通过在推理阶段附加稀疏策略来减少 attention 计算量和 KV Cache 内存占用。
 
-**KSE 如何适配 NSA：**
+**不纳入 KSE 范围的模型原生稀疏注意力：**
 
-NSA 可以作为 `PER_LAYER` 频率的 `SparsityPolicy` 集成，其中 `select()` 委托给模型的原生 indexer：
+部分模型在架构层面内置了稀疏注意力机制（如 DeepSeek NSA），其稀疏模式由模型内部的学习型模块决定，并配合专用的高性能内核（如 TileLang/Triton 实现的 sparse MLA）执行。这类模型原生稀疏注意力**不纳入 KSE 的管理范围**，原因如下：
 
-```python
-@register_policy("deepseek_nsa")
-class NSAPolicy(SparsityPolicy):
-    def frequency(self):
-        return SparsityPolicy.Frequency.PER_LAYER
+1. **已有高度优化的专用实现**：模型原生稀疏注意力通常配备专用的 attention 后端（如 sglang 中的 `NSABackend`），这些后端针对特定的稀疏模式和元数据格式进行了深度优化，性能远优于通用框架的元数据重写方案。
+2. **与模型架构深度耦合**：原生稀疏的 indexer 作为模型前向传播的一部分运行，使用中间隐藏状态（而不仅仅是 Q 向量）来决定稀疏模式。将其纳入 KSE 的 `SparsityPolicy` 抽象会引入不必要的间接层，且无法与模型架构完全解耦。
+3. **元数据格式不兼容**：原生稀疏注意力使用专有的元数据格式（如 NSA 的 `page_table_1`、`real_page_table`、`nsa_cache_seqlens` 等），与 KSE 基于通用 page table / kv_indices 重写的机制不匹配。
 
-    def select(self, query, layer_id, req_pool_indices, seq_lens,
-               forward_batch, **kwargs):
-        indexer = kwargs["indexer"]
-        # indexer 是一个模型组件，产生 top-k page 索引
-        sparse_indices = indexer(
-            x=kwargs["x"], q_lora=kwargs["q_lora"],
-            positions=kwargs["positions"],
-            forward_batch=forward_batch, layer_id=layer_id,
-        )
-        return SelectionResult(
-            granularity=SelectionResult.Granularity.PAGE,
-            selected_indices=sparse_indices,
-            valid_lengths=...,
-            sparse_mask=torch.ones(len(req_pool_indices), dtype=torch.bool),
-        )
-```
-
-然而，NSA 还使用**专用内核**（通过 TileLang/Triton 实现的 sparse MLA），这些内核与其元数据格式紧密耦合。对于 NSA，`MetadataAdapter` 必须生成 NSA 特有的元数据（`NSAMetadata`，包含 `page_table_1`、`real_page_table` 等），而非通用的 page table 重写。
-
-这通过注册 NSA 专用适配器来处理：
-
-```python
-@register_adapter("nsa")
-class NSAMetadataAdapter(MetadataAdapter):
-    def apply(self, result, forward_metadata, forward_batch, layer_id):
-        # 将 SelectionResult 转换为 NSA 特有的 page tables
-        # (page_table_1, real_page_table, nsa_cache_seqlens 等)
-        ...
-```
-
-**限制**：NSA 的 indexer 深度嵌入在模型的前向传播中（它使用中间隐藏状态，而不仅仅是 Q）。KSE 可以包装它，但无法将其与模型架构完全解耦。这是模型原生稀疏性的固有属性。
+因此，KSE 与模型原生稀疏注意力是**互补**而非替代的关系：原生稀疏注意力由模型自身的专用后端处理，KSE 则为标准稠密 attention 模型提供可插拔的稀疏化能力。
 
 ### 4.2 选择开销分析
 
