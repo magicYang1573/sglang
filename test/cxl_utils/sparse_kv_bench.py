@@ -285,9 +285,12 @@ def bench_cxl(
     iters: int,
 ) -> List[float]:
     total_bytes = seq_len * item_size
+    # DAX devices require mmap size aligned to huge page boundary (2MB)
+    HUGE_PAGE_SIZE = 2 * 1024 * 1024
+    map_bytes = ((total_bytes + HUGE_PAGE_SIZE - 1) // HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE
     ok = cxl_ext.cxl_init(
         dev_path=cxl_dev,
-        map_bytes=total_bytes + 4096,
+        map_bytes=map_bytes,
         register_cuda=True,
         gpu_id=gpu_id,
     )
