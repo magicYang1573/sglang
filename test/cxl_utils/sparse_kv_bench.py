@@ -88,6 +88,7 @@ def _build_scatter_torch_module():
     wrapper_src = build_dir / "scatter_wrapper.cu"
     wrapper_src.write_text(r"""
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 
