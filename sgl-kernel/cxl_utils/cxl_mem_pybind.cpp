@@ -10,6 +10,15 @@
 
 #include "cxl_mem.hpp"
 
+struct CxlRegion {
+    void *base = nullptr;
+    std::size_t length = 0;
+    bool cuda_registered = false;
+    void *device_ptr = nullptr;
+};
+
+extern CxlRegion g_cxl;
+
 namespace {
 
 // Ensure we always work on a contiguous backing buffer to make size/ptr simple.
@@ -183,6 +192,14 @@ torch::Tensor cxl_to_tensor_noflush_parallel_contiguous_dst(at::Tensor dst,
 
     return dst;
 }
+int64_t get_cxl_device_ptr() {
+    return reinterpret_cast<int64_t>(g_cxl.device_ptr);
+}
+
+int64_t get_cxl_base_ptr() {
+    return reinterpret_cast<int64_t>(g_cxl.base);
+}
+
 PYBIND11_MODULE(cxl_mem_ext, m) {
     m.doc() = "PyTorch bindings for CXL shared memory helpers";
 
@@ -196,6 +213,12 @@ PYBIND11_MODULE(cxl_mem_ext, m) {
           "Map the CXL DAX device; optionally register with CUDA.");
 
     m.def("cxl_close", &cxl_close, "Unmap and unregister the mapped CXL window.");
+
+    m.def("get_cxl_device_ptr", &get_cxl_device_ptr,
+          "Return the CUDA device pointer for the mapped CXL region (int64).");
+
+    m.def("get_cxl_base_ptr", &get_cxl_base_ptr,
+          "Return the host base pointer for the mapped CXL region (int64).");
 
     m.def("tensor_to_cxl",
           &tensor_to_cxl,

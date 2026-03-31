@@ -297,60 +297,32 @@ def bench_cxl(
     if not ok:
         raise RuntimeError(f"cxl_init failed for {cxl_dev}")
 
+    # Write random KV data into CXL mmap region
     src_data = torch.randint(0, 256, (seq_len, item_size), dtype=torch.uint8)
     cxl_ext.tensor_to_cxl(src_data.view(-1), offset=0)
 
-    # After cxl_init with register_cuda=True, the device_ptr is the
-    # CUDA-accessible host pointer.  We need to get it.  The current
-    # cxl_mem_pybind does not expose cxl_get_base_ptr / device_ptr directly,
-    # so we use cxl2vram_noflush_parallel_contiguous_dst's kernel path which
-    # reads from device_ptr.  For our scatter kernel we need the raw pointer.
-    #
-    # Workaround: allocate a tiny GPU tensor via cxl_to_tensor to confirm the
-    # path works, then use the device_ptr obtained from CUDA registration.
-    # Since cxl_mem.cpp stores g_cxl globally, we can retrieve device_ptr
-    # by calling the existing copy functions.  But for the scatter kernel
-    # we actually need the HOST pointer (which is what cudaHostRegister
-    # exposes).  The base host pointer IS the mmap pointer = g_cxl.base.
-    #
-    # We'll pass the host pointer (= data_ptr of a CPU tensor at the CXL
-    # mmap region).  Since we registered it with cudaHostRegister, the GPU
-    # kernel can read it via PCIe/CXL using ld.global.nc.
-    #
-    # To get this pointer, we rely on the fact that tensor_to_cxl copies
-    # data INTO the CXL mmap and we need the mmap base address.  The
-    # cxl_to_tensor_noflush_parallel_contiguous_dst path uses device_ptr
-    # (from cudaHostGetDevicePointer) in its kernel.  For ld.global.nc
-    # from a kernel, the device_ptr works identically.
-    #
-    # Approach: we'll do a small probe to find the device_ptr.
-    # Actually, the simplest approach is to add a helper.  For now, we
-    # use the CXL extension's scatter-gather kernel path directly:
-    # cxl_to_tensor_noflush_parallel_contiguous_dst already launches a
-    # kernel with (device_ptr, dst, offsets, segment_size) which is
-    # essentially our scatter read.  We can benchmark that directly.
+    # Get the CUDA-accessible device pointer for the CXL mmap region.
+    # After cudaHostRegister + cudaHostGetDevicePointer, this pointer can be
+    # used directly by GPU kernels with ld.global.nc — identical to DRAM path.
+    cxl_device_ptr = cxl_ext.get_cxl_device_ptr()
+    if cxl_device_ptr == 0:
+        cxl_ext.cxl_close()
+        raise RuntimeError("CXL device_ptr is null; ensure register_cuda=True")
 
-    device_buf = torch.empty(top_k * item_size, dtype=torch.uint8, device="cuda")
+    device_buf = torch.empty(top_k, item_size, dtype=torch.uint8, device="cuda")
 
     for _ in range(warmup):
-        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64)
-        offsets = (indices * item_size).to(torch.int64)
-        cxl_ext.cxl_to_tensor_noflush_parallel_contiguous_dst(
-            device_buf, item_size, offsets
-        )
+        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64, device="cuda")
+        scatter_mod.launch_scatter(cxl_device_ptr, device_buf, indices, item_size)
         torch.cuda.synchronize()
 
     latencies = []
     for _ in range(iters):
-        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64)
-        offsets = (indices * item_size).to(torch.int64)
-
+        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64, device="cuda")
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        cxl_ext.cxl_to_tensor_noflush_parallel_contiguous_dst(
-            device_buf, item_size, offsets
-        )
+        scatter_mod.launch_scatter(cxl_device_ptr, device_buf, indices, item_size)
         end.record()
         torch.cuda.synchronize()
         latencies.append(start.elapsed_time(end) * 1000.0)
