@@ -2,6 +2,7 @@
 // https://github.com/vllm-project/vllm/blob/eb59b5a6cba6727d3727c0372258db9002f687c1/csrc/quantization/awq/gemm_kernels.cu#L350
 #pragma once
 
+#include <cassert>
 #include <sgl_kernel/tensor.h>
 
 #include <sgl_kernel/utils.cuh>
