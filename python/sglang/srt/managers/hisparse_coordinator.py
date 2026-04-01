@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple
+from typing import Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -37,6 +37,7 @@ class HiSparseCoordinator:
         device: str,
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
+        cxl_config: Optional[Dict] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -47,14 +48,21 @@ class HiSparseCoordinator:
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
         )
-        self.mem_pool_host = MLATokenToKVPoolHost(
-            device_pool=self.mem_pool_device,
-            host_to_device_ratio=host_to_device_ratio,
-            host_size=0,
-            page_size=1,  # for simplicity, we set page size to 1 to enable backup one token at a time
-            layout="layer_first",
-            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
-        )
+
+        self._cxl_region = None
+        if cxl_config is not None and cxl_config.get("enabled", False):
+            self.mem_pool_host = self._init_cxl_host_pool(
+                cxl_config, host_to_device_ratio
+            )
+        else:
+            self.mem_pool_host = MLATokenToKVPoolHost(
+                device_pool=self.mem_pool_device,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                page_size=1,
+                layout="layer_first",
+                override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+            )
 
         max_num_reqs = req_to_token_pool.size
         max_context_len = req_to_token_pool.max_context_len
@@ -118,6 +126,36 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
+
+    def _init_cxl_host_pool(
+        self, cxl_config: Dict, host_to_device_ratio: int
+    ) -> "CXLMLATokenToKVPoolHost":
+        from sglang.srt.mem_cache.cxl_memory_pool import (
+            CXLConfig,
+            CXLMemoryRegion,
+            CXLMLATokenToKVPoolHost,
+        )
+
+        region = CXLMemoryRegion(
+            CXLConfig(
+                dev_path=cxl_config.get("dev_path", "/dev/dax0.0"),
+                map_bytes=cxl_config.get("map_bytes", 64 * 1024**3),
+                gpu_id=cxl_config.get("gpu_id", 0),
+            )
+        )
+        region.init()
+        self._cxl_region = region
+
+        logger.info("HiSparse: using CXL memory pool at %s", cxl_config.get("dev_path"))
+        return CXLMLATokenToKVPoolHost(
+            device_pool=self.mem_pool_device,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=0,
+            page_size=1,
+            layout="layer_first",
+            cxl_region=region,
+            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+        )
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -556,19 +594,15 @@ class HiSparseCoordinator:
         layer_id: int,
     ) -> torch.Tensor:
         """Swap selected top-k tokens into device memory and return their indices."""
-        # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32.
+        # The CUDA kernel expects specific dtypes; cast defensively so callers
+        # (e.g. non-CUDA-graph decode path where seq_lens is int64) don't need
+        # to worry about dtype alignment.
         if req_pool_indices.dtype != torch.int64:
-            raise ValueError(
-                f"req_pool_indices dtype {req_pool_indices.dtype} is not int64 as expected"
-            )
+            req_pool_indices = req_pool_indices.to(torch.int64)
         if seq_lens.dtype != torch.int32:
-            raise ValueError(
-                f"seq_lens dtype {seq_lens.dtype} is not int32 as expected"
-            )
+            seq_lens = seq_lens.to(torch.int32)
         if top_k_result.dtype != torch.int32:
-            raise ValueError(
-                f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
-            )
+            top_k_result = top_k_result.to(torch.int32)
 
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]

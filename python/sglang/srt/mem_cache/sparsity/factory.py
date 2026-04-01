@@ -88,6 +88,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     backend = extra_config.pop("backend", None)
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
+    cxl_config = extra_config.pop("cxl", None)
 
     return SparseConfig(
         top_k=top_k,
@@ -97,6 +98,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         backend=backend,
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
+        cxl_config=cxl_config,
         sparse_extra_config=extra_config,
     )
 

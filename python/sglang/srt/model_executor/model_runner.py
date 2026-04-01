@@ -633,6 +633,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                cxl_config=hisparse_cfg.cxl_config,
             )
 
         # Init routed experts capturer

@@ -179,22 +179,25 @@ class HostKVCache(abc.ABC):
         ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
+        # Subclasses (e.g. CXL-backed pools) may set _skip_host_mem_check=True
+        # before calling super().__init__() because their memory is not visible
+        # to psutil.virtual_memory().
         requested_bytes = self.size * self.size_per_token
-        # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
-        if requested_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
-            )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
-            )
+        if not getattr(self, "_skip_host_mem_check", False):
+            host_mem = psutil.virtual_memory()
+            # preserve at least 10GB for other usage
+            ten_gb = 10 * (1024**3)
+            available_bytes = host_mem.available - ten_gb
+            if requested_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory available. Requesting "
+                    f"{requested_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
+                    f"size of the hierarchical cache."
+                )
+        logger.info(
+            f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+        )
 
         self.kv_buffer = self.init_kv_buffer()
 
