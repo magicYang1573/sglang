@@ -1,19 +1,18 @@
 """CXL Memory Pool for HiSparse KV Cache.
 
-Manages CXL DAX device mmap and provides torch.Tensor backed by CXL memory.
-Does NOT use sgl-kernel/cxl_utils for data transfer — all operations through
-standard OS APIs (mmap) and CUDA APIs (cudaHostRegister, torch.frombuffer).
+Uses sgl-kernel/cxl_utils (cxl_mem_ext) for CXL device initialization
+(mmap + cudaHostRegister), then constructs torch.Tensor on top of the
+registered CXL base pointer via torch.frombuffer (zero-copy).
 
-After cudaHostRegister, GPU kernels (including HiSparse's ld.global.nc.b64
-swap-in kernel) can directly access CXL memory with ~1.0-1.7x DRAM latency.
+Data transfer does NOT use cxl_mem_ext's copy functions — all reads go
+through HiSparse's existing JIT kernel (ld.global.nc.b64) and cudaMemcpy,
+which achieve ~1.0-1.7x DRAM latency on CXL.
 """
 
 from __future__ import annotations
 
 import ctypes
 import logging
-import mmap
-import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -35,28 +34,45 @@ class CXLConfig:
     gpu_id: int = 0
 
 
+def _load_cxl_ext():
+    """Load the cxl_mem_ext C++ extension (built from sgl-kernel/cxl_utils)."""
+    try:
+        import cxl_mem_ext
+
+        return cxl_mem_ext
+    except ImportError:
+        raise ImportError(
+            "cxl_mem_ext not found. Build it from sgl-kernel/cxl_utils: "
+            "cd sgl-kernel/cxl_utils && pip install -e ."
+        )
+
+
 class CXLMemoryRegion:
     """Manages a single CXL DAX device mmap region with CUDA registration.
 
+    Uses the proven cxl_mem_ext C++ library for the low-level init:
+        mmap -> cudaSetDevice -> cudaHostRegister -> cudaHostGetDevicePointer
+
+    Then provides make_tensor() to allocate torch.Tensor views on top of
+    the registered CXL memory via torch.frombuffer (zero-copy).
+
     Lifecycle:
-        1. open DAX device -> mmap (2MB-aligned, MAP_SHARED)
-        2. cudaHostRegister (Portable | Mapped)
-        3. Allocate tensors via make_tensor (torch.frombuffer, zero-copy)
-        4. All GPU DMA and kernel access through registered pointers
-        5. Close: cudaHostUnregister -> munmap -> close fd
+        1. cxl_ext.cxl_init() — mmap + optional cudaHostRegister
+        2. make_tensor() — bump-allocate + torch.frombuffer
+        3. close() — cxl_ext.cxl_close() (unregister + munmap)
     """
 
     def __init__(self, config: CXLConfig):
         self.config = config
-        self._fd: int = -1
-        self._mmap: Optional[mmap.mmap] = None
+        self._cxl_ext = None
         self._base_ptr: int = 0
         self._size: int = 0
-        self._cuda_registered: bool = False
+        self._initialized: bool = False
         self._alloc_offset: int = 0
 
     def init(self) -> None:
-        """Open the DAX device, mmap it, and register with CUDA."""
+        """Initialize CXL region via cxl_mem_ext C++ library."""
+        self._cxl_ext = _load_cxl_ext()
         dev_path = self.config.dev_path
         raw_size = self.config.map_bytes
 
@@ -65,46 +81,41 @@ class CXLMemoryRegion:
             (raw_size + HUGE_PAGE_2MB - 1) // HUGE_PAGE_2MB
         ) * HUGE_PAGE_2MB
 
-        self._fd = os.open(dev_path, os.O_RDWR)
-        try:
-            self._mmap = mmap.mmap(
-                self._fd,
-                aligned_size,
-                mmap.MAP_SHARED,
-                mmap.PROT_READ | mmap.PROT_WRITE,
-            )
-        except OSError as e:
-            os.close(self._fd)
-            self._fd = -1
-            raise RuntimeError(
-                f"CXL mmap failed for {dev_path} (size={aligned_size}): {e}. "
-                f"Check DAX device permissions and ensure size is 2MB-aligned."
-            ) from e
-
-        buf = ctypes.c_char.from_buffer(self._mmap)
-        self._base_ptr = ctypes.addressof(buf)
-        self._size = aligned_size
-
-        # cudaHostRegisterPortable (0x01) | cudaHostRegisterMapped (0x02)
-        flags = 0x01 | 0x02
-        torch.cuda.set_device(self.config.gpu_id)
-        ret = torch.cuda.cudart().cudaHostRegister(
-            ctypes.c_void_p(self._base_ptr), self._size, flags
+        ok = self._cxl_ext.cxl_init(
+            dev_path=dev_path,
+            map_bytes=aligned_size,
+            register_cuda=True,
+            gpu_id=self.config.gpu_id,
         )
-        if ret[0] != 0:
-            self._cleanup_mmap()
+        if not ok:
             raise RuntimeError(
-                f"cudaHostRegister failed for CXL region (ret={ret[0]}). "
-                f"Check CUDA driver compatibility with CXL DAX devices."
+                f"cxl_init failed for {dev_path} (size={aligned_size}). "
+                f"Check DAX device permissions and CUDA driver compatibility."
             )
-        self._cuda_registered = True
+
+        self._base_ptr = self._cxl_ext.get_cxl_base_ptr()
+        if self._base_ptr == 0:
+            self._cxl_ext.cxl_close()
+            raise RuntimeError("CXL base_ptr is null after cxl_init")
+
+        device_ptr = self._cxl_ext.get_cxl_device_ptr()
+        if device_ptr == 0:
+            self._cxl_ext.cxl_close()
+            raise RuntimeError(
+                "CXL device_ptr is null; cudaHostRegister may have failed"
+            )
+
+        self._size = aligned_size
+        self._initialized = True
 
         logger.info(
-            "CXL region initialized: %s, size=%.2f GB, gpu_id=%d, base_ptr=0x%x",
+            "CXL region initialized: %s, size=%.2f GB, gpu_id=%d, "
+            "base_ptr=0x%x, device_ptr=0x%x",
             dev_path,
             aligned_size / 1e9,
             self.config.gpu_id,
             self._base_ptr,
+            device_ptr,
         )
 
     @property
@@ -116,11 +127,7 @@ class CXLMemoryRegion:
         return self._size
 
     def allocate(self, nbytes: int, alignment: int = 64) -> int:
-        """Bump-allocate from the CXL region. Returns byte offset.
-
-        Thread safety: this is only called during initialization,
-        not on the hot path.
-        """
+        """Bump-allocate from the CXL region. Returns byte offset."""
         offset = (self._alloc_offset + alignment - 1) & ~(alignment - 1)
         if offset + nbytes > self._size:
             raise RuntimeError(
@@ -135,8 +142,7 @@ class CXLMemoryRegion:
 
         The returned tensor's data_ptr() points directly into the CXL mmap
         region. Since the region is cudaHostRegister'd, GPU kernels and
-        cudaMemcpy can access it through this pointer — identical to pinned
-        DRAM semantics.
+        cudaMemcpy can access it through this pointer.
         """
         numel = 1
         for d in dims:
@@ -148,28 +154,16 @@ class CXLMemoryRegion:
 
         c_array = (ctypes.c_byte * nbytes).from_address(ptr)
         tensor = torch.frombuffer(c_array, dtype=dtype, count=numel).reshape(dims)
-
-        # Zero-initialize. GPU DMA bypasses CPU cache, so no clflush needed
-        # for subsequent GPU access.
         tensor.zero_()
 
         return tensor
 
     def close(self) -> None:
-        """Release CUDA registration and unmap."""
-        if self._cuda_registered:
-            torch.cuda.cudart().cudaHostUnregister(ctypes.c_void_p(self._base_ptr))
-            self._cuda_registered = False
-        self._cleanup_mmap()
-        logger.info("CXL region closed")
-
-    def _cleanup_mmap(self) -> None:
-        if self._mmap is not None:
-            self._mmap.close()
-            self._mmap = None
-        if self._fd >= 0:
-            os.close(self._fd)
-            self._fd = -1
+        """Release CXL region (cudaHostUnregister + munmap)."""
+        if self._initialized and self._cxl_ext is not None:
+            self._cxl_ext.cxl_close()
+            self._initialized = False
+            logger.info("CXL region closed")
 
     def __del__(self):
         self.close()
@@ -198,13 +192,7 @@ class CXLMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         override_kv_cache_dim: Optional[int] = None,
     ):
         self._cxl_region = cxl_region
-        # pin_memory=False: the CXL region is already cudaHostRegister'd in
-        # CXLMemoryRegion.init(), so HostKVCache.__init__ should NOT call
-        # cudaHostRegister again via alloc_with_host_register.
-        #
-        # NOTE: we set _skip_host_mem_check = True to bypass psutil check
-        # in HostKVCache.__init__, because CXL memory is not visible to
-        # psutil.virtual_memory().
+        # Bypass psutil host memory check — CXL memory is not visible to it.
         self._skip_host_mem_check = True
         super().__init__(
             device_pool=device_pool,
@@ -212,18 +200,14 @@ class CXLMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             host_size=host_size,
             page_size=page_size,
             layout=layout,
-            pin_memory=False,
+            pin_memory=False,  # CXL already cudaHostRegister'd
             device="cpu",
             allocator_type="default",
             override_kv_cache_dim=override_kv_cache_dim,
         )
 
     def init_kv_buffer(self):
-        """Override: allocate KV buffer on CXL memory instead of DRAM.
-
-        Uses CXLMemoryRegion.make_tensor() which returns a zero-copy
-        torch.Tensor backed by the CXL mmap region.
-        """
+        """Override: allocate KV buffer on CXL memory instead of DRAM."""
         if self.layout == "layer_first":
             dims = (self.layer_num, self.size, 1, self.kv_cache_dim)
         elif self.layout == "page_first":
