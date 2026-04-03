@@ -87,7 +87,7 @@ class CXLMemoryRegion:
 
         # cudaHostRegisterPortable (0x01) | cudaHostRegisterMapped (0x02)
         flags = 0x01 | 0x02
-        torch.cuda.cudart().cudaSetDevice(self.config.gpu_id)
+        torch.cuda.set_device(self.config.gpu_id)
         ret = torch.cuda.cudart().cudaHostRegister(
             ctypes.c_void_p(self._base_ptr), self._size, flags
         )
