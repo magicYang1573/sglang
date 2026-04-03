@@ -27,7 +27,8 @@
   - 5.3 [整体架构变更](#53-整体架构变更)
   - 5.4 [模块设计](#54-模块设计)
   - 5.5 [CXL 分区与 TP 多进程](#55-cxl-分区与-tp-多进程)
-  - 5.6 [数据流变更](#56-数据流变更)
+  - 5.6 [CXL 容量约束与 KV Pool 大小自动适配](#56-cxl-容量约束与-kv-pool-大小自动适配)
+  - 5.7 [数据流变更](#57-数据流变更)
 6. [详细代码设计](#6-详细代码设计)
   - 6.1 [CXLMemoryRegion 轻量管理类](#61-cxlmemoryregion-轻量管理类)
   - 6.2 [CXL Tensor 分配函数](#62-cxl-tensor-分配函数)
@@ -537,9 +538,50 @@ python/sglang/srt/
 - 分区边界 2MB 对齐，符合 DAX 大页要求
 - 进程间不共享 Python 对象，安全无竞争
 
-### 5.6 数据流变更
+### 5.6 CXL 容量约束与 KV Pool 大小自动适配
 
-#### 5.6.1 Prefill Staging（GPU → CXL）
+SGLang 通过 GPU VRAM profiling 决定 `max_total_num_tokens`（device pool 大小），进而 host pool 大小 = `max_total_num_tokens × host_to_device_ratio`。如果 CXL 容量不足以容纳 host pool，系统会**自动缩小 `max_total_num_tokens`** 以适配。
+
+**约束公式**：
+
+```
+host_pool_bytes = max_total_num_tokens × host_to_device_ratio × bytes_per_token
+cxl_partition   = cxl_map_bytes / tp_size  (2MB 对齐)
+
+约束: host_pool_bytes ≤ cxl_partition
+=> max_total_num_tokens ≤ cxl_partition / (host_to_device_ratio × bytes_per_token)
+```
+
+其中 `bytes_per_token = kv_cache_dim × dtype_size × layer_num`（MLA host pool 每 token 大小）。
+
+**实现位置**：`ModelRunner._resolve_token_capacity()` → `_apply_cxl_capacity_cap()`
+
+```
+profiled_tokens (GPU VRAM)
+     │
+     ▼  min(profiled_tokens, user_limit)
+     │
+     ▼  min(capacity, cxl_partition / (ratio × bytes_per_token))  ← CXL cap
+     │
+     ▼  page_size 对齐
+     │
+     ▼  PP sync (all_reduce MIN)
+     │
+     = max_total_num_tokens
+```
+
+**示例**：TP=8, CXL 64GB, host_to_device_ratio=2, bytes_per_token=656×61=40016
+
+```
+cxl_partition  = 64GB / 8 = 8GB
+max_capacity   = 8GB / (2 × 40016) ≈ 107,000 tokens
+```
+
+如果 GPU profiling 得到 200,000 tokens，会自动缩小到 107,000。日志中会输出 CXL capacity cap 信息。
+
+### 5.7 数据流变更
+
+#### 5.7.1 Prefill Staging（GPU → CXL）
 
 ```
 现有:  transfer_kv_all_layer_mla(dst=host.data_ptrs) → cudaMemcpy D2H → pinned DRAM
@@ -548,7 +590,7 @@ CXL:   transfer_kv_all_layer_mla(dst=host.data_ptrs) → cudaMemcpy D2H → CXL 
 
 `data_ptrs` 指向 CXL mmap 区域（已 `cudaHostRegister`）。`cudaMemcpy D2H` 的目标是注册过的 host memory，DMA 引擎直接写入 CXL 物理地址。**无需修改传输代码，无需 clflush**（DMA 不经过 CPU cache）。
 
-#### 5.6.2 Decode Swap-in（CXL → GPU）
+#### 5.7.2 Decode Swap-in（CXL → GPU）
 
 ```
 现有:  JIT kernel ld.global.nc.b64 from pinned DRAM → st.global.cg.b64 to VRAM
@@ -557,7 +599,7 @@ CXL:   JIT kernel ld.global.nc.b64 from CXL mmap   → st.global.cg.b64 to VRAM
 
 JIT kernel 的 `host_cache_k` 指针来自 `data_ptrs`，指向 CXL mmap。`ld.global.nc.b64` 通过 PCIe/CXL 链路直接加载，延迟为 DRAM 的 1.0~1.7x（已验证）。**JIT kernel 零修改。**
 
-#### 5.6.3 Decode Backup（GPU → CXL）
+#### 5.7.3 Decode Backup（GPU → CXL）
 
 ```
 现有:  transfer_kv_all_layer_mla → cudaMemcpy D2H → pinned DRAM
@@ -957,7 +999,7 @@ class InterleavedCXLPool:
 | `torch.frombuffer` 生命周期          | tensor 释放后 mmap 仍有效                 | CXLMemoryRegion 绑定到 Coordinator 生命周期      |
 | DAX 设备 2MB 对齐要求                  | mmap EINVAL                         | `CXLMemoryRegion.init()` 自动向上对齐           |
 | TP 多进程 CXL 竞争                    | 8 个 GPU 并发读写同一 CXL 设备竞争带宽          | `set_partition()` 按 rank 等分；考虑多 DAX 设备 interleave |
-| CXL 分区不足                         | 每 rank 分区小于 KV cache 需求             | 配置时确保 `map_bytes / tp_size > 每 rank host pool 大小` |
+| CXL 分区不足                         | 每 rank 分区小于 KV cache 需求             | `_apply_cxl_capacity_cap()` 自动缩小 `max_total_num_tokens` |
 | HostKVCache 内存检查                 | `psutil.virtual_memory()` 可能不识别 CXL | `_skip_host_mem_check = True` 已实现         |
 | `cxl_mem_ext` 全局单例               | C++ 库内 `g_cxl` 是全局变量               | 每 TP rank 是独立进程，各有自己的全局变量副本，无冲突 |
 
@@ -977,6 +1019,8 @@ class InterleavedCXLPool:
 | `python/sglang/jit_kernel/hisparse.py`                | JIT Python 入口                 | 不变                         |
 | `python/sglang/srt/layers/attention/nsa_backend.py`   | NSA attention 后端              | 不变                         |
 | `python/sglang/srt/model_executor/model_runner.py`    | 模型初始化                         | 传递 CXL 配置 + TP 信息         |
+| `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py` | KV Pool 大小计算       | CXL 容量约束 `_apply_cxl_capacity_cap()` |
+| `python/sglang/srt/entrypoints/engine.py`             | Engine 启动入口                   | worker 启动前预编译 `cxl_mem_ext` |
 | `python/sglang/srt/mem_cache/sparsity/factory.py`     | HiSparse 配置解析                 | 解析 `cxl` JSON 字段          |
 
 

@@ -797,7 +797,7 @@ class ModelRunnerKVCacheMixin:
 
     def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
         """Compute final token pool capacity from profiled value,
-        applying user cap, page alignment, and PP sync"""
+        applying user cap, CXL capacity cap, page alignment, and PP sync"""
         user_limit = self.server_args.max_total_tokens
 
         # Apply user-specified upper bound
@@ -810,6 +810,11 @@ class ModelRunnerKVCacheMixin:
             capacity = min(profiled_tokens, user_limit)
         else:
             capacity = profiled_tokens
+
+        # Apply CXL capacity constraint: device pool * host_to_device_ratio
+        # must fit in the per-rank CXL partition.
+        if self.enable_hisparse and self.server_args.hisparse_config:
+            capacity = self._apply_cxl_capacity_cap(capacity)
 
         # Align to page boundary
         page_size = self.server_args.page_size
@@ -824,6 +829,50 @@ class ModelRunnerKVCacheMixin:
                 group=get_world_group().cpu_group,
             )
             capacity = tensor.item()
+
+        return capacity
+
+    def _apply_cxl_capacity_cap(self: ModelRunner, capacity: int) -> int:
+        """Cap token capacity so the host pool fits in the CXL partition."""
+        import json
+
+        try:
+            cfg = json.loads(self.server_args.hisparse_config)
+        except (json.JSONDecodeError, TypeError):
+            return capacity
+
+        cxl_cfg = cfg.get("cxl")
+        if not cxl_cfg or not cxl_cfg.get("enabled", False):
+            return capacity
+
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        hisparse_cfg = parse_hisparse_config(self.server_args)
+        host_to_device_ratio = hisparse_cfg.host_to_device_ratio
+
+        cxl_total_bytes = cxl_cfg.get("map_bytes", 64 * 1024**3)
+        # Per-rank partition (2MB aligned down)
+        huge_page = 2 * 1024 * 1024
+        per_rank = cxl_total_bytes // self.tp_size
+        per_rank = (per_rank // huge_page) * huge_page
+
+        # Compute host bytes per token (MLA: kv_cache_dim * dtype_size * layer_num)
+        kv_cache_dim = self.calculate_mla_kv_cache_dim()
+        dtype_size = torch._utils._element_size(self.kv_cache_dtype)
+        host_bytes_per_token = kv_cache_dim * dtype_size * self.num_effective_layers
+
+        # max_capacity such that host_pool fits: capacity * ratio * bytes_per_token <= per_rank
+        if host_bytes_per_token > 0 and host_to_device_ratio > 0:
+            max_capacity = int(per_rank / (host_to_device_ratio * host_bytes_per_token))
+            if max_capacity < capacity:
+                logger.info(
+                    "CXL capacity cap: reducing max_total_num_tokens from %d to %d "
+                    "(CXL partition=%.2f GB, host_to_device_ratio=%d, "
+                    "host_bytes_per_token=%d)",
+                    capacity, max_capacity,
+                    per_rank / 1e9, host_to_device_ratio, host_bytes_per_token,
+                )
+                capacity = max_capacity
 
         return capacity
 
