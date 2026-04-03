@@ -112,6 +112,8 @@ class CXLMemoryRegion:
         self._size: int = 0
         self._initialized: bool = False
         self._alloc_offset: int = 0
+        self._partition_end: int = 0
+        self._partition_size: int = 0
 
     def init(self) -> None:
         """Initialize CXL region via cxl_mem_ext C++ library."""
@@ -149,6 +151,8 @@ class CXLMemoryRegion:
             )
 
         self._size = aligned_size
+        self._partition_end = aligned_size
+        self._partition_size = aligned_size
         self._initialized = True
 
         logger.info(
@@ -161,6 +165,32 @@ class CXLMemoryRegion:
             device_ptr,
         )
 
+    def set_partition(self, tp_rank: int, tp_size: int) -> None:
+        """Restrict this region's allocator to a disjoint partition.
+
+        All TP processes mmap the entire CXL DAX device, but each rank
+        only allocates from its own 1/tp_size slice. Partitions are
+        2MB-aligned to respect DAX huge page boundaries.
+        """
+        if tp_size <= 1:
+            return
+        per_rank = self._size // tp_size
+        # Align down to 2MB boundary
+        per_rank = (per_rank // HUGE_PAGE_2MB) * HUGE_PAGE_2MB
+        if per_rank == 0:
+            raise RuntimeError(
+                f"CXL region too small to partition among {tp_size} ranks: "
+                f"{self._size} bytes total, need at least {HUGE_PAGE_2MB * tp_size}"
+            )
+        start = tp_rank * per_rank
+        self._alloc_offset = start
+        self._partition_end = start + per_rank
+        self._partition_size = per_rank
+        logger.info(
+            "CXL partition for tp_rank=%d: [0x%x, 0x%x), %.2f GB",
+            tp_rank, start, self._partition_end, per_rank / 1e9,
+        )
+
     @property
     def base_ptr(self) -> int:
         return self._base_ptr
@@ -170,12 +200,13 @@ class CXLMemoryRegion:
         return self._size
 
     def allocate(self, nbytes: int, alignment: int = 64) -> int:
-        """Bump-allocate from the CXL region. Returns byte offset."""
+        """Bump-allocate from this rank's partition. Returns byte offset."""
         offset = (self._alloc_offset + alignment - 1) & ~(alignment - 1)
-        if offset + nbytes > self._size:
+        if offset + nbytes > self._partition_end:
             raise RuntimeError(
-                f"CXL region exhausted: need {nbytes} bytes at offset {offset}, "
-                f"but only {self._size - offset} available"
+                f"CXL partition exhausted: need {nbytes} bytes at offset {offset}, "
+                f"but partition ends at {self._partition_end} "
+                f"(only {self._partition_end - offset} available)"
             )
         self._alloc_offset = offset + nbytes
         return offset

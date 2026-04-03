@@ -38,6 +38,9 @@ class HiSparseCoordinator:
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
         cxl_config: Optional[Dict] = None,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        gpu_id: int = 0,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -52,7 +55,7 @@ class HiSparseCoordinator:
         self._cxl_region = None
         if cxl_config is not None and cxl_config.get("enabled", False):
             self.mem_pool_host = self._init_cxl_host_pool(
-                cxl_config, host_to_device_ratio
+                cxl_config, host_to_device_ratio, tp_rank, tp_size, gpu_id
             )
         else:
             self.mem_pool_host = MLATokenToKVPoolHost(
@@ -128,7 +131,12 @@ class HiSparseCoordinator:
         self._skip_first_backup = [False] * max_num_reqs
 
     def _init_cxl_host_pool(
-        self, cxl_config: Dict, host_to_device_ratio: int
+        self,
+        cxl_config: Dict,
+        host_to_device_ratio: int,
+        tp_rank: int,
+        tp_size: int,
+        gpu_id: int,
     ) -> "CXLMLATokenToKVPoolHost":
         from sglang.srt.mem_cache.cxl_memory_pool import (
             CXLConfig,
@@ -136,17 +144,28 @@ class HiSparseCoordinator:
             CXLMLATokenToKVPoolHost,
         )
 
+        total_map_bytes = cxl_config.get("map_bytes", 64 * 1024**3)
         region = CXLMemoryRegion(
             CXLConfig(
                 dev_path=cxl_config.get("dev_path", "/dev/dax0.0"),
-                map_bytes=cxl_config.get("map_bytes", 64 * 1024**3),
-                gpu_id=cxl_config.get("gpu_id", 0),
+                map_bytes=total_map_bytes,
+                gpu_id=gpu_id,
             )
         )
         region.init()
+
+        # Partition the CXL region among TP ranks so each rank uses
+        # a disjoint slice. All TP processes mmap the same DAX device
+        # but only allocate from their own partition.
+        region.set_partition(tp_rank, tp_size)
         self._cxl_region = region
 
-        logger.info("HiSparse: using CXL memory pool at %s", cxl_config.get("dev_path"))
+        logger.info(
+            "HiSparse tp_rank=%d/%d: CXL pool at %s, partition offset=0x%x, "
+            "partition size=%.2f GB",
+            tp_rank, tp_size, cxl_config.get("dev_path"),
+            region._alloc_offset, region._partition_size / 1e9,
+        )
         return CXLMLATokenToKVPoolHost(
             device_pool=self.mem_pool_device,
             host_to_device_ratio=host_to_device_ratio,

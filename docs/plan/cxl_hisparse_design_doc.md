@@ -12,23 +12,32 @@
   - 2.2 [数据流：请求生命周期](#22-数据流请求生命周期)
   - 2.3 [CXL 替换的目标层](#23-cxl-替换的目标层)
   - 2.4 [关键接口汇总](#24-关键接口汇总)
-3. [CXL 直接 GPU 读取方案验证](#3-cxl-直接-gpu-读取方案验证)
-4. [CXL 内存池集成设计](#4-cxl-内存池集成设计)
-  - 4.1 [设计原则](#41-设计原则)
-  - 4.2 [核心方案：mmap + cudaHostRegister + torch.frombuffer](#42-核心方案mmap--cudahostregister--torchfrombuffer)
-  - 4.3 [整体架构变更](#43-整体架构变更)
-  - 4.4 [模块设计](#44-模块设计)
-  - 4.5 [数据流变更](#45-数据流变更)
-5. [详细代码设计](#5-详细代码设计)
-  - 5.1 [CXLMemoryRegion 轻量管理类](#51-cxlmemoryregion-轻量管理类)
-  - 5.2 [CXL Tensor 分配函数](#52-cxl-tensor-分配函数)
-  - 5.3 [CXLMLATokenToKVPoolHost 类设计](#53-cxlmlatokentokv-poolhost-类设计)
-  - 5.4 [HiSparseCoordinator 适配](#54-hisparsecoordinator-适配)
-  - 5.5 [ServerArgs 与配置扩展](#55-serverargs-与配置扩展)
-6. [为什么不使用 cxl_utils 库的传输函数](#6-为什么不使用-cxl_utils-库的传输函数)
-7. [CXL 内存策略与优化](#7-cxl-内存策略与优化)
-8. [分阶段实施计划](#8-分阶段实施计划)
-9. [风险与缓解措施](#9-风险与缓解措施)
+3. [SGLang 并行架构与存储层次](#3-sglang-并行架构与存储层次)
+  - 3.1 [进程模型：每个 TP Rank 一个独立进程](#31-进程模型每个-tp-rank-一个独立进程)
+  - 3.2 [并行方式概览：TP、DPA、EP 对 KV Cache 的影响](#32-并行方式概览tpdpaep-对-kv-cache-的影响)
+  - 3.3 [核心对象所有权](#33-核心对象所有权)
+  - 3.4 [存储层次与对象关系图](#34-存储层次与对象关系图)
+  - 3.5 [MLA KV Cache 的特性](#35-mla-kv-cache-的特性)
+  - 3.6 [CXL 在多进程架构下的设计](#36-cxl-在多进程架构下的设计)
+  - 3.7 [架构设计的合理性](#37-架构设计的合理性)
+4. [CXL 直接 GPU 读取方案验证](#4-cxl-直接-gpu-读取方案验证)
+5. [CXL 内存池集成设计](#5-cxl-内存池集成设计)
+  - 5.1 [设计原则](#51-设计原则)
+  - 5.2 [核心方案：mmap + cudaHostRegister + torch.frombuffer](#52-核心方案mmap--cudahostregister--torchfrombuffer)
+  - 5.3 [整体架构变更](#53-整体架构变更)
+  - 5.4 [模块设计](#54-模块设计)
+  - 5.5 [CXL 分区与 TP 多进程](#55-cxl-分区与-tp-多进程)
+  - 5.6 [数据流变更](#56-数据流变更)
+6. [详细代码设计](#6-详细代码设计)
+  - 6.1 [CXLMemoryRegion 轻量管理类](#61-cxlmemoryregion-轻量管理类)
+  - 6.2 [CXL Tensor 分配函数](#62-cxl-tensor-分配函数)
+  - 6.3 [CXLMLATokenToKVPoolHost 类设计](#63-cxlmlatokentokv-poolhost-类设计)
+  - 6.4 [HiSparseCoordinator 适配](#64-hisparsecoordinator-适配)
+  - 6.5 [ServerArgs 与配置扩展](#65-serverargs-与配置扩展)
+7. [为什么不使用 cxl_utils 库的传输函数](#7-为什么不使用-cxl_utils-库的传输函数)
+8. [CXL 内存策略与优化](#8-cxl-内存策略与优化)
+9. [分阶段实施计划](#9-分阶段实施计划)
+10. [风险与缓解措施](#10-风险与缓解措施)
 
 ---
 
@@ -133,9 +142,230 @@ Decode 时 NSA indexer 为每层产出 top-k token 位置，JIT kernel 检查 de
 
 ---
 
-## 3. CXL 直接 GPU 读取方案验证
+## 3. SGLang 并行架构与存储层次
 
-### 3.1 Micro-benchmark 结果
+### 3.1 进程模型：每个 TP Rank 一个独立进程
+
+SGLang 的 Tensor Parallel（TP）采用**多进程架构**。以 TP=8 为例：
+
+```
+Engine (主进程)
+  └── _launch_scheduler_processes()
+       ├── mp.Process(tp_rank=0, gpu_id=0) → Scheduler → TpModelWorker → ModelRunner
+       ├── mp.Process(tp_rank=1, gpu_id=1) → Scheduler → TpModelWorker → ModelRunner
+       ├── ...
+       └── mp.Process(tp_rank=7, gpu_id=7) → Scheduler → TpModelWorker → ModelRunner
+```
+
+**关键事实**：
+
+- 每个 `tp_rank` 是一个独立的 OS **进程**（`multiprocessing.Process`），不是线程
+- 每个进程绑定一个 GPU（`gpu_id`），有独立的 Python 解释器和 CUDA context
+- 进程间通过 NCCL 通信（all-reduce / all-gather），不共享 Python 对象
+
+### 3.2 并行方式概览：TP、DPA、EP 对 KV Cache 的影响
+
+SGLang 支持多种并行方式，它们对 KV Cache 存储的影响各不相同：
+
+```
+并行层次（由外到内）:
+  Attention 路径: Global(TP) → DP → ATTN_CP → ATTN_TP
+  MoE 路径:      Global(TP) → MOE_DP → EP → MOE_TP
+```
+
+#### 3.2.1 纯 TP（Tensor Parallel）
+
+**配置示例**：`--tp 8`
+
+```
+8 个进程，每个处理相同的请求批次
+┌──────┬──────┬──────┬───┬──────┐
+│rank 0│rank 1│rank 2│...│rank 7│  ← 同一批请求，KV Cache 内容相同
+└──────┴──────┴──────┴───┴──────┘
+  NCCL all-reduce (attention output)
+```
+
+- 所有 rank 处理**同一批请求**（同一个 Scheduler 分发）
+- MLA KV Cache 是 latent vector（`kv_lora_rank + qk_rope_head_dim`），**不按 head 分片**
+- 因此**每个 rank 的 KV Cache 内容完全相同**，是互为副本
+- Host pool 每个 rank 独立存一份 → TP=8 时 host 总内存 = 8 × 单 rank host pool 大小
+
+**为什么不共享 KV？** MLA 的 KV 是压缩后的 latent，维度很小（~656 bytes/token），TP 分片无收益。且各 rank 是独立进程，跨进程共享 tensor 需要 IPC 同步，复杂度远大于各自独立存储。这是**现有 DRAM HiSparse 的行为**，CXL 方案保持一致。
+
+#### 3.2.2 DPA（Data Parallel Attention）
+
+**配置示例**：`--tp 8 --dp 2 --enable-dp-attention`
+
+```
+                    DataParallelController (负载均衡)
+                   /                              \
+          DP group 0                        DP group 1
+          (请求集 A)                         (请求集 B)
+   ┌──────┬──────┬──────┬──────┐   ┌──────┬──────┬──────┬──────┐
+   │rank 0│rank 1│rank 2│rank 3│   │rank 4│rank 5│rank 6│rank 7│
+   └──────┴──────┴──────┴──────┘   └──────┴──────┴──────┴──────┘
+    attn_tp: 4 ranks 共处理 A        attn_tp: 4 ranks 共处理 B
+```
+
+- `DataParallelController` 将请求**负载均衡**到不同的 DP group
+- **不同 DP group 处理不同的请求** → **KV Cache 内容不同**
+- 同一 DP group 内的 `attn_tp` ranks 仍处理相同请求（通过 broadcast 同步）
+- `max_running_requests` 按 `dp_size` 均分
+
+**对 KV Cache 的影响**：不同 DP group 的 KV 数据不同，每个 worker 独立存储自己负责的请求的 KV Cache。**"每个 worker 一份独立 host pool" 的架构完全正确**——因为各 worker 的数据本来就不同。
+
+#### 3.2.3 EP（Expert Parallel）
+
+**配置示例**：`--tp 8 --ep 8`
+
+- EP 仅影响 **MoE FFN 层**的 expert 分布：不同 rank 持有不同的 expert 权重子集
+- **EP 完全不影响 KV Cache 存储**：MLA attention 的 KV 数据与 MoE routing 无关
+- EP rank 的 KV pool 大小和内容与非 EP 模式完全一致
+
+#### 3.2.4 DPA + EP（推荐的 DeepSeek-V3 大规模部署配置）
+
+**配置示例**：`--tp 16 --dp 2 --enable-dp-attention --ep 16`
+
+```
+Global TP = 16 GPUs
+├── Attention: dp_size=2, attn_tp_size=8
+│   DP group 0 (rank 0-7): 请求集 A → 8 rank 各自独立 KV Cache
+│   DP group 1 (rank 8-15): 请求集 B → 8 rank 各自独立 KV Cache
+│
+└── MoE: ep_size=16
+    16 个 rank 各持有不同 expert，对 KV Cache 无影响
+```
+
+**在 DPA+EP 下**：
+
+- 不同 DP group 的 KV 内容不同（处理不同请求）
+- 同一 DP group 内的 attn_tp ranks 的 KV 内容相同（处理同一批请求）
+- EP 对 KV 完全透明
+- 每个 worker 的 host pool 存储**只与该 worker 所属 DP group 负责的请求相关**
+
+#### 3.2.5 总结：各并行方式下 host KV Cache 的独立性
+
+| 并行配置 | 同一 group 内 KV 相同? | 不同 group 间 KV 不同? | 每 worker 一份 host pool? |
+| --- | --- | --- | --- |
+| 纯 TP=8 | 是（全部 8 rank 相同） | N/A（只有 1 个 group） | 是（8 份副本，与现有 DRAM 行为一致） |
+| TP=8, DPA dp=2 | 是（同一 DP group 内 4 rank 相同） | **是**（不同 DP group 处理不同请求） | 是（天然正确） |
+| TP=8, EP=8 | 是（全部 8 rank 相同） | N/A | 是（EP 不影响 KV） |
+| TP=16, DPA dp=2, EP=16 | 是（同一 DP group 内 8 rank 相同） | **是** | 是（天然正确） |
+
+**结论**：**"每个 worker 独立持有一份 host pool"的架构在所有并行配置下都是正确的。** 对于纯 TP 模式，虽然各 rank 存储的 KV 内容相同（有冗余），但这与现有 DRAM HiSparse 行为一致，且避免了跨进程 IPC 同步的复杂性。对于 DPA 模式，不同 DP group 的 KV 内容本身就不同，独立存储是必要的。
+
+### 3.3 核心对象所有权
+
+| 对象 | 创建位置 | 每个 Worker 独有? | 说明 |
+| --- | --- | --- | --- |
+| `Scheduler` | `run_scheduler_process()` | **是** | 调度器，管理请求队列和前向循环 |
+| `TpModelWorker` | `Scheduler.init_tp_model_worker()` | **是** | 封装 ModelRunner，每进程一个 |
+| `ModelRunner` | `TpModelWorker._init_model_runner()` | **是** | 模型执行器，持有模型权重、KV pool |
+| `HiSparseCoordinator` | `ModelRunner.initialize()` | **是** | HiSparse 核心协调器 |
+| `HiSparseNSATokenToKVPool` | `ModelRunner.init_memory_pool()` | **是** | GPU 端 KV cache（Device Buffer） |
+| `HiSparseTokenToKVPoolAllocator` | `ModelRunner.init_memory_pool()` | **是** | Device token 分配器 |
+| `MLATokenToKVPoolHost` / `CXLMLATokenToKVPoolHost` | `HiSparseCoordinator.__init__()` | **是** | Host 端 KV cache（DRAM 或 CXL） |
+| `ReqToTokenPool` | `TpModelWorker.__init__()` | **是** | 请求→token 映射池 |
+| NCCL Communicator | ModelRunner distributed init | **共享通信** | 跨 rank 的 all-reduce/broadcast 通道 |
+| CXL DAX 物理设备 | `/dev/dax0.0` | **物理共享** | 所有 rank 共用同一物理设备，按 rank 分区 |
+
+### 3.4 存储层次与对象关系图
+
+```
+Per Worker Process (tp_rank=i, gpu_id=i)
+┌─────────────────────────────────────────────────────────────────┐
+│  Scheduler                                                       │
+│   └── TpModelWorker                                              │
+│        └── ModelRunner (tp_rank=i, gpu_id=i)                     │
+│             │                                                    │
+│             ├── model weights (GPU VRAM, TP 分片)                │
+│             │                                                    │
+│             ├── HiSparseNSATokenToKVPool (GPU VRAM)              │
+│             │   ├── kv_buffer: (layer_num, size, 1, kv_cache_dim)│
+│             │   ├── index_buffer: NSA 索引                       │
+│             │   └── 每 rank 独立，大小 = max_total_num_tokens     │
+│             │                                                    │
+│             ├── HiSparseTokenToKVPoolAllocator                   │
+│             │   └── 管理 device token 的分配/释放                 │
+│             │                                                    │
+│             └── HiSparseCoordinator                              │
+│                  │                                               │
+│                  ├── mem_pool_device ──→ HiSparseNSATokenToKVPool│
+│                  │   (引用，不额外分配)                           │
+│                  │                                               │
+│                  ├── mem_pool_host ──→ MLATokenToKVPoolHost       │
+│                  │   │                 或 CXLMLATokenToKVPoolHost │
+│                  │   │                                           │
+│                  │   ├── kv_buffer: (layer_num, host_size, 1, d) │
+│                  │   │   DRAM 模式: torch.empty + pin_memory     │
+│                  │   │   CXL 模式: CXL mmap + frombuffer         │
+│                  │   │                                           │
+│                  │   └── data_ptrs: per-layer host 指针 (on GPU) │
+│                  │       → JIT kernel / cudaMemcpy 的访问入口     │
+│                  │                                               │
+│                  ├── device_buffer_manager (per-request buffers) │
+│                  └── LRU 管理器 (per-layer)                      │
+└─────────────────────────────────────────────────────────────────┘
+
+物理存储:
+┌──────────────────────────┐ ┌───────────────────────────────────┐
+│ GPU i VRAM               │ │ CXL DAX 设备 (/dev/dax0.0)       │
+│ ┌──────────────────────┐ │ │ ┌─────────────────────────────┐   │
+│ │ model weights (分片)  │ │ │ │ rank 0 分区 [0, N/T)       │   │
+│ │ device KV buffer     │ │ │ │ rank 1 分区 [N/T, 2N/T)    │   │
+│ │ activations          │ │ │ │ ...                         │   │
+│ │ CUDA graphs          │ │ │ │ rank T-1 分区 [(T-1)N/T, N)│   │
+│ └──────────────────────┘ │ │ └─────────────────────────────┘   │
+└──────────────────────────┘ └───────────────────────────────────┘
+                               T = tp_size（总 worker 数）
+```
+
+### 3.5 MLA KV Cache 的特性
+
+DeepSeek-V3.2 使用 MLA（Multi-head Latent Attention），其 KV Cache 是一个 **latent vector**（`kv_lora_rank + qk_rope_head_dim`），**不按 attention head 分片**。
+
+- 每个 worker 存储**完整维度**的 KV Cache（所有层、所有 token、全 `kv_cache_dim`）
+- TP/DPA 只在 attention 的 Q/K/V projection 计算时分片，KV **存储**不分
+- `host_size = device_pool.size × host_to_device_ratio`，其中 `device_pool.size` 是该 rank 根据 GPU 可用 VRAM profiling 得出的 `max_total_num_tokens`
+
+**现有 DRAM HiSparse 行为**：TP=8 时，8 个 rank 各自分配独立的 pinned DRAM host pool，大小相同。这是当前框架的标准行为。CXL 方案保持完全一致，仅将底层内存从 DRAM 替换为 CXL。
+
+### 3.6 CXL 在多进程架构下的设计
+
+由于每个 worker 是独立进程：
+
+1. **mmap 是进程级的**：每个进程独立调用 `cxl_init()` → `mmap(MAP_SHARED)` 映射同一个 DAX 设备。Linux 为每个进程创建独立的虚拟地址映射，指向相同的物理 CXL 内存
+2. **cudaHostRegister 是 CUDA context 级的**：每个进程有自己的 CUDA context（绑定到各自的 GPU），各自注册 OK
+3. **必须分区**：虽然映射了整个设备，但每个 rank 只能使用自己的分区，否则并发写入会产生数据竞争
+4. **分区方案**：`CXLMemoryRegion.set_partition(tp_rank, tp_size)` 将整个 CXL 区域等分为 `tp_size` 份
+
+```
+CXL 物理设备 (64 GB, tp_size=8)
+├── Rank 0 分区: [0, 8GB)      ← alloc_offset 从 0 开始
+├── Rank 1 分区: [8GB, 16GB)   ← alloc_offset 从 8GB 开始
+├── ...
+└── Rank 7 分区: [56GB, 64GB)  ← alloc_offset 从 56GB 开始
+```
+
+每个分区内部通过 `allocate()` + `make_tensor()` 进行 bump allocation，分区边界 2MB 对齐。
+
+### 3.7 架构设计的合理性
+
+**为什么采用 "每个 worker 独立一份 host pool" 而非共享？**
+
+1. **与现有 DRAM 行为一致**：现有 HiSparse 在 DRAM 上就是每 rank 一份独立 host pool，CXL 方案保持这一设计，最小化侵入性
+2. **DPA 下天然正确**：不同 DP group 处理不同请求，KV 内容不同，必须独立存储
+3. **避免 IPC 复杂性**：跨进程共享 tensor 需要进程间同步（如 POSIX shared memory + semaphore），引入额外延迟和复杂度
+4. **MLA latent 很小**：每 token 仅 ~656 bytes，host pool 总内存相对可控
+5. **CXL 分区零开销**：`set_partition()` 仅调整 bump allocator 的偏移量，无额外 mmap 或 CUDA 调用
+
+**未来优化方向**：对于纯 TP 模式下同一 attn_tp group 内的 rank，理论上可以共享同一份 CXL KV 数据（因为内容相同），减少 CXL 容量需求。但这需要跨进程的同步机制，作为后续优化考虑。
+
+---
+
+## 4. CXL 直接 GPU 读取方案验证
+
+### 4.1 Micro-benchmark 结果
 
 通过 `test/cxl_utils/sparse_kv_bench.py` 的实验验证了两种 CXL 读取方式的性能差异：
 
@@ -159,7 +389,7 @@ for (int j = tid; j < total_u64; j += blockDim.x) {
 }
 ```
 
-### 3.2 性能对比（seq_len=32K, H20 GPU）
+### 4.2 性能对比（seq_len=32K, H20 GPU）
 
 
 | top-k | DRAM (μs) | CXL 方案A (μs) | CXL 方案B (μs) | A/DRAM | B/DRAM    |
@@ -175,7 +405,7 @@ for (int j = tid; j < total_u64; j += blockDim.x) {
 2. **Non-cached 路径**：`ld.global.nc` 绕过 L2 cache，直接通过 PCIe/CXL DMA，减少 TLB 和 cache 层级开销
 3. **零额外开销**：无 pybind 调用、无 offset 格式转换、无额外 `cudaMemcpyAsync`
 
-### 3.3 对 HiSparse 的指导意义
+### 4.3 对 HiSparse 的指导意义
 
 HiSparse 的 JIT kernel 已经使用了 `ld.global.nc.b64`（`transfer_item_warp`），**与方案 B 完全一致**。因此：
 
@@ -185,16 +415,17 @@ HiSparse 的 JIT kernel 已经使用了 `ld.global.nc.b64`（`transfer_item_warp
 
 ---
 
-## 4. CXL 内存池集成设计
+## 5. CXL 内存池集成设计
 
-### 4.1 设计原则
+### 5.1 设计原则
 
 1. **指针透明性**：CXL mmap → `cudaHostRegister` → `torch.frombuffer` → `data_ptr()` → 与 DRAM pinned memory 语义完全一致
 2. **不依赖 cxl_utils 传输层**：所有数据传输使用已有的 `cudaMemcpy`（staging/backup）和 JIT kernel（swap-in）
 3. **最小侵入性**：仅替换 `MLATokenToKVPoolHost` 的内存分配后端，不修改 Coordinator、LRU、JIT kernel
-4. **轻量实现**：CXL 管理仅需 ~100 行 Python 代码（mmap + register + frombuffer），不需要额外 C++ 扩展
+4. **TP 感知分区**：所有 TP rank 共用同一 CXL 物理设备，按 `tp_rank` 等分为不相交的分区（参见第 3 章）
+5. **CXL 初始化使用 `cxl_mem_ext`**：底层 mmap + cudaHostRegister 由 `sgl-kernel/cxl_utils` C++ 扩展完成（JIT 编译），确保跨平台可靠性
 
-### 4.2 核心方案：mmap + cudaHostRegister + torch.frombuffer
+### 5.2 核心方案：mmap + cudaHostRegister + torch.frombuffer
 
 ```
 CXL DAX 设备 (/dev/dax0.0)
@@ -218,33 +449,45 @@ CUDA 可访问的 host memory
 
 **关键点**：`torch.frombuffer` 创建的 tensor 的 `data_ptr()` 就是 CXL mmap 地址。所有通过 `data_ptrs` 操作的传输函数（`transfer_kv_all_layer_mla`、JIT kernel 的 `host_cache_k`）直接访问 CXL，无需任何中间层。
 
-### 4.3 整体架构变更
+### 5.3 整体架构变更
 
 ```
-┌────────────────────────────────────────────────────┐
-│  HiSparseCoordinator                                │
-│    └─ mem_pool_host: CXLMLATokenToKVPoolHost        │
-│         └─ kv_buffer: torch.Tensor                  │
-│              │  (data_ptr → CXL mmap region)        │
-│         ┌────┴─────────────────────┐                │
-│         │  内存后端选择 (配置驱动)    │                │
-│         ├─────────┬────────────────┤                │
-│         │ DRAM    │ CXL            │                │
-│         │ (现有)   │ (新增)         │                │
-│         │         │                │                │
-│         │ torch   │ mmap DAX       │                │
-│         │ .empty  │ + cudaHost     │                │
-│         │ + pin   │ Register       │                │
-│         │         │ + frombuffer   │                │
-│         └─────────┴────────────────┘                │
-│                                                      │
-│  swap-in:  JIT kernel ld.global.nc.b64 ──→ 同一路径  │
-│  staging:  cudaMemcpy D2H ──→ 同一路径               │
-│  backup:   cudaMemcpy D2H ──→ 同一路径               │
-└────────────────────────────────────────────────────┘
+Per TP Rank Process (tp_rank=i)
+┌───────────────────────────────────────────────────────────┐
+│  HiSparseCoordinator (tp_rank=i, gpu_id=i)                │
+│    │                                                       │
+│    ├─ mem_pool_host: CXLMLATokenToKVPoolHost               │
+│    │    └─ kv_buffer: torch.Tensor                         │
+│    │         │  data_ptr → CXL mmap + offset[i]            │
+│    │         │                                             │
+│    │    ┌────┴─────────────────────┐                       │
+│    │    │  内存后端选择 (配置驱动)    │                       │
+│    │    ├─────────┬────────────────┤                       │
+│    │    │ DRAM    │ CXL            │                       │
+│    │    │ (现有)   │ (新增)         │                       │
+│    │    │ torch   │ CXLMemoryRegion│                       │
+│    │    │ .empty  │ .set_partition │                       │
+│    │    │ + pin   │   (tp_rank, 8) │                       │
+│    │    │         │ .make_tensor() │                       │
+│    │    └─────────┴────────────────┘                       │
+│    │                                                       │
+│    │  swap-in:  JIT kernel ld.global.nc.b64 ──→ 同一路径    │
+│    │  staging:  cudaMemcpy D2H ──→ 同一路径                 │
+│    │  backup:   cudaMemcpy D2H ──→ 同一路径                 │
+│    │                                                       │
+│    └─ _cxl_region: CXLMemoryRegion (引用，防止 GC)          │
+│         partition: [i*N/8, (i+1)*N/8)                      │
+└───────────────────────────────────────────────────────────┘
+              ↓ mmap(MAP_SHARED)
+┌───────────────────────────────────────────────────────────┐
+│  CXL DAX 设备 /dev/dax0.0 (物理共享)                       │
+│  ┌────────┬────────┬────────┬───┬────────┐                 │
+│  │ rank 0 │ rank 1 │ rank 2 │...│ rank 7 │                 │
+│  └────────┴────────┴────────┴───┴────────┘                 │
+└───────────────────────────────────────────────────────────┘
 ```
 
-### 4.4 模块设计
+### 5.4 模块设计
 
 ```
 python/sglang/srt/mem_cache/
@@ -259,11 +502,44 @@ python/sglang/srt/
     └── server_args.py                     # [修改] 增加 CXL 配置参数
 ```
 
-**注意**：不需要任何新的 C++/CUDA 编译。CXL 操作全部通过 Python 标准库（`os.open`, `mmap`）和 PyTorch（`cudaHostRegister`, `torch.frombuffer`）完成。
+**注意**：CXL 底层初始化使用 `sgl-kernel/cxl_utils` 的 C++ 扩展（`cxl_mem_ext`），支持 JIT 编译。数据传输不使用 `cxl_mem_ext` 的 copy 函数。
 
-### 4.5 数据流变更
+### 5.5 CXL 分区与 TP 多进程
 
-#### 4.5.1 Prefill Staging（GPU → CXL）
+由于 TP 架构下每个 rank 是独立进程（见第 3 章），CXL 设备的使用需要分区：
+
+```
+初始化流程 (每个 TP rank 进程内):
+
+1. CXLMemoryRegion(config)    ← 创建管理对象
+2. region.init()              ← cxl_init: mmap 整个 DAX 设备 + cudaHostRegister
+3. region.set_partition(tp_rank, tp_size)  ← 设置本 rank 的分区边界
+4. CXLMLATokenToKVPoolHost(cxl_region=region)
+      └── init_kv_buffer() → region.make_tensor()  ← 在分区内 bump-allocate
+```
+
+分区示意（TP=8, 64GB CXL）：
+
+```
+  /dev/dax0.0 — 64 GB, 全量 mmap 到每个进程
+  ┌────────┬────────┬────────┬───┬────────┐
+  │ Rank 0 │ Rank 1 │ Rank 2 │...│ Rank 7 │  ← 每个 8 GB
+  │  8 GB  │  8 GB  │  8 GB  │   │  8 GB  │
+  └────────┴────────┴────────┴───┴────────┘
+  0        8GB      16GB             56GB    64GB
+```
+
+**关键属性**：
+
+- `_alloc_offset`：当前分区内的分配游标，初始值 = `tp_rank * per_rank`
+- `_partition_end`：分区结束地址 = `(tp_rank + 1) * per_rank`
+- `allocate()` 在 `[_alloc_offset, _partition_end)` 范围内进行 bump allocation
+- 分区边界 2MB 对齐，符合 DAX 大页要求
+- 进程间不共享 Python 对象，安全无竞争
+
+### 5.6 数据流变更
+
+#### 5.6.1 Prefill Staging（GPU → CXL）
 
 ```
 现有:  transfer_kv_all_layer_mla(dst=host.data_ptrs) → cudaMemcpy D2H → pinned DRAM
@@ -272,7 +548,7 @@ CXL:   transfer_kv_all_layer_mla(dst=host.data_ptrs) → cudaMemcpy D2H → CXL 
 
 `data_ptrs` 指向 CXL mmap 区域（已 `cudaHostRegister`）。`cudaMemcpy D2H` 的目标是注册过的 host memory，DMA 引擎直接写入 CXL 物理地址。**无需修改传输代码，无需 clflush**（DMA 不经过 CPU cache）。
 
-#### 4.5.2 Decode Swap-in（CXL → GPU）
+#### 5.6.2 Decode Swap-in（CXL → GPU）
 
 ```
 现有:  JIT kernel ld.global.nc.b64 from pinned DRAM → st.global.cg.b64 to VRAM
@@ -281,7 +557,7 @@ CXL:   JIT kernel ld.global.nc.b64 from CXL mmap   → st.global.cg.b64 to VRAM
 
 JIT kernel 的 `host_cache_k` 指针来自 `data_ptrs`，指向 CXL mmap。`ld.global.nc.b64` 通过 PCIe/CXL 链路直接加载，延迟为 DRAM 的 1.0~1.7x（已验证）。**JIT kernel 零修改。**
 
-#### 4.5.3 Decode Backup（GPU → CXL）
+#### 5.6.3 Decode Backup（GPU → CXL）
 
 ```
 现有:  transfer_kv_all_layer_mla → cudaMemcpy D2H → pinned DRAM
@@ -292,169 +568,87 @@ CXL:   transfer_kv_all_layer_mla → cudaMemcpy D2H → CXL mmap
 
 ---
 
-## 5. 详细代码设计
+## 6. 详细代码设计
 
-### 5.1 CXLMemoryRegion 轻量管理类
+### 6.1 CXLMemoryRegion 管理类
 
-**新文件**: `python/sglang/srt/mem_cache/cxl_memory_pool.py`
+**文件**: `python/sglang/srt/mem_cache/cxl_memory_pool.py`
+
+底层使用 `cxl_mem_ext` C++ 扩展（JIT 编译自 `sgl-kernel/cxl_utils`）执行 mmap + cudaHostRegister，Python 层负责 TP 分区和 tensor 创建：
 
 ```python
-"""CXL Memory Pool for HiSparse KV Cache.
-
-Manages CXL DAX device mmap and provides torch.Tensor backed by CXL memory.
-Does NOT use sgl-kernel/cxl_utils — all operations through standard OS and CUDA APIs.
-"""
-
-import ctypes
-import logging
-import mmap
-import os
-from dataclasses import dataclass, field
-from typing import Optional
-
-import torch
-
-logger = logging.getLogger(__name__)
-
-HUGE_PAGE_2MB = 2 * 1024 * 1024
-
-
-@dataclass
-class CXLConfig:
-    """CXL device configuration."""
-    dev_path: str = "/dev/dax0.0"
-    map_bytes: int = 64 * 1024 * 1024 * 1024   # 64 GB
-    gpu_id: int = 0
-
-
 class CXLMemoryRegion:
-    """Manages a single CXL DAX device mmap region with CUDA registration.
+    """Manages a CXL DAX device mmap region with CUDA registration + TP partitioning.
 
     Lifecycle:
-        1. open DAX device → mmap (2MB-aligned)
-        2. cudaHostRegister (Portable | Mapped)
-        3. Allocate tensors via torch.frombuffer (zero-copy)
-        4. All GPU DMA and kernel access through registered pointers
-        5. Close: cudaHostUnregister → munmap
+        1. cxl_ext.cxl_init() — mmap + cudaHostRegister (C++ 实现)
+        2. set_partition(tp_rank, tp_size) — 设置本 rank 的分区边界
+        3. make_tensor() — bump-allocate + torch.frombuffer (zero-copy)
+        4. close() — cxl_ext.cxl_close() (unregister + munmap)
     """
 
     def __init__(self, config: CXLConfig):
         self.config = config
-        self._fd: int = -1
-        self._mmap: Optional[mmap.mmap] = None
+        self._cxl_ext = None
         self._base_ptr: int = 0
         self._size: int = 0
-        self._cuda_registered: bool = False
+        self._initialized: bool = False
         self._alloc_offset: int = 0
+        self._partition_end: int = 0
+        self._partition_size: int = 0
 
     def init(self) -> None:
-        dev_path = self.config.dev_path
-        raw_size = self.config.map_bytes
-
-        # Align to 2MB huge page boundary (required by DAX devices)
-        aligned_size = ((raw_size + HUGE_PAGE_2MB - 1) // HUGE_PAGE_2MB) * HUGE_PAGE_2MB
-
-        self._fd = os.open(dev_path, os.O_RDWR)
-        try:
-            self._mmap = mmap.mmap(
-                self._fd, aligned_size,
-                mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE,
-            )
-        except OSError as e:
-            os.close(self._fd)
-            self._fd = -1
-            raise RuntimeError(
-                f"CXL mmap failed for {dev_path} (size={aligned_size}): {e}. "
-                f"Check DAX device permissions and ensure size is 2MB-aligned."
-            ) from e
-
-        # Get the base address of the mmap region
-        buf = ctypes.c_char.from_buffer(self._mmap)
-        self._base_ptr = ctypes.addressof(buf)
+        self._cxl_ext = _load_cxl_ext()
+        aligned_size = align_to_2mb(self.config.map_bytes)
+        ok = self._cxl_ext.cxl_init(
+            dev_path=self.config.dev_path,
+            map_bytes=aligned_size,
+            register_cuda=True,
+            gpu_id=self.config.gpu_id,
+        )
+        if not ok:
+            raise RuntimeError(...)
+        self._base_ptr = self._cxl_ext.get_cxl_base_ptr()
         self._size = aligned_size
+        self._partition_end = aligned_size    # 默认：整个区域
+        self._partition_size = aligned_size
 
-        # Register with CUDA for GPU DMA access
-        flags = 0x01 | 0x02  # cudaHostRegisterPortable | cudaHostRegisterMapped
-        ret = torch.cuda.cudart().cudaSetDevice(self.config.gpu_id)
-        ret = torch.cuda.cudart().cudaHostRegister(
-            ctypes.c_void_p(self._base_ptr), self._size, flags
-        )
-        if ret[0] != 0:
-            self._cleanup_mmap()
-            raise RuntimeError(
-                f"cudaHostRegister failed for CXL region (ret={ret[0]}). "
-                f"Check CUDA driver compatibility with CXL DAX devices."
-            )
-        self._cuda_registered = True
-
-        logger.info(
-            "CXL region initialized: %s, size=%.2f GB, gpu_id=%d, base_ptr=0x%x",
-            dev_path, aligned_size / 1e9, self.config.gpu_id, self._base_ptr,
-        )
-
-    @property
-    def base_ptr(self) -> int:
-        return self._base_ptr
-
-    @property
-    def size(self) -> int:
-        return self._size
+    def set_partition(self, tp_rank: int, tp_size: int) -> None:
+        """将 CXL 区域按 tp_size 等分，本 rank 仅使用 1/tp_size."""
+        if tp_size <= 1:
+            return
+        per_rank = (self._size // tp_size // HUGE_PAGE_2MB) * HUGE_PAGE_2MB
+        start = tp_rank * per_rank
+        self._alloc_offset = start
+        self._partition_end = start + per_rank
+        self._partition_size = per_rank
 
     def allocate(self, nbytes: int, alignment: int = 64) -> int:
-        """Bump-allocate from the CXL region. Returns byte offset."""
+        """Bump-allocate from this rank's partition."""
         offset = (self._alloc_offset + alignment - 1) & ~(alignment - 1)
-        if offset + nbytes > self._size:
-            raise RuntimeError(
-                f"CXL region exhausted: need {nbytes} bytes at offset {offset}, "
-                f"but only {self._size - offset} available"
-            )
+        if offset + nbytes > self._partition_end:
+            raise RuntimeError("CXL partition exhausted")
         self._alloc_offset = offset + nbytes
         return offset
 
     def make_tensor(self, dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-        """Allocate a torch.Tensor backed by CXL memory (zero-copy).
-
-        The tensor's data_ptr() points directly into the CXL mmap region.
-        Since the region is cudaHostRegister'd, GPU kernels and cudaMemcpy
-        can access it through this pointer.
-        """
-        numel = 1
-        for d in dims:
-            numel *= d
-        nbytes = numel * dtype.itemsize
-
+        """在 CXL 分区内分配 tensor (zero-copy)."""
+        nbytes = prod(dims) * dtype.itemsize
         offset = self.allocate(nbytes)
         ptr = self._base_ptr + offset
-
-        # Create a ctypes array viewing the CXL memory, then wrap as tensor
         c_array = (ctypes.c_byte * nbytes).from_address(ptr)
-        tensor = torch.frombuffer(c_array, dtype=dtype, count=numel).reshape(dims)
-
-        # Zero-initialize (CPU memset to CXL mmap — fast, no clflush needed
-        # because subsequent access is by GPU DMA which bypasses CPU cache)
+        tensor = torch.frombuffer(c_array, dtype=dtype).reshape(dims)
         tensor.zero_()
-
         return tensor
 
     def close(self) -> None:
-        if self._cuda_registered:
-            torch.cuda.cudart().cudaHostUnregister(ctypes.c_void_p(self._base_ptr))
-            self._cuda_registered = False
-        self._cleanup_mmap()
-
-    def _cleanup_mmap(self) -> None:
-        if self._mmap is not None:
-            self._mmap.close()
-            self._mmap = None
-        if self._fd >= 0:
-            os.close(self._fd)
-            self._fd = -1
-
-    def __del__(self):
-        self.close()
+        if self._initialized:
+            self._cxl_ext.cxl_close()
 ```
 
-### 5.2 CXL Tensor 分配函数
+**`_load_cxl_ext()`**：先尝试 `import cxl_mem_ext`，失败则自动从 `sgl-kernel/cxl_utils` JIT 编译（使用 `torch.utils.cpp_extension.load()`）。
+
+### 6.2 CXL Tensor 分配函数
 
 不需要独立的分配函数——`CXLMemoryRegion.make_tensor()` 直接完成 CXL 内存上的 tensor 构建。
 
@@ -473,7 +667,7 @@ class CXLMemoryRegion:
 # - JIT kernel: ld.global.nc.b64 from tensor.data_ptr() → GPU 直接读 CXL
 ```
 
-### 5.3 CXLMLATokenToKVPoolHost 类设计
+### 6.3 CXLMLATokenToKVPoolHost 类设计
 
 **新文件**: `python/sglang/srt/mem_cache/cxl_memory_pool.py`（续）
 
@@ -555,67 +749,74 @@ class CXLMLATokenToKVPoolHost(MLATokenToKVPoolHost):
 3. `data_refs` 和 `data_ptrs`：在父类 `MLATokenToKVPoolHost.__init__` 中通过 `kv_buffer[i].data_ptr()` 构建。由于 `kv_buffer` 底层是 CXL，`data_ptrs` 自然指向 CXL 地址
 4. 所有 `transfer_kv_`* 和 JIT kernel 通过 `data_ptrs` 操作，**零修改**
 
-### 5.4 HiSparseCoordinator 适配
+### 6.4 HiSparseCoordinator 适配
 
 **修改文件**: `python/sglang/srt/managers/hisparse_coordinator.py`
 
-变更极小——仅在构造 `mem_pool_host` 时根据配置选择 DRAM 或 CXL：
+Coordinator 接收 `tp_rank`、`tp_size`、`gpu_id`，传递给 CXL 初始化以实现分区：
 
 ```python
 class HiSparseCoordinator:
     def __init__(
         self,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: HiSparseTokenToKVPoolAllocator,
-        top_k: int,
-        device_buffer_size: int,
-        device: str,
-        tp_group: torch.distributed.ProcessGroup,
+        # ... existing params ...
         host_to_device_ratio: int = 2,
         cxl_config: Optional[dict] = None,
+        tp_rank: int = 0,       # 新增
+        tp_size: int = 1,       # 新增
+        gpu_id: int = 0,        # 新增：每个 rank 绑定的 GPU
     ):
         # ... existing init ...
-
         self.mem_pool_device = self.token_to_kv_pool_allocator.get_kvcache()
 
+        self._cxl_region = None
         if cxl_config is not None and cxl_config.get("enabled", False):
-            from sglang.srt.mem_cache.cxl_memory_pool import (
-                CXLConfig, CXLMemoryRegion, CXLMLATokenToKVPoolHost,
-            )
-            region = CXLMemoryRegion(CXLConfig(
-                dev_path=cxl_config.get("dev_path", "/dev/dax0.0"),
-                map_bytes=cxl_config.get("map_bytes", 64 * 1024**3),
-                gpu_id=cxl_config.get("gpu_id", 0),
-            ))
-            region.init()
-            self._cxl_region = region  # prevent GC
-
-            self.mem_pool_host = CXLMLATokenToKVPoolHost(
-                device_pool=self.mem_pool_device,
-                host_to_device_ratio=host_to_device_ratio,
-                host_size=0,
-                page_size=1,
-                layout="layer_first",
-                cxl_region=region,
-                override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+            self.mem_pool_host = self._init_cxl_host_pool(
+                cxl_config, host_to_device_ratio, tp_rank, tp_size, gpu_id
             )
         else:
-            self.mem_pool_host = MLATokenToKVPoolHost(
-                device_pool=self.mem_pool_device,
-                host_to_device_ratio=host_to_device_ratio,
-                host_size=0,
-                page_size=1,
-                layout="layer_first",
-                override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
-            )
+            self.mem_pool_host = MLATokenToKVPoolHost(...)
 
-        # 其余初始化完全不变
+    def _init_cxl_host_pool(self, cxl_config, host_to_device_ratio,
+                             tp_rank, tp_size, gpu_id):
+        from sglang.srt.mem_cache.cxl_memory_pool import (
+            CXLConfig, CXLMemoryRegion, CXLMLATokenToKVPoolHost,
+        )
+        region = CXLMemoryRegion(CXLConfig(
+            dev_path=cxl_config.get("dev_path", "/dev/dax0.0"),
+            map_bytes=cxl_config.get("map_bytes", 64 * 1024**3),
+            gpu_id=gpu_id,  # 使用当前 rank 的 GPU
+        ))
+        region.init()               # mmap 整个 DAX 设备 + cudaHostRegister
+        region.set_partition(tp_rank, tp_size)  # 设置本 rank 的分区
+        self._cxl_region = region
+        return CXLMLATokenToKVPoolHost(
+            device_pool=self.mem_pool_device,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=0, page_size=1, layout="layer_first",
+            cxl_region=region,
+            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+        )
 ```
 
-### 5.5 ServerArgs 与配置扩展
+**ModelRunner 调用侧**（`model_runner.py`）：
+
+```python
+self.hisparse_coordinator = HiSparseCoordinator(
+    ...,
+    cxl_config=hisparse_cfg.cxl_config,
+    tp_rank=self.tp_rank,     # 当前进程的 TP rank
+    tp_size=self.tp_size,     # TP 总数
+    gpu_id=self.gpu_id,       # 当前进程绑定的 GPU
+)
+```
+
+### 6.5 ServerArgs 与配置扩展
 
 ```bash
 # 在 hisparse_config JSON 中增加 CXL 字段
+# 注意：不需要指定 gpu_id，每个 TP rank 自动使用自己绑定的 GPU
+# map_bytes 是整个 CXL 设备大小，会按 tp_size 自动等分
 python -m sglang.launch_server \
     --model deepseek-ai/DeepSeek-V3.2 \
     --tp 8 \
@@ -627,15 +828,23 @@ python -m sglang.launch_server \
         "cxl": {
             "enabled": true,
             "dev_path": "/dev/dax0.0",
-            "map_bytes": 68719476736,
-            "gpu_id": 0
+            "map_bytes": 68719476736
         }
     }'
 ```
 
+**配置说明**：
+
+| 字段 | 说明 |
+| --- | --- |
+| `cxl.enabled` | 启用 CXL 后端替换 DRAM |
+| `cxl.dev_path` | DAX 设备路径，所有 TP rank 共用同一设备 |
+| `cxl.map_bytes` | CXL 设备总大小（所有 rank 共享，内部按 `tp_size` 自动等分） |
+| ~~`cxl.gpu_id`~~ | **已移除**：由 `ModelRunner.gpu_id` 自动提供 |
+
 ---
 
-## 6. 为什么不使用 cxl_utils 库的传输函数
+## 7. 为什么不使用 cxl_utils 库的传输函数
 
 
 | 方面                  | cxl_utils 库路径                                | 本方案（mmap + register + ld.global.nc）           |
@@ -655,9 +864,9 @@ python -m sglang.launch_server \
 
 ---
 
-## 7. CXL 内存策略与优化
+## 8. CXL 内存策略与优化
 
-### 7.1 DAX 大页对齐
+### 8.1 DAX 大页对齐
 
 CXL DAX 设备的 mmap 必须 2MB 对齐。`CXLMemoryRegion.init()` 中已自动处理：
 
@@ -665,11 +874,11 @@ CXL DAX 设备的 mmap 必须 2MB 对齐。`CXLMemoryRegion.init()` 中已自动
 aligned_size = ((raw_size + HUGE_PAGE_2MB - 1) // HUGE_PAGE_2MB) * HUGE_PAGE_2MB
 ```
 
-### 7.2 TLB 优化
+### 8.2 TLB 优化
 
 sparse top-k 的离散访问模式会产生大量 TLB miss。DAX 设备天然使用大页（2MB），相比 4KB 页可将 TLB 条目覆盖范围扩大 512 倍。如需进一步优化，可通过内核配置启用 1GB 大页。
 
-### 7.3 多 CXL 设备 Interleave
+### 8.3 多 CXL 设备 Interleave
 
 ```python
 # 按 layer 分布到不同 CXL 设备：
@@ -686,7 +895,7 @@ class InterleavedCXLPool:
         return region.make_tensor(dims, dtype)
 ```
 
-### 7.4 写入一致性
+### 8.4 写入一致性
 
 
 | 操作                      | 写入方                       | 是否需要 clflush         |
@@ -699,7 +908,7 @@ class InterleavedCXLPool:
 
 ---
 
-## 8. 分阶段实施计划
+## 9. 分阶段实施计划
 
 ### Phase 1: 基础功能（3-5 天）
 
@@ -738,7 +947,7 @@ class InterleavedCXLPool:
 
 ---
 
-## 9. 风险与缓解措施
+## 10. 风险与缓解措施
 
 
 | 风险                               | 影响                                  | 缓解措施                                      |
@@ -747,8 +956,10 @@ class InterleavedCXLPool:
 | `cudaHostRegister` 对 CXL mmap 失败 | GPU 无法 DMA                          | 检查 CUDA driver 版本和 PCIe topology；降级为 DRAM |
 | `torch.frombuffer` 生命周期          | tensor 释放后 mmap 仍有效                 | CXLMemoryRegion 绑定到 Coordinator 生命周期      |
 | DAX 设备 2MB 对齐要求                  | mmap EINVAL                         | `CXLMemoryRegion.init()` 自动向上对齐           |
-| 多 GPU TP 场景                      | 多 GPU 竞争 CXL 带宽                     | 每 GPU 使用独立 CXL region offset 或独立 DAX 设备   |
-| HostKVCache 内存检查                 | `psutil.virtual_memory()` 可能不识别 CXL | 在 CXL 子类中 override 检查逻辑                   |
+| TP 多进程 CXL 竞争                    | 8 个 GPU 并发读写同一 CXL 设备竞争带宽          | `set_partition()` 按 rank 等分；考虑多 DAX 设备 interleave |
+| CXL 分区不足                         | 每 rank 分区小于 KV cache 需求             | 配置时确保 `map_bytes / tp_size > 每 rank host pool 大小` |
+| HostKVCache 内存检查                 | `psutil.virtual_memory()` 可能不识别 CXL | `_skip_host_mem_check = True` 已实现         |
+| `cxl_mem_ext` 全局单例               | C++ 库内 `g_cxl` 是全局变量               | 每 TP rank 是独立进程，各有自己的全局变量副本，无冲突 |
 
 
 ---
@@ -756,17 +967,17 @@ class InterleavedCXLPool:
 ## 附录 A：关键文件索引
 
 
-| 文件                                                    | 角色                            | CXL 变更             |
-| ----------------------------------------------------- | ----------------------------- | ------------------ |
-| `python/sglang/srt/mem_cache/cxl_memory_pool.py`      | **新增** CXL region + host pool | —                  |
-| `python/sglang/srt/managers/hisparse_coordinator.py`  | HiSparse 核心协调器                | 增加 `cxl_config` 参数 |
-| `python/sglang/srt/mem_cache/memory_pool_host.py`     | Host KV Pool 基类               | 不变                 |
-| `python/sglang/srt/mem_cache/hisparse_memory_pool.py` | Device Pool + Allocator       | 不变                 |
-| `python/sglang/jit_kernel/csrc/hisparse.cuh`          | JIT swap-in kernel            | 不变                 |
-| `python/sglang/jit_kernel/hisparse.py`                | JIT Python 入口                 | 不变                 |
-| `python/sglang/srt/layers/attention/nsa_backend.py`   | NSA attention 后端              | 不变                 |
-| `python/sglang/srt/model_executor/model_runner.py`    | 模型初始化                         | 传递 CXL 配置          |
-| `python/sglang/srt/server_args.py`                    | 启动参数                          | CXL 配置解析           |
+| 文件                                                    | 角色                            | CXL 变更                     |
+| ----------------------------------------------------- | ----------------------------- | -------------------------- |
+| `python/sglang/srt/mem_cache/cxl_memory_pool.py`      | **新增** CXL region + host pool | CXLMemoryRegion (含 TP 分区) + CXLMLATokenToKVPoolHost |
+| `python/sglang/srt/managers/hisparse_coordinator.py`  | HiSparse 核心协调器                | 增加 `cxl_config` + `tp_rank/tp_size/gpu_id` |
+| `python/sglang/srt/mem_cache/memory_pool_host.py`     | Host KV Pool 基类               | 增加 `_skip_host_mem_check` |
+| `python/sglang/srt/mem_cache/hisparse_memory_pool.py` | Device Pool + Allocator       | 不变                         |
+| `python/sglang/jit_kernel/csrc/hisparse.cuh`          | JIT swap-in kernel            | 不变                         |
+| `python/sglang/jit_kernel/hisparse.py`                | JIT Python 入口                 | 不变                         |
+| `python/sglang/srt/layers/attention/nsa_backend.py`   | NSA attention 后端              | 不变                         |
+| `python/sglang/srt/model_executor/model_runner.py`    | 模型初始化                         | 传递 CXL 配置 + TP 信息         |
+| `python/sglang/srt/mem_cache/sparsity/factory.py`     | HiSparse 配置解析                 | 解析 `cxl` JSON 字段          |
 
 
 ## 附录 B：代码量估算
@@ -774,16 +985,19 @@ class InterleavedCXLPool:
 
 | 文件                        | 新增/修改行数    | 说明                                        |
 | ------------------------- | ---------- | ----------------------------------------- |
-| `cxl_memory_pool.py`      | ~200 行     | CXLMemoryRegion + CXLMLATokenToKVPoolHost |
-| `hisparse_coordinator.py` | ~20 行      | CXL 分支 + region 初始化                       |
-| `server_args.py`          | ~5 行       | CXL config 解析                             |
-| **合计**                    | **~225 行** | 无 C++/CUDA 编译需求                           |
+| `cxl_memory_pool.py`      | ~310 行     | CXLMemoryRegion (含 TP 分区) + CXLMLATokenToKVPoolHost + JIT loader |
+| `hisparse_coordinator.py` | ~40 行      | CXL 分支 + region 初始化 + TP 分区               |
+| `memory_pool_host.py`     | ~5 行       | psutil 检查跳过                                |
+| `model_runner.py`         | ~3 行       | 传递 tp_rank/tp_size/gpu_id                 |
+| `factory.py`              | ~5 行       | CXL config 解析                             |
+| **合计**                    | **~360 行** | 需 JIT 编译 cxl_mem_ext（自动）                  |
 
 
 ## 附录 C：配置示例
 
 ```bash
-# 单 CXL 设备，64GB
+# 单 CXL 设备 64GB, TP=8 → 每 rank 自动分配 8GB
+# gpu_id 不需要在 JSON 中指定，各 rank 自动使用自己的 GPU
 python -m sglang.launch_server \
     --model deepseek-ai/DeepSeek-V3.2 \
     --tp 8 \
@@ -795,8 +1009,7 @@ python -m sglang.launch_server \
         "cxl": {
             "enabled": true,
             "dev_path": "/dev/dax0.0",
-            "map_bytes": 68719476736,
-            "gpu_id": 0
+            "map_bytes": 68719476736
         }
     }' \
     --disable-radix-cache
