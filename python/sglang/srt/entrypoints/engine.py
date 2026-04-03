@@ -664,6 +664,21 @@ class Engine(EngineBase):
                 host=server_args.host, port=bootstrap_port
             )
 
+        # Pre-compile CXL extension if needed (once, before workers fork)
+        if server_args.enable_hisparse and server_args.hisparse_config:
+            import json
+
+            try:
+                cfg = json.loads(server_args.hisparse_config)
+                if cfg.get("cxl", {}).get("enabled", False):
+                    from sglang.srt.mem_cache.cxl_memory_pool import (
+                        precompile_cxl_ext,
+                    )
+
+                    precompile_cxl_ext()
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func

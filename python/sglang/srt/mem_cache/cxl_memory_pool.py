@@ -37,13 +37,72 @@ class CXLConfig:
 _cxl_ext_cache = None
 
 
+def _get_cxl_source_paths():
+    """Return (cxl_root, build_dir) for cxl_mem_ext source and build."""
+    from pathlib import Path
+
+    sglang_root = Path(__file__).resolve().parents[4]
+    cxl_root = sglang_root / "sgl-kernel" / "cxl_utils"
+    build_dir = sglang_root / "build" / "cxl_mem_ext"
+    return cxl_root, build_dir
+
+
+def precompile_cxl_ext():
+    """Pre-compile cxl_mem_ext in the main process before workers are spawned.
+
+    Called from engine.py when CXL is enabled. This ensures the .so is
+    ready before any worker process starts, so workers just load it.
+    """
+    try:
+        import cxl_mem_ext  # noqa: F401
+
+        logger.info("cxl_mem_ext already installed, skipping compilation")
+        return
+    except ImportError:
+        pass
+
+    from torch.utils.cpp_extension import load
+
+    cxl_root, build_dir = _get_cxl_source_paths()
+    if not (cxl_root / "cxl_mem.cpp").exists():
+        raise ImportError(
+            f"CXL source not found at {cxl_root}. "
+            f"Ensure sgl-kernel/cxl_utils exists in the repository."
+        )
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Pre-compiling cxl_mem_ext from %s ...", cxl_root)
+    load(
+        name="cxl_mem_ext",
+        sources=[
+            str(cxl_root / "cxl_mem.cpp"),
+            str(cxl_root / "cxl_mem_cuda.cu"),
+            str(cxl_root / "cxl_mem_pybind.cpp"),
+        ],
+        extra_cflags=[
+            "-O3", "-std=c++17",
+            "-mclflushopt", "-mclwb", "-msse4.1", "-fopenmp",
+        ],
+        extra_cuda_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=["-lgomp"],
+        build_directory=str(build_dir),
+        verbose=False,
+        with_cuda=True,
+    )
+    logger.info("cxl_mem_ext pre-compiled successfully")
+
+
 def _load_cxl_ext():
-    """JIT-compile and load the cxl_mem_ext C++ extension from sgl-kernel/cxl_utils."""
+    """Load the already-compiled cxl_mem_ext extension.
+
+    Expects precompile_cxl_ext() to have been called in the main process
+    before workers are spawned. Falls back to JIT compilation if .so is
+    not found (e.g. standalone testing).
+    """
     global _cxl_ext_cache
     if _cxl_ext_cache is not None:
         return _cxl_ext_cache
 
-    # First try importing in case it's already installed
     try:
         import cxl_mem_ext
 
@@ -52,41 +111,27 @@ def _load_cxl_ext():
     except ImportError:
         pass
 
-    # JIT compile from source
-    from pathlib import Path
+    # Try loading from build directory (pre-compiled by main process)
+    import glob as glob_mod
+    import importlib.util
+    import sys
 
-    from torch.utils.cpp_extension import load
+    _, build_dir = _get_cxl_source_paths()
+    so_files = glob_mod.glob(str(build_dir / "cxl_mem_ext*.so"))
+    if so_files:
+        spec = importlib.util.spec_from_file_location("cxl_mem_ext", so_files[0])
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["cxl_mem_ext"] = mod
+        spec.loader.exec_module(mod)
+        _cxl_ext_cache = mod
+        return _cxl_ext_cache
 
-    # Locate sgl-kernel/cxl_utils relative to the sglang package
-    sglang_root = Path(__file__).resolve().parents[4]  # python/sglang/srt/mem_cache -> repo root
-    cxl_root = sglang_root / "sgl-kernel" / "cxl_utils"
-    if not (cxl_root / "cxl_mem.cpp").exists():
-        raise ImportError(
-            f"CXL source not found at {cxl_root}. "
-            f"Ensure sgl-kernel/cxl_utils exists in the repository."
-        )
+    # Last resort: compile in-process (for standalone scripts / tests)
+    logger.warning("cxl_mem_ext not pre-compiled, compiling in worker process...")
+    precompile_cxl_ext()
+    import cxl_mem_ext
 
-    build_dir = sglang_root / "build" / "cxl_mem_ext"
-    build_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("JIT compiling cxl_mem_ext from %s ...", cxl_root)
-    _cxl_ext_cache = load(
-        name="cxl_mem_ext",
-        sources=[
-            str(cxl_root / "cxl_mem.cpp"),
-            str(cxl_root / "cxl_mem_cuda.cu"),
-            str(cxl_root / "cxl_mem_pybind.cpp"),
-        ],
-        extra_cflags=[
-            "-O3", "-std=c++17", "-mclflushopt", "-mclwb", "-msse4.1", "-fopenmp",
-        ],
-        extra_cuda_cflags=["-O3", "-std=c++17"],
-        extra_ldflags=["-lgomp"],
-        build_directory=str(build_dir),
-        verbose=False,
-        with_cuda=True,
-    )
-    logger.info("cxl_mem_ext compiled successfully")
+    _cxl_ext_cache = cxl_mem_ext
     return _cxl_ext_cache
 
 
