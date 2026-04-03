@@ -34,17 +34,60 @@ class CXLConfig:
     gpu_id: int = 0
 
 
+_cxl_ext_cache = None
+
+
 def _load_cxl_ext():
-    """Load the cxl_mem_ext C++ extension (built from sgl-kernel/cxl_utils)."""
+    """JIT-compile and load the cxl_mem_ext C++ extension from sgl-kernel/cxl_utils."""
+    global _cxl_ext_cache
+    if _cxl_ext_cache is not None:
+        return _cxl_ext_cache
+
+    # First try importing in case it's already installed
     try:
         import cxl_mem_ext
 
-        return cxl_mem_ext
+        _cxl_ext_cache = cxl_mem_ext
+        return _cxl_ext_cache
     except ImportError:
+        pass
+
+    # JIT compile from source
+    from pathlib import Path
+
+    from torch.utils.cpp_extension import load
+
+    # Locate sgl-kernel/cxl_utils relative to the sglang package
+    sglang_root = Path(__file__).resolve().parents[4]  # python/sglang/srt/mem_cache -> repo root
+    cxl_root = sglang_root / "sgl-kernel" / "cxl_utils"
+    if not (cxl_root / "cxl_mem.cpp").exists():
         raise ImportError(
-            "cxl_mem_ext not found. Build it from sgl-kernel/cxl_utils: "
-            "cd sgl-kernel/cxl_utils && pip install -e ."
+            f"CXL source not found at {cxl_root}. "
+            f"Ensure sgl-kernel/cxl_utils exists in the repository."
         )
+
+    build_dir = sglang_root / "build" / "cxl_mem_ext"
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info("JIT compiling cxl_mem_ext from %s ...", cxl_root)
+    _cxl_ext_cache = load(
+        name="cxl_mem_ext",
+        sources=[
+            str(cxl_root / "cxl_mem.cpp"),
+            str(cxl_root / "cxl_mem_cuda.cu"),
+            str(cxl_root / "cxl_mem_pybind.cpp"),
+        ],
+        extra_cflags=[
+            "-O3", "-std=c++17", "-mclflushopt", "-mclwb", "-msse4.1", "-fopenmp",
+        ],
+        extra_cuda_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=["-lgomp"],
+        build_directory=str(build_dir),
+        verbose=False,
+        with_cuda=True,
+    )
+    logger.info("cxl_mem_ext compiled successfully")
+    return _cxl_ext_cache
 
 
 class CXLMemoryRegion:
