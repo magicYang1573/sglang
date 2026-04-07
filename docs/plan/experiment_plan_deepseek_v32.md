@@ -50,9 +50,10 @@ SGLang 已合并的 **HiSparse**（PR#20343）恰好实现了 DeepSeek-V3.2 NSA 
 | -------- | ------------------------------------- | ----------------------------------- |
 | GPU      | 8 × H20 96GB（或更高规格的 8 卡机器）            | DeepSeek-V3.2 为 671B MoE，TP=8 可完整加载 |
 | CXL 设备   | CXL 2.0 type-3 内存扩展 ≥64GB             | 存放 offload 的 KV Cache               |
-| RDMA NIC | ConnectX-5/6/7, 100/200Gbps IB 或 RoCE | Mooncake 传输后端                       |
-| 远端节点     | ≥1 台具有 RDMA NIC + ≥256GB DRAM 的机器     | Mooncake 远端 KV Cache 存储             |
+| RDMA NIC | ConnectX-5/6/7, 100/200Gbps IB 或 RoCE | 本机 loopback 模拟分布式内存池              |
 | 本地 DRAM  | ≥512GB                                | 模型权重 + HiSparse host pool + OS 开销   |
+
+> **注意**：所有实验均在**单机**完成，不需要远端节点。RDMA 方案使用本机 NIC loopback 模拟分布式内存池的全量预取开销。
 
 
 ---
@@ -90,16 +91,25 @@ HiSparse 的默认模式。Prefill 后全量 KV 备份到 CPU pinned memory（`c
 - **数据路径**：GPU ↔ CPU DRAM（PCIe DMA）
 - **定位**：性能上限基线——本地 DRAM 无网络开销，延迟最低，但容量受限于单机物理内存，可支撑的并发请求数有限
 
-### 4.3 方案 B：Mooncake RDMA 远端内存池（全量预取）
+### 4.3 方案 B：RDMA 分布式内存池（本机 Loopback 模拟）
 
 这是当前 RDMA 池化系统（Mooncake、LMCache 等）的标准做法，也是本文要批判的对象。
 
-KV Cache 的持久存储位于远端节点。每步 decode 开始前，通过 Mooncake RDMA 将该请求的**全量 KV Cache** 从远端预取到本地 DRAM staging area，然后 HiSparse 从本地 staging area 按 top-k 加载到 GPU。
+**模拟场景**：KV Cache 存储在"远端"分布式内存池中，本地 DRAM 仅缓存一部分。每步 decode 开始前，需要通过 RDMA 将不在本地的 KV Cache 全量预取到本地 DRAM staging area，然后 HiSparse 从本地 staging area 按 top-k 加载到 GPU。
 
-- **数据路径**：远端 DRAM →（RDMA）→ 本地 DRAM →（PCIe DMA）→ GPU
+**单机模拟方式**：在同一台机器上，将 KV Cache 分为两部分：
+
+- **本地缓存部分**：存在 pinned DRAM 中，可直接访问（模拟分布式内存池中本地节点缓存的热数据）
+- **"远端"部分**：也存在本机 DRAM 中，但 decode 前需通过 RDMA NIC loopback 读取到 staging buffer（模拟从远端节点的全量预取）
+
+通过调节"本地缓存比例"（0%–100%），可以模拟不同的分布式内存池配置。
+
+- **数据路径**：本机 DRAM →（RDMA loopback）→ 本地 staging DRAM →（PCIe DMA）→ GPU
 - **问题**：预取了 100% 数据，attention 只用了 1–10%。带宽和本地 DRAM 均被浪费
 
 > RDMA 是消息语义，每次传输都有 μs 级的 per-message 协议开销。DeepSeek-V3.2 有 61 层 transformer，如果每层都发一次 RDMA 请求取 top-k，仅协议开销就是 61 × 数μs = 数百μs，远超 sparse attention 本身的计算时间。因此 RDMA 只能做全量预取，逐层按需取不可行。
+>
+> **关于 loopback 的有效性**：本机 NIC loopback 下 per-message 开销（~1-2 μs）与跨机场景量级一致（仅少了线缆传播延迟 ~0.5-1 μs）。因此 loopback 结果是 RDMA 性能的**下界**，跨机场景延迟只会更高。
 
 ### 4.4 方案 C：CXL 共享内存池
 
@@ -113,14 +123,14 @@ KV Cache 的持久存储位于远端节点。每步 decode 开始前，通过 Mo
 ### 4.5 三种方案的数据流对比
 
 
-| 环节               | A: DRAM                 | B: RDMA 全量预取               | C: CXL                 |
-| ---------------- | ----------------------- | -------------------------- | ---------------------- |
-| Prefill 后 backup | GPU → DRAM              | GPU → DRAM → RDMA → 远端     | GPU → CXL              |
-| Decode 每步预取      | 无（数据已在本地）               | 远端 → RDMA → DRAM（**全量**）   | 无（CXL 按需访问）            |
-| 每层 swap-in       | DRAM → GPU (top-k miss) | DRAM → GPU (top-k miss)    | CXL → GPU (top-k miss) |
-| 每步总传输量           | top-k × layers          | **全量 KV** + top-k × layers | top-k × layers         |
-| 本地 DRAM 占用       | 全量 KV                   | 全量 KV (staging)            | ≈ 0（KV 在 CXL）          |
-| 有效带宽利用率          | 100%                    | **1–10%**                  | ≈ 100%                 |
+| 环节               | A: DRAM                 | B: RDMA 分布式池（loopback 模拟） | C: CXL                 |
+| ---------------- | ----------------------- | ------------------------------ | ---------------------- |
+| Prefill 后 backup | GPU → DRAM              | GPU → DRAM（本地+"远端"两部分）        | GPU → CXL              |
+| Decode 每步预取      | 无（数据已在本地）               | "远端"部分 → RDMA loopback → staging（**全量**） | 无（CXL 按需访问）     |
+| 每层 swap-in       | DRAM → GPU (top-k miss) | staging DRAM → GPU (top-k miss) | CXL → GPU (top-k miss) |
+| 每步总传输量           | top-k × layers          | **全量 KV** + top-k × layers     | top-k × layers         |
+| 本地 DRAM 占用       | 全量 KV                   | 本地缓存部分 + staging               | ≈ 0（KV 在 CXL）          |
+| 有效带宽利用率          | 100%                    | **1–10%**                      | ≈ 100%                 |
 
 
 ---
@@ -193,53 +203,248 @@ HiSparse 的 host pool 使用 `layer_first` 或 `page_first` 布局。不同布�
 
 ### 6.2 Part 2：端到端 Serving 实验
 
-在 SGLang + HiSparse 上运行 DeepSeek-V3.2，实测三种方案的端到端推理性能。
+在 SGLang + HiSparse 上运行 DeepSeek-V3.2，实测三种方案的端到端推理性能。实验采用**两轮执行**设计：第一轮冷启动（无 prefix-cache），第二轮利用第一轮产生的 KV Cache 作为 prefix-cache 热数据。两轮结果均展示，形成完整的"KV Cache 从生成到复用"全链路对比。
 
-#### 6.2a 吞吐与延迟对比
+#### 6.2.0 实验总体流程
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Round 1：冷启动（无 prefix-cache）                        │
+│                                                         │
+│  发送 N 个共享前缀的请求（prefix + query_i）                │
+│  → 每个请求完整 prefill → KV Cache 写入内存池              │
+│  → decode 从内存池读取 sparse KV                          │
+│                                                         │
+│  测量指标：TTFT、Prefill 吞吐、Decode TBT、总吞吐          │
+│  实验结束后 KV Cache 保留在内存池中（radix cache + host     │
+│  prefix cache 双重保留）                                   │
+├─────────────────────────────────────────────────────────┤
+│  Round 2：热启动（prefix-cache 命中）                      │
+│                                                         │
+│  发送 M 个共享同一前缀的新请求（prefix + query_j）           │
+│  → prefix 部分命中 radix cache，跳过 prefix 的 prefill     │
+│    计算，仅对 query_j 做 extend prefill（数百 tokens）      │
+│  → staging 仅备份 extend 部分的 KV，prefix KV 从 host      │
+│    prefix cache 直接复用                                   │
+│  → decode 从内存池读取 sparse KV（与 Round 1 相同路径）      │
+│                                                         │
+│  测量指标：TTFT（应显著降低）、Decode TBT、总吞吐            │
+│  重点关注：GPU 几乎全部用于 decode，RDMA 预取开销被充分暴露   │
+└─────────────────────────────────────────────────────────┘
+```
+
+**为什么要两轮？**
+
+- Round 1 展示"无 prefix cache"场景下三种方案的**全链路差异**（含 prefill + KV 写入 + decode）
+- Round 2 展示"prefix cache 命中"场景下的差异——prefix 的 prefill 计算被完全跳过（通过 SGLang radix cache），GPU 几乎 100% 用于 decode，此时 **decode 阶段的 KV 读取效率成为唯一瓶颈**，三种方案的差异被充分放大
+- 两轮结合体现了真实生产场景的完整链路：首次请求生成 KV Cache → 后续请求复用
+- 如果不跳过 prefix 的 prefill 计算，GPU 被 prefill 计算占据，RDMA 带宽不会成为瓶颈，三种方案的 decode throughput 趋于一致，无法区分
+
+#### 6.2.1 Dataset 选择
+
+| Dataset | 说明 | 适用场景 |
+|---------|------|---------|
+| **LongBench-v2** | 真实长文本 QA，涵盖多种任务类型，输入 4K–128K tokens | 主实验，prefix = 文档内容 |
+| **RULER** | 合成长上下文基准（needle-in-haystack 等），可精确控制 context 长度 | 控制变量实验 |
+| **ShareGPT 长对话子集** | 真实多轮对话，共享 system prompt + 历史 | prefix = system prompt |
+| **合成 Prefix Dataset** | 人工构造固定前缀 + 随机 query | 精确控制 prefix 长度 |
+
+**推荐主实验使用合成 Prefix Dataset**，理由：
+
+1. 可精确控制 prefix 长度（4K/16K/32K/64K tokens），排除 dataset 本身的 variance
+2. 所有请求共享完全相同的 prefix，保证 Round 2 的 prefix-cache 命中率 = 100%
+3. query 部分随机生成，保证 NSA indexer 的 top-k 选择具有多样性
+
+LongBench-v2 作为**补充实验**展示真实工作负载下的性能。
+
+**合成 Prefix Dataset 构造**：
+
+```
+prefix = [随机英文文本, 填充到目标 token 数]
+query_i = "Based on the above document, answer question {i}: {random_question}"
+请求 = prefix + query_i
+output = 生成 256 tokens
+```
+
+#### 6.2.2 指标定义
+
+| 指标 | 定义 | Round 1 含义 | Round 2 含义 |
+|------|------|-------------|-------------|
+| **TTFT** (ms) | Time To First Token | 完整 prefill 时间 | **极低**（prefix 命中 radix cache，跳过 prefix prefill，仅计算 extend 的数百 tokens） |
+| **Decode TBT** (ms) | Time Between Tokens | decode 步间延迟 | 同 Round 1（**核心对比指标**） |
+| **P99 TBT** (ms) | 第 99 百分位 TBT | 尾延迟 | 尾延迟 |
+| **Decode Throughput** (tokens/s) | decode 产生的 token 数 / decode 总时间 | **主要对比指标** | **主要对比指标** |
+| **Total Throughput** (tokens/s) | 所有 output token / 端到端总时间 | 含 prefill 开销 | prefix cache 命中后更高 |
+| **Max Concurrency** | 不 OOM 的最大并发请求数 | 受限于内存池容量 | 同 Round 1 |
+| **DRAM Usage** (GB) | 本地 DRAM 被 KV Cache 占用量 | — | — |
+
+#### 6.2.3 方案 B（RDMA）的本地缓存比例设置
+
+方案 B 模拟分布式内存池场景。关键变量是**本地 DRAM 缓存了多少比例的 KV Cache**，剩余部分需要通过 RDMA loopback 全量取回。
+
+| 配置名称 | 本地 DRAM 比例 | RDMA 预取量 | 模拟场景 |
+|---------|-------------|-----------|---------|
+| B-0 | 0% | 100% 全量 RDMA | 极端：所有 KV 在"远端"，每步全量预取 |
+| B-30 | 30% | 70% RDMA | 典型：本地缓存热数据，多数仍在远端 |
+| B-70 | 70% | 30% RDMA | 乐观：大部分在本地，少量远端 |
+| B-100 | 100% | 0% RDMA | 等价于方案 A（对照） |
+
+**RDMA 预取的执行方式**：
+
+每步 decode 开始前，将"远端部分"（(1 - 本地比例) × 全量 KV）通过 RDMA NIC loopback 从本机"远端 MR"读取到 staging buffer。这真实地执行了 RDMA 传输，产生的延迟是硬件实测值而非模拟注入。
+
+#### 6.2.4 Round 1：冷启动实验
 
 
 | 变量            | 取值                                                  |
 | ------------- | --------------------------------------------------- |
 | 模型            | DeepSeek-V3.2 (671B MoE, 61 layers, NSA, MLA)       |
-| 序列长度          | 32K, 64K, 128K                                      |
-| 并发请求数         | 1, 2, 4, 8                                          |
+| prefix 长度     | 4K, 16K, 32K, 64K tokens                            |
+| query 长度      | 256, 1024 tokens                                    |
+| output 长度     | 256 tokens                                          |
+| 并发请求数         | 1, 2, 4, 8, 16                                      |
 | top-k         | 2048（模型默认 `index_topk`）                             |
 | device buffer | 2 × top_k = 4096                                    |
-| 方案            | A (DRAM) / B (RDMA 全量预取) / C (CXL)                  |
-| 指标            | Throughput (tokens/s), TTFT (ms), TBT (ms), P99 TBT |
+| 方案            | A (DRAM) / B-0, B-30 (RDMA loopback) / C (CXL)     |
+| 指标            | TTFT, Decode TBT, P99 TBT, Decode Throughput, Total Throughput, DRAM Usage |
+
+**Round 1 预期结果**：
+
+- 三种方案 TTFT 基本相同（都在本地 GPU 执行 prefill）
+- Decode TBT：A ≈ C < B（B 被 RDMA 全量预取延迟拖慢）
+- Total Throughput：A ≈ C > B
+- DRAM Usage：A > B > C
+
+#### 6.2.5 Round 2：Prefix-Cache 命中实验
+
+Round 1 结束后，KV Cache 保留在内存池中。发送**新一批请求**，共享与 Round 1 相同的 prefix：
 
 
-**预期结果**：
+| 变量            | 取值                                                  |
+| ------------- | --------------------------------------------------- |
+| prefix 长度     | 与 Round 1 相同                                       |
+| 新 query       | 不同于 Round 1 的 query（确保 decode 路径不同）                |
+| 并发请求数         | 1, 2, 4, 8, 16, 32（可测更多，因 TTFT 更短释放资源更快）          |
+| 方案            | A (DRAM) / B-0, B-30 (RDMA loopback) / C (CXL)     |
+| 指标            | TTFT（应大幅降低）, Decode TBT, P99 TBT, Decode Throughput, Max Concurrency |
 
-- A（DRAM）：延迟最低，但受限于本地 DRAM 容量，可并发请求数有限
-- B（RDMA 全量预取）：每步 decode 的 RDMA 全量传输时间远超 sparse 计算时间，吞吐被 RDMA 带宽锁死
-- C（CXL）：延迟接近 A，但本地 DRAM 占用接近 0，可扩展更多并发
+**Round 2 预期结果**：
 
-#### 6.2b 内存效率与可扩展性
+- **TTFT 大幅降低**：prefix 命中 radix cache → prefill 跳过 prefix 计算，仅处理 extend 部分（256-1024 tokens）。三种方案的 TTFT 均大幅降低（prefill 不涉及 host 介质差异）
+- **Decode TBT：A ≈ C << B**——这是核心对比：
+  - GPU 几乎完全被 decode 占据（prefill 开销可忽略），RDMA 预取延迟不再被 prefill 计算掩盖
+  - 方案 A/C 每步按需读取 top-k（~几十 μs），方案 B 每步需 RDMA 全量预取（~几百 μs ~ 几 ms）
+  - Round 2 的 Decode TBT 差异应**显著大于** Round 1（Round 1 中 prefill 间隔掩盖了部分差异）
+- **Max Concurrency**：C 远超 A/B
+  - A：本地 DRAM 存全量 KV → 并发数受限
+  - B：本地 DRAM 存 staging + 部分缓存 → 与 A 类似
+  - C：KV 在 CXL，本地 DRAM 释放 → 可扩展到更多并发
+- **总吞吐**：C > A >> B（C 有高并发优势 + 低延迟，B 被 RDMA 预取锁死）
+
+#### 6.2.6 Round 1 + Round 2 结果展示
+
+两轮结果并列展示，形成如下对比图：
+
+```
+  图 1: Decode TBT (ms) — prefix_len=32K, concurrency=4
+
+        Round 1 (冷启动)            Round 2 (prefix cache hit)
+   TBT │                      TBT │
+   (ms)│  ┌──┐                (ms)│  ┌──┐
+       │  │A │ ┌──┐               │  │A │ ┌──┐
+       │  │  │ │C │               │  │  │ │C │     (A≈C, 因 decode 路径不变)
+       │  │  │ │  │ ┌────┐        │  │  │ │  │ ┌────┐
+       │  │  │ │  │ │ B  │        │  │  │ │  │ │ B  │  (B 仍被 RDMA 拖慢)
+       │  └──┘ └──┘ └────┘        │  └──┘ └──┘ └────┘
+       └──────────────────        └──────────────────
+
+  图 2: Max Concurrency — prefix_len=32K, seq_len=64K
+
+   Max  │
+   Conc │                     ┌──┐
+       │              ┌──┐   │C │
+       │  ┌──┐ ┌──┐   │B │   │  │  (C >> A ≈ B)
+       │  │A │ │B │   │  │   │  │
+       │  └──┘ └──┘   └──┘   └──┘
+       └──────────────────────────
+          Round 1     Round 2
+          (所有方案内存占满)  (C 因 CXL 释放 DRAM 可扩展)
+```
+
+#### 6.2.7 内存效率与可扩展性
 
 
 | 变量      | 取值                         |
 | ------- | -------------------------- |
-| 序列长度    | 128K                       |
+| prefix 长度 | 32K, 64K                 |
 | 递增并发请求数 | 1, 2, 4, 8, 16, ... 直到 OOM |
-| 指标      | 最大可并发请求数、总吞吐量              |
+| 方案      | A / B-0 / B-30 / C        |
+| 指标      | 最大可并发请求数、总吞吐量、DRAM 占用     |
 
 
 **预期结果**：
 
 - A（DRAM）：每请求需在本地存全量 KV → 可并发数少
-- B（RDMA）：本地仍需 staging area 存全量 KV → 与 A 类似
-- C（CXL）：本地仅需 VRAM buffer → 可并发请求数远超 A/B
+- B-0（RDMA 0% 本地）：本地仍需 staging area 存全量 KV → 与 A 类似
+- B-30（RDMA 30% 本地）：本地缓存 30% + staging → 介于 A 和 B-0 之间
+- C（CXL）：本地仅需 VRAM device buffer → 可并发请求数远超 A/B
 
-#### 6.2c 消融实验
-
+#### 6.2.8 消融实验
 
 | 实验           | 变量                                              | 指标                              |
 | ------------ | ----------------------------------------------- | ------------------------------- |
 | Buffer 大小    | device_buffer_size: 512, 1024, 2048, 4096, 8192 | Buffer 命中率、CXL 实际读取量 / top-k 总量 |
 | Sparse ratio | top-k: 512, 1024, 2048, 4096                    | 各方案吞吐对比                         |
 | CXL 内存策略     | 单卡 CXL-only / 多卡 CXL interleave / 不同页面大小        | TBT、吞吐                          |
+| RDMA 本地缓存比例  | B-0 (0%) / B-30 / B-70 / B-100                  | Decode TBT、RDMA 传输延迟            |
 | 层间相似性        | 记录每层 top-k indices                              | 相邻层 overlap 率、热力图               |
 | 计算与取数重叠      | 开启/关闭 overlap                                   | TBT 差异、Nsight Systems trace     |
+
+#### 6.2.9 RDMA 全量预取延迟速查表
+
+以 100Gbps IB NIC loopback 为例，RDMA 方案每步 decode 前需全量预取的数据量与延迟：
+
+| prefix 长度 | 每 token 大小 | 层数 | 全量 KV 大小 | RDMA 传输延迟 (100Gbps) | 备注 |
+|------------|-------------|------|------------|---------------------|------|
+| 4K tokens | 656B | 61 | 155 MB | ~12.4 ms | |
+| 16K tokens | 656B | 61 | 620 MB | ~49.6 ms | |
+| 32K tokens | 656B | 61 | 1.24 GB | ~99.2 ms | **每步 decode 都要等** |
+| 64K tokens | 656B | 61 | 2.48 GB | ~198.4 ms | |
+
+而 CXL 方案每步 decode 只需读取 top-k × layers 的数据：
+
+| top-k | 层数 | 实际读取量 | CXL 延迟 (估) | vs RDMA 全量 (32K prefix) |
+|-------|------|----------|-------------|--------------------------|
+| 2048 | 61 | 78 MB | ~3-5 ms | **20-33× 更快** |
+| 1024 | 61 | 39 MB | ~1.5-2.5 ms | **40-66× 更快** |
+| 512 | 61 | 19.5 MB | ~0.8-1.3 ms | **76-124× 更快** |
+
+#### 6.2.10 预期结果总结
+
+```
+              Decode Throughput (tokens/s) vs 并发请求数
+              prefix_len=32K, top-k=2048, Round 2 (prefix cache hit)
+
+  tokens/s │
+           │       ○──○──○──○──○  A: DRAM (OOM at 8 req)
+           │      ╱
+           │     ╱  ●──●──●──●──●──●──●  C: CXL (scales to 32 req)
+           │    ╱  ╱
+           │   ╱  ╱
+           │  ╱  ╱    ×──×──×──×  B: RDMA (bandwidth-limited)
+           │ ╱  ╱    ╱
+           │╱  ╱    ╱
+           └─┬──┬──┬──┬──┬──┬──┬──→ 并发请求数
+             1  2  4  8  16 24 32
+```
+
+| 对比维度 | A: DRAM | B: RDMA 分布式池 | C: CXL |
+|---------|---------|---------------|--------|
+| 每步 decode 数据传输量 | top-k only | **全量 KV** (100%) | top-k only |
+| 本地 DRAM 占用 | 全量 KV | staging + 本地缓存 | ≈ 0 |
+| 最大并发请求数 | 受限于 DRAM | 受限于 staging DRAM | 受限于 CXL（远大于 DRAM） |
+| Decode TBT | **最低** | 被 RDMA 延迟拖慢 | 接近 A |
+| 有效带宽利用率 | 100% | **1-10%** | ≈ 100% |
+| 部署复杂度 | 最简单 | 需 RDMA NIC | 需 CXL 设备 |
 
 
