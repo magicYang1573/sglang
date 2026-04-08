@@ -351,6 +351,41 @@ class HiSparseCoordinator:
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
+    def _materialize_short_seq_device_buffer_from_host(
+        self, req: Req, seq_len: int, device_indices: torch.Tensor
+    ) -> None:
+        """Eagerly populate short-seq device buffer slots from host.
+
+        The HiSparse kernel has a short-sequence fast path (`seq_len <= hot buffer`)
+        that assumes token position `i` already resides in `device_buffer_locs[i]`
+        and does not consult `device_buffer_tokens`.
+
+        For prefix-hit requests we intentionally initialize the device buffer as
+        empty and rely on host swap-in during decode. That works for the general
+        path, but not for the short-seq fast path. To preserve correctness, we
+        eagerly materialize the whole short sequence into the per-request device
+        buffer before decode starts.
+        """
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :seq_len]
+        invalid_mask = host_indices < 0
+        if torch.any(invalid_mask):
+            bad_positions = torch.where(invalid_mask)[0].tolist()
+            raise AssertionError(
+                f"Req {req.rid}: missing host backup for short-seq tokens at positions "
+                f"{bad_positions}"
+            )
+
+        host_indices = host_indices.contiguous()
+        device_indices = device_indices[:seq_len].contiguous()
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend="kernel",
+            )
+
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
@@ -396,6 +431,16 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.req_pool_idx, : self.device_buffer_size
             ] = -1
+            if req.kv_allocated_len <= self.device_buffer_size:
+                # Short-seq fast path in the kernel assumes token i already lives in
+                # device_buffer_locs[i]. Materialize the full sequence now so the
+                # fast path remains valid for prefix-hit requests.
+                self._materialize_short_seq_device_buffer_from_host(
+                    req, req.kv_allocated_len, buffer_indices
+                )
+                self.req_device_buffer_tokens[
+                    :, req.req_pool_idx, : req.kv_allocated_len
+                ] = torch.arange(req.kv_allocated_len, device=self.device)
         else:
             self.req_device_buffer_tokens[
                 :, req.req_pool_idx, : self.device_buffer_size
