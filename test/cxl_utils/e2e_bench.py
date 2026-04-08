@@ -2,30 +2,31 @@
 """Two-round end-to-end benchmark for CXL vs RDMA prefix cache comparison.
 
 Round 1 (Cold):
-  Send N requests sampled from the ShareGPT dataset.
-  Each request has unique content (different conversation).
-  This populates the server's radix prefix cache.
-  Measures: TTFT, TBT (inter-token latency), throughput.
+  Send N requests; each request prefill fills the radix / prefix cache.
 
 Round 2 (Warm):
-  Replay the EXACT SAME N requests as Round 1.
-  The radix cache now holds the full KV for each request's prefix,
-  so prefill is skipped and only extend tokens are computed.
-  Measures: TTFT (should drop), TBT, throughput.
+  Replay the EXACT SAME N requests as Round 1 so prefix-cache effects dominate.
 
-Request design:
-  - Both rounds use the SAME set of N prompts (same objects, same order)
-  - Each of the N prompts is a different ShareGPT user turn — no shared prefix
-  - The "prefix" exploited by the cache is each request's own token prefix from Round 1
-  - This tests KV-cache read bandwidth (CXL vs RDMA) under realistic workload diversity
+Prompt modes (--prompt-mode):
+  synthetic (default): fixed token-length long prompts (8K–64K class workloads).
+    Use --target-input-tokens and --output-tokens; no ShareGPT download.
+  sharegpt: sample ShareGPT user turns with --min/--max-prompt-tokens filters.
 
-Usage:
+Client behaviour:
+  --num-requests is the total per round (SGLang does not change this).
+  --max-concurrency only caps concurrent HTTP clients; total requests stay 2×N
+  for two rounds. For long context, lower concurrency (e.g. 32) reduces OOM risk.
+
+Usage (long-context defaults match docs/plan/experiment_plan_deepseek_v32.md):
   python e2e_bench.py \\
     --server-url http://localhost:30000 \\
     --model deepseek-ai/DeepSeek-V3.2 \\
-    --num-requests 16 \\
-    --output-tokens 128 \\
-    --request-rate 4 \\
+    --prompt-mode synthetic \\
+    --target-input-tokens 8192 \\
+    --output-tokens 1024 \\
+    --num-requests 512 \\
+    --max-concurrency 32 \\
+    --request-rate 0 \\
     --output results.json
 """
 
@@ -241,6 +242,50 @@ def load_sharegpt_prompts(
     return prompts
 
 
+def load_synthetic_long_prompts(
+    tokenizer,
+    num_prompts: int,
+    target_input_tokens: int,
+    output_tokens: int,
+    seed: int,
+) -> List[Tuple[str, int, int]]:
+    """Build N long prompts targeting ``target_input_tokens`` tokens each.
+
+    Uses contiguous slices from one large encoded passage so decode/re-tokenize is
+    stable for typical BPE/SentencePiece tokenizers.
+    """
+    rng = random.Random(seed)
+    filler = (
+        "The quick brown fox jumps over the lazy dog. "
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. "
+        "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "
+    ) * (target_input_tokens // 3 + 256)
+
+    mega = tokenizer.encode(filler, add_special_tokens=False)
+    need = target_input_tokens * num_prompts + target_input_tokens
+    while len(mega) < need:
+        mega = mega + mega
+
+    out: List[Tuple[str, int, int]] = []
+    span = len(mega) - target_input_tokens
+    if span <= 0:
+        raise ValueError("Failed to build long token buffer for synthetic prompts.")
+
+    for i in range(num_prompts):
+        start = (i * 9973 + rng.randint(0, span - 1)) % span
+        ids = mega[start : start + target_input_tokens]
+        text = tokenizer.decode(ids, skip_special_tokens=True)
+        plen = len(tokenizer.encode(text, add_special_tokens=False))
+        if abs(plen - target_input_tokens) > max(8, target_input_tokens // 200):
+            warnings.warn(
+                f"Prompt {i}: re-tokenized length {plen} vs target {target_input_tokens}.",
+                stacklevel=2,
+            )
+        out.append((text, plen, output_tokens))
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 #  Async request sender with streaming (for TTFT/ITL measurement)
 # ---------------------------------------------------------------------------
@@ -406,26 +451,41 @@ def print_metrics(m: RoundMetrics):
 async def main_async(args):
     from transformers import AutoTokenizer
 
+    tok_id = args.tokenizer or args.model
+    tok_kw = {"trust_remote_code": True}
+    if args.local_files_only:
+        tok_kw["local_files_only"] = True
+
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(tok_id, **tok_kw)
 
-    # Load N diverse prompts from ShareGPT — each request is a different conversation.
-    # Both rounds will replay the exact same N prompts.
     fixed_output = args.output_tokens if args.output_tokens > 0 else None
-    print(f"Loading {args.num_requests} diverse prompts from ShareGPT...")
-    sharegpt_prompts = load_sharegpt_prompts(
-        dataset_path=args.dataset_path,
-        num_prompts=args.num_requests,
-        tokenizer=tokenizer,
-        min_prompt_tokens=args.min_prompt_tokens,
-        max_prompt_tokens=args.max_prompt_tokens,
-        fixed_output_len=fixed_output,
-        seed=args.seed,
-    )
 
-    # prompts for run_round: list of (text, prompt_len); output_len comes from each entry
-    # We carry output_len per request for accurate per-request max_tokens
-    round_prompts: List[Tuple[str, int, int]] = sharegpt_prompts  # (text, prompt_len, output_len)
+    if args.prompt_mode == "synthetic":
+        if args.output_tokens <= 0:
+            raise ValueError("--output-tokens must be > 0 when using --prompt-mode synthetic")
+        print(
+            f"Building {args.num_requests} synthetic prompts "
+            f"(~{args.target_input_tokens} input tokens, {args.output_tokens} output tokens)..."
+        )
+        round_prompts = load_synthetic_long_prompts(
+            tokenizer=tokenizer,
+            num_prompts=args.num_requests,
+            target_input_tokens=args.target_input_tokens,
+            output_tokens=args.output_tokens,
+            seed=args.seed,
+        )
+    else:
+        print(f"Loading {args.num_requests} diverse prompts from ShareGPT...")
+        round_prompts = load_sharegpt_prompts(
+            dataset_path=args.dataset_path,
+            num_prompts=args.num_requests,
+            tokenizer=tokenizer,
+            min_prompt_tokens=args.min_prompt_tokens,
+            max_prompt_tokens=args.max_prompt_tokens,
+            fixed_output_len=fixed_output,
+            seed=args.seed,
+        )
 
     prompt_lens = [p[1] for p in round_prompts]
     output_lens = [p[2] for p in round_prompts]
@@ -509,6 +569,10 @@ async def main_async(args):
     all_results["config"] = {
         "server_url": args.server_url,
         "model": args.model,
+        "tokenizer": tok_id,
+        "local_files_only": args.local_files_only,
+        "prompt_mode": args.prompt_mode,
+        "target_input_tokens": args.target_input_tokens,
         "num_requests": args.num_requests,
         "output_tokens": args.output_tokens,
         "min_prompt_tokens": args.min_prompt_tokens,
@@ -534,9 +598,8 @@ async def main_async(args):
 def main():
     parser = argparse.ArgumentParser(
         description="CXL vs RDMA two-round e2e benchmark.\n\n"
-        "Both rounds replay the EXACT SAME set of N requests sampled from "
-        "the ShareGPT dataset. Each request has unique content (different "
-        "conversation). Round 1 populates the prefix cache; Round 2 hits it.",
+        "Both rounds replay the EXACT SAME N requests. Use --prompt-mode synthetic "
+        "for long-context sweeps (see docs/plan/experiment_plan_deepseek_v32.md).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -548,32 +611,49 @@ def main():
         help="Model name (for tokenizer and API)",
     )
     parser.add_argument(
-        "--num-requests", type=int, default=16,
+        "--tokenizer", default="",
+        help="Tokenizer id or local dir (default: same as --model)",
+    )
+    parser.add_argument(
+        "--local-files-only", action="store_true",
+        help="Load tokenizer from local files only (no Hub download)",
+    )
+    parser.add_argument(
+        "--prompt-mode", choices=("synthetic", "sharegpt"), default="synthetic",
+        help="synthetic: fixed-length long prompts; sharegpt: sample ShareGPT JSON",
+    )
+    parser.add_argument(
+        "--target-input-tokens", type=int, default=8192,
+        help="Synthetic mode: target prompt length in tokens (e.g. 8192, 16384, 32768, 65536)",
+    )
+    parser.add_argument(
+        "--num-requests", type=int, default=512,
         help="Number of requests per round (identical in both rounds)",
     )
     parser.add_argument(
-        "--output-tokens", type=int, default=128,
-        help="Fixed output token count per request. 0 = use dataset ground truth",
+        "--output-tokens", type=int, default=1024,
+        help="Output tokens per request (synthetic) or fixed cap (sharegpt). "
+        "0 = sharegpt ground-truth assistant length only",
     )
     parser.add_argument(
         "--min-prompt-tokens", type=int, default=64,
-        help="Minimum prompt length filter (tokens)",
+        help="sharegpt: minimum prompt length filter (tokens)",
     )
     parser.add_argument(
         "--max-prompt-tokens", type=int, default=8192,
-        help="Maximum prompt length filter (tokens)",
+        help="sharegpt: maximum prompt length filter (tokens)",
     )
     parser.add_argument(
-        "--request-rate", type=float, default=4.0,
-        help="Request dispatch rate (req/s). 0 = send all simultaneously",
+        "--request-rate", type=float, default=0.0,
+        help="Client dispatch spacing (req/s). 0 = no extra delay (only --max-concurrency caps)",
     )
     parser.add_argument(
-        "--max-concurrency", type=int, default=0,
-        help="Max concurrent in-flight requests. 0 = unlimited",
+        "--max-concurrency", type=int, default=32,
+        help="Max concurrent in-flight HTTP requests (0 = unlimited). Long context: 32 typical.",
     )
     parser.add_argument(
         "--dataset-path", type=str, default="",
-        help="Path to ShareGPT JSON file. Auto-downloaded from HuggingFace if empty.",
+        help="sharegpt: path to ShareGPT JSON. Empty = download from HuggingFace",
     )
     parser.add_argument(
         "--seed", type=int, default=42,
