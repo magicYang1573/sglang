@@ -250,9 +250,29 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        # disable free group mechanism for device buffer free
-        self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
+        # Disable free-group batching for direct device-buffer frees.
+        allocator = self.hisparse_attn_allocator
+        positive = buffer_indices[buffer_indices > 0]
+        if positive.numel() == 0:
+            return
+
+        # Guard against double-free on the same physical page. Prefix-cache
+        # restore and request/device-buffer teardown can legitimately converge
+        # on the same page from different higher-level paths. The paged allocator
+        # itself assumes callers never free the same page twice; enforce that
+        # invariant here before touching its free lists.
+        page_indices = torch.unique(positive // self.page_size)
+        existing_pages = allocator.free_pages
+        if allocator.release_pages.numel() > 0:
+            existing_pages = torch.cat((existing_pages, allocator.release_pages))
+        if existing_pages.numel() > 0:
+            existing_pages = torch.unique(existing_pages)
+            page_indices = page_indices[~torch.isin(page_indices, existing_pages)]
+        if page_indices.numel() == 0:
+            return
+
+        allocator.is_not_in_free_group = True
+        allocator.free(page_indices * self.page_size)
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         hisparse_last_locs = self._kvcache._translate_loc_to_hisparse_device(last_locs)
