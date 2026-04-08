@@ -95,17 +95,17 @@ HiSparse 的默认模式。Prefill 后全量 KV 备份到 CPU pinned memory（`c
 
 这是当前 RDMA 池化系统（Mooncake、LMCache 等）的标准做法，也是本文要批判的对象。
 
-**模拟场景**：KV Cache 存储在"远端"分布式内存池中，本地 DRAM 仅缓存一部分。每步 decode 开始前，需要通过 RDMA 将不在本地的 KV Cache 全量预取到本地 DRAM staging area，然后 HiSparse 从本地 staging area 按 top-k 加载到 GPU。
+**模拟场景**：KV Cache 存储在"远端"分布式内存池中。Remote 请求在进入 decode 阶段前，需一次性通过 RDMA 将全量 KV Cache 预取到本地 DRAM staging area，之后 HiSparse 从本地 DRAM 按 top-k 加载到 GPU。
 
-**单机模拟方式**：在同一台机器上，将 KV Cache 分为两部分：
+**单机模拟方式**：在同一台机器上，按**请求粒度**划分 local/remote：
 
-- **本地缓存部分**：存在 pinned DRAM 中，可直接访问（模拟分布式内存池中本地节点缓存的热数据）
-- **"远端"部分**：也存在本机 DRAM 中，但 decode 前需通过 RDMA NIC loopback 读取到 staging buffer（模拟从远端节点的全量预取）
+- **Local 请求**（概率 = `local_ratio`）：KV 在 host pool（pinned DRAM）中直接可用，无需 RDMA
+- **Remote 请求**（概率 = `1 - local_ratio`）：KV 存在本机 DRAM 的 RDMA MR 中模拟远端，decode 前需一次性 RDMA loopback 全量拉回
 
-通过调节"本地缓存比例"（0%–100%），可以模拟不同的分布式内存池配置。
+同一请求的全部 KV 要么全在本地，要么全在远端，符合真实分布式语义。通过调节 `local_ratio`（0%–100%）模拟不同的命中率配置。
 
-- **数据路径**：本机 DRAM →（RDMA loopback）→ 本地 staging DRAM →（PCIe DMA）→ GPU
-- **问题**：预取了 100% 数据，attention 只用了 1–10%。带宽和本地 DRAM 均被浪费
+- **数据路径**：remote 请求进入 decode 前一次性预取："远端" DRAM →（RDMA loopback）→ 本地 DRAM；之后每步 decode：本地 DRAM →（PCIe DMA）→ GPU
+- **问题**：一次性预取了 100% 数据，但每步 attention 只用了 1–10%。带宽和本地 DRAM 均被浪费
 
 > RDMA 是消息语义，每次传输都有 μs 级的 per-message 协议开销。DeepSeek-V3.2 有 61 层 transformer，如果每层都发一次 RDMA 请求取 top-k，仅协议开销就是 61 × 数μs = 数百μs，远超 sparse attention 本身的计算时间。因此 RDMA 只能做全量预取，逐层按需取不可行。
 >
@@ -126,11 +126,11 @@ HiSparse 的默认模式。Prefill 后全量 KV 备份到 CPU pinned memory（`c
 | 环节               | A: DRAM                 | B: RDMA 分布式池（loopback 模拟） | C: CXL                 |
 | ---------------- | ----------------------- | ------------------------------ | ---------------------- |
 | Prefill 后 backup | GPU → DRAM              | GPU → DRAM（本地+"远端"两部分）        | GPU → CXL              |
-| Decode 每步预取      | 无（数据已在本地）               | "远端"部分 → RDMA loopback → staging（**全量**） | 无（CXL 按需访问）     |
-| 每层 swap-in       | DRAM → GPU (top-k miss) | staging DRAM → GPU (top-k miss) | CXL → GPU (top-k miss) |
-| 每步总传输量           | top-k × layers          | **全量 KV** + top-k × layers     | top-k × layers         |
-| 本地 DRAM 占用       | 全量 KV                   | 本地缓存部分 + staging               | ≈ 0（KV 在 CXL）          |
-| 有效带宽利用率          | 100%                    | **1–10%**                      | ≈ 100%                 |
+| Decode 前预取（一次性） | 无（数据已在本地）               | remote 请求：全量 KV → RDMA loopback → 本地 DRAM（**一次性**） | 无（CXL 按需访问）     |
+| 每层 swap-in       | DRAM → GPU (top-k miss) | 本地 DRAM → GPU (top-k miss)（预取后与 A 相同） | CXL → GPU (top-k miss) |
+| 一次性传输量           | 0                       | remote 请求：**全量 KV**（一次性）       | 0                      |
+| 本地 DRAM 占用       | 全量 KV                   | 全量 KV（预取后占用与 A 相同）             | ≈ 0（KV 在 CXL）          |
+| 有效带宽利用率          | 100%                    | 预取：**1–10%**（取 100% 用 1-10%） | ≈ 100%                 |
 
 
 ---
@@ -280,18 +280,18 @@ output = 生成 256 tokens
 
 #### 6.2.3 方案 B（RDMA）的本地缓存比例设置
 
-方案 B 模拟分布式内存池场景。关键变量是**本地 DRAM 缓存了多少比例的 KV Cache**，剩余部分需要通过 RDMA loopback 全量取回。
+方案 B 模拟分布式内存池场景。关键变量是**多少比例的请求的 KV Cache 已在本地**，其余请求的 KV 需通过 RDMA loopback 全量取回。`local_ratio` 控制的是**请求级别**的本地命中率——同一请求的全部 KV 要么全在本地，要么全在远端。
 
-| 配置名称 | 本地 DRAM 比例 | RDMA 预取量 | 模拟场景 |
-|---------|-------------|-----------|---------|
-| B-0 | 0% | 100% 全量 RDMA | 极端：所有 KV 在"远端"，每步全量预取 |
-| B-30 | 30% | 70% RDMA | 典型：本地缓存热数据，多数仍在远端 |
-| B-70 | 70% | 30% RDMA | 乐观：大部分在本地，少量远端 |
-| B-100 | 100% | 0% RDMA | 等价于方案 A（对照） |
+| 配置名称 | 请求本地命中率 | 需 RDMA 的请求比例 | 模拟场景 |
+|---------|-------------|----------------|---------|
+| B-0 | 0% | 100% 请求需 RDMA | 极端：所有请求 KV 在"远端" |
+| B-30 | 30% | 70% 请求需 RDMA | 典型：部分请求 KV 本地命中 |
+| B-70 | 70% | 30% 请求需 RDMA | 乐观：大部分请求本地命中 |
+| B-100 | 100% | 0% | 等价于方案 A（对照） |
 
 **RDMA 预取的执行方式**：
 
-每步 decode 开始前，将"远端部分"（(1 - 本地比例) × 全量 KV）通过 RDMA NIC loopback 从本机"远端 MR"读取到 staging buffer。这真实地执行了 RDMA 传输，产生的延迟是硬件实测值而非模拟注入。
+请求从 staging 完成进入 decode 阶段时，若该请求被标记为 remote，则**一次性**将其全量 KV 通过 RDMA NIC loopback 从本机"远端 MR"读取到 staging buffer 并写回 host pool。之后该请求的所有 decode step 均为本地 DRAM 读取，不再涉及 RDMA。这模拟了真实 PD 分离中 decode 实例从 prefill 实例一次性拉取 KV 的行为。
 
 #### 6.2.4 Round 1：冷启动实验
 
@@ -333,7 +333,7 @@ Round 1 结束后，KV Cache 保留在内存池中。发送**新一批请求**�
 - **TTFT 大幅降低**：prefix 命中 radix cache → prefill 跳过 prefix 计算，仅处理 extend 部分（256-1024 tokens）。三种方案的 TTFT 均大幅降低（prefill 不涉及 host 介质差异）
 - **Decode TBT：A ≈ C << B**——这是核心对比：
   - GPU 几乎完全被 decode 占据（prefill 开销可忽略），RDMA 预取延迟不再被 prefill 计算掩盖
-  - 方案 A/C 每步按需读取 top-k（~几十 μs），方案 B 每步需 RDMA 全量预取（~几百 μs ~ 几 ms）
+  - 方案 A/C 每步按需读取 top-k（~几十 μs），方案 B 的 remote 请求在首步 decode 前有一次性 RDMA 预取延迟（~几百 μs ~ 几 ms），推高整体 TTFT
   - Round 2 的 Decode TBT 差异应**显著大于** Round 1（Round 1 中 prefill 间隔掩盖了部分差异）
 - **Max Concurrency**：C 远超 A/B
   - A：本地 DRAM 存全量 KV → 并发数受限
@@ -385,8 +385,8 @@ Round 1 结束后，KV Cache 保留在内存池中。发送**新一批请求**�
 **预期结果**：
 
 - A（DRAM）：每请求需在本地存全量 KV → 可并发数少
-- B-0（RDMA 0% 本地）：本地仍需 staging area 存全量 KV → 与 A 类似
-- B-30（RDMA 30% 本地）：本地缓存 30% + staging → 介于 A 和 B-0 之间
+- B-0（RDMA 0% 本地命中）：所有请求都需 RDMA 预取全量 KV 到本地，DRAM 占用与 A 类似
+- B-30（RDMA 30% 本地命中）：30% 请求免 RDMA，70% 请求需全量预取
 - C（CXL）：本地仅需 VRAM device buffer → 可并发请求数远超 A/B
 
 #### 6.2.8 消融实验
@@ -402,13 +402,13 @@ Round 1 结束后，KV Cache 保留在内存池中。发送**新一批请求**�
 
 #### 6.2.9 RDMA 全量预取延迟速查表
 
-以 100Gbps IB NIC loopback 为例，RDMA 方案每步 decode 前需全量预取的数据量与延迟：
+以 100Gbps IB NIC loopback 为例，RDMA 方案 remote 请求进入 decode 前需一次性全量预取的数据量与延迟：
 
 | prefix 长度 | 每 token 大小 | 层数 | 全量 KV 大小 | RDMA 传输延迟 (100Gbps) | 备注 |
 |------------|-------------|------|------------|---------------------|------|
 | 4K tokens | 656B | 61 | 155 MB | ~12.4 ms | |
 | 16K tokens | 656B | 61 | 620 MB | ~49.6 ms | |
-| 32K tokens | 656B | 61 | 1.24 GB | ~99.2 ms | **每步 decode 都要等** |
+| 32K tokens | 656B | 61 | 1.24 GB | ~99.2 ms | **一次性延迟，推高 TTFT** |
 | 64K tokens | 656B | 61 | 2.48 GB | ~198.4 ms | |
 
 而 CXL 方案每步 decode 只需读取 top-k × layers 的数据：

@@ -51,10 +51,10 @@
 │   │          │  │ (loopback)   │  │          │                  │
 │   │ pinned   │  │              │  │ CXL mmap │                  │
 │   │ DRAM     │  │ ┌──────────┐ │  │          │                  │
-│   │ (100%    │  │ │本地 DRAM  │ │  │ 全量 KV   │                  │
-│   │  本地)    │  │ │(X% 缓存) │ │  │ 在 CXL   │                  │
+│   │ (100%    │  │ │host pool │ │  │ 全量 KV   │                  │
+│   │  本地)    │  │ │(统一视图) │ │  │ 在 CXL   │                  │
 │   │          │  │ ├──────────┤ │  │          │                  │
-│   │          │  │ │"远端"DRAM │ │  │          │                  │
+│   │          │  │ │remote buf│ │  │          │                  │
 │   │          │  │ │(RDMA MR) │ │  │          │                  │
 │   │          │  │ │ ↕ NIC    │ │  │          │                  │
 │   │          │  │ │ loopback │ │  │          │                  │
@@ -68,7 +68,7 @@
 
 ### 方案 B 的内存布局详解
 
-方案 B 模拟"分布式内存池中，本地 DRAM 缓存了 X% 的 KV Cache"的场景：
+方案 B 模拟"分布式内存池中，X% 的请求 KV 在本地、其余在远端"的场景。`local_ratio` 控制的是**请求级别**的本地命中率——同一请求的全部 KV 要么全在本地，要么全在远端：
 
 ```
 本机 DRAM 布局（方案 B）:
@@ -76,20 +76,25 @@
 ┌─────────────────────────────┐
 │  模型权重 + 其他                │
 ├─────────────────────────────┤
-│  本地 KV Cache 缓存            │  ← X% 的 KV，pinned DRAM
-│  (直接可用，无需 RDMA)          │    配置: rdma_local_ratio
+│  Host Pool (pinned DRAM)     │  ← HiSparse 统一视图，所有请求的 KV
+│  (staging DMA 写入 + decode  │    local 请求直接可用
+│   swap-in 读取)              │    remote 请求 RDMA 预取后可用
 ├─────────────────────────────┤
-│  "远端" KV Cache              │  ← (1-X%) 的 KV，注册为 RDMA MR
-│  (ibv_reg_mr, 模拟远端节点)    │    decode 前需 RDMA READ 到 staging
+│  Remote Buffer (RDMA MR)     │  ← 与 host pool 等大
+│  (ibv_reg_mr, 模拟远端节点)    │    remote 请求的 KV 副本存放于此
 ├─────────────────────────────┤
-│  Staging Buffer              │  ← RDMA READ 目标，pinned DRAM
-│  (每步 decode 前写入)          │    大小 = "远端"部分大小
+│  Staging Buffer (pinned)     │  ← RDMA READ 目标
+│  (一次性预取写入)              │    与 host pool 等大
 └─────────────────────────────┘
 
-每步 Decode 数据流:
-  1. RDMA READ: "远端" MR → NIC loopback → staging buffer
-  2. 合并: staging + 本地缓存 → 完整 KV host pool view
-  3. HiSparse swap-in: host pool → GPU (仅 top-k miss)
+请求进入 Decode 前（按请求粒度）:
+  local  请求 → 无操作，KV 已在 host pool
+  remote 请求 → RDMA READ: remote MR → NIC loopback → staging
+                staging → 写回 host pool
+                （一次性，之后与 local 请求行为一致）
+
+Decode 每步（local/remote 一致）:
+  HiSparse swap-in: host pool → GPU (仅 top-k miss)
 ```
 
 ---
@@ -433,14 +438,20 @@ Radix cache eviction（`RadixCache.evict()`）只释放 GPU 侧资源：调用 `
 
 **新文件**：`python/sglang/srt/mem_cache/rdma_memory_pool.py`
 
-这是方案 B 的核心组件。继承 `MLATokenToKVPoolHost`，将 host pool 分为"本地缓存"+"远端 MR"两部分，并在每步 decode 前执行 RDMA loopback 全量预取。
+这是方案 B 的核心组件。继承 `MLATokenToKVPoolHost`，将 host pool 分为"本地缓存"+"远端 MR"两部分。在请求进入 decode 阶段之前，**一次性**通过 RDMA loopback 将该请求的远端 KV cache 全量预取到本地 staging buffer。
 
 ```python
 """RDMA distributed memory pool simulation for HiSparse KV Cache.
 
 Simulates a distributed KV Cache pool where only a fraction of
-KV data is cached locally in DRAM, and the rest must be fetched
-via RDMA before each decode step.
+KV data is cached locally in DRAM, and the rest resides on a
+"remote" node and must be fetched via RDMA.
+
+When a request transitions from prefill/staging to decode,
+`prefetch_for_decode()` is called ONCE to bulk-transfer all
+remote KV data into local staging buffer. After this one-time
+prefetch, all subsequent decode steps read from local memory
+(local_cache + staging_buffer) without further RDMA operations.
 
 Uses real RDMA NIC loopback — the "remote" data is stored in a
 local DRAM region registered as an RDMA MR, and fetched through
@@ -479,16 +490,18 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
 
     KV data is split into two regions:
       - local_cache: X% of tokens, pinned DRAM, directly accessible
-      - remote_region: (1-X)% of tokens, RDMA MR, must be RDMA-READ
-        to staging_buffer before HiSparse can read them
+      - remote_region: (1-X)% of tokens, RDMA MR, simulates remote node
 
-    Before each decode step, `prefetch_for_decode()` is called to
-    RDMA READ the remote portion into the staging buffer.
+    Lifecycle:
+      1. Prefill: KV written to local_cache + remote_buffer
+         (remote_buffer simulates "KV stored on remote node")
+      2. Staging→Decode transition: `prefetch_for_decode()` called ONCE
+         per request, bulk RDMA READ remote_buffer → staging_buffer
+      3. All decode steps: HiSparse reads from unified local view
+         = [local_cache | staging_buffer], no further RDMA operations
 
-    After prefetch, HiSparse sees a unified host pool view:
-      - tokens in local_cache → read from local DRAM
-      - tokens in remote_region → read from staging buffer
-      (implemented by updating data_ptrs to point to the right buffer)
+    This models the real PD-disaggregation scenario: decode instance
+    fetches full KV from remote prefill instance once before decoding.
     """
 
     def __init__(
@@ -507,62 +520,70 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         super().__init__(...)
 
     def init_kv_buffer(self):
-        """Allocate KV buffer split into local + remote portions."""
-        total_dims = (self.layer_num, self.size, 1, self.kv_cache_dim)
-
-        # Split token slots: first X% → local, rest → remote
-        local_size = int(self.size * self.local_ratio)
-        remote_size = self.size - local_size
-
-        # local_buffer: pinned DRAM
-        self.local_buffer = torch.empty(
-            (self.layer_num, local_size, 1, self.kv_cache_dim),
+        """Allocate host pool + shadow remote buffer + staging buffer."""
+        # host_pool: pinned DRAM, HiSparse 的统一视图
+        self.kv_buffer = torch.empty(
+            (self.layer_num, self.size, 1, self.kv_cache_dim),
             dtype=self.dtype, pin_memory=True)
 
         # remote_buffer: regular DRAM, registered as RDMA MR
-        self.remote_buffer = torch.empty(
-            (self.layer_num, remote_size, 1, self.kv_cache_dim),
-            dtype=self.dtype)
-        # Register remote_buffer with RDMA NIC
-        # ...
+        # 与 host_pool 等大，用于存放"远端请求"的 KV 副本
+        self.remote_buffer = torch.empty_like(self.kv_buffer)
+        # Register remote_buffer with RDMA NIC ...
 
-        # staging_buffer: pinned DRAM, target for RDMA READ
-        self.staging_buffer = torch.empty_like(self.remote_buffer,
+        # staging_buffer: pinned DRAM, RDMA READ 目标
+        self.staging_buffer = torch.empty_like(self.kv_buffer,
                                                 pin_memory=True)
 
-        # Combine into unified view for HiSparse
-        full_buffer = torch.cat([self.local_buffer, self.staging_buffer], dim=1)
-        return full_buffer
+        # 跟踪哪些请求被标记为"远端"
+        self._remote_reqs = set()
+        return self.kv_buffer
 
-    def prefetch_for_decode(self, req_token_indices: torch.Tensor):
-        """RDMA READ remote KV data into staging buffer.
+    def mark_request_locality(self, req_pool_idx: int):
+        """Staging 完成时调用，按 local_ratio 概率决定请求是 local 还是 remote."""
+        if random.random() >= self.local_ratio:
+            self._remote_reqs.add(req_pool_idx)
 
-        Called before each decode step. This is the critical path
-        that adds RDMA overhead — the full remote portion is fetched
-        regardless of which tokens will actually be selected by top-k.
+    def simulate_remote_write(self, req_pool_idx: int, seq_len: int):
+        """将 remote 请求的 KV 从 host_pool 拷贝到 remote_buffer（模拟 KV 写入远端）."""
+        if req_pool_idx not in self._remote_reqs:
+            return
+        host_indices = self.req_to_host_pool[req_pool_idx, :seq_len]
+        # kv_buffer[:, host_indices] → remote_buffer[:, host_indices]
+        self.remote_buffer[:, host_indices] = self.kv_buffer[:, host_indices]
 
+    def prefetch_for_decode(self, req_pool_idx: int, seq_len: int):
+        """One-time RDMA READ: fetch remote request's full KV into local.
+
+        Called ONCE per request when transitioning to decode.
+        Local requests skip this entirely (no RDMA overhead).
         Returns: RDMA transfer time in microseconds (for logging).
         """
-        remote_bytes = self.remote_buffer.numel() * self.remote_buffer.element_size()
+        if req_pool_idx not in self._remote_reqs:
+            return 0.0  # local request, no RDMA needed
+        host_indices = self.req_to_host_pool[req_pool_idx, :seq_len]
+        num_tokens = len(host_indices)
+        remote_bytes = (num_tokens * self.layer_num
+                        * self.kv_cache_dim * self.dtype_size)
         rdma_us = self.rdma_ctx.bulk_read(remote_bytes)
-        # Copy remote data to staging (RDMA READ already did this)
-        # Now staging_buffer contains fresh "remote" KV data
+        # RDMA READ: remote_buffer → staging_buffer, then copy back
+        self.kv_buffer[:, host_indices] = self.staging_buffer[:, host_indices]
         return rdma_us
 ```
 
 **设计要点**：
 
-1. **KV buffer 物理分离**：local_buffer（直接可用）+ remote_buffer（RDMA MR）+ staging_buffer（RDMA READ 目标）
-2. **HiSparse 视角统一**：`init_kv_buffer()` 返回 `cat([local_buffer, staging_buffer])`，HiSparse 看到的是一个连续的 host pool，`data_ptrs` 指向这个统一视图
-3. **Prefill 写入**：prefill 时正常写入 full_buffer（= local + staging），然后将 staging 部分拷贝到 remote_buffer（模拟"KV 写入远端"）
-4. **Decode 预取**：每步 decode 前调用 `prefetch_for_decode()`，RDMA READ remote → staging，更新统一视图
-5. **本地比例可配**：`local_ratio` 控制本地缓存多少 KV，0% = 全部远端，100% = 全部本地
+1. **按请求划分 local/remote**：`local_ratio` 控制的是**请求级别**的本地命中率——每个请求的全部 KV 要么全在本地，要么全在远端。`mark_request_locality()` 在 staging 完成时以 `local_ratio` 概率将请求标记为 local，其余标记为 remote。这符合真实分布式场景：同一请求的 KV 在同一个节点上
+2. **HiSparse 视角统一**：`init_kv_buffer()` 返回统一的 pinned DRAM host pool，HiSparse 的 staging DMA 和 decode swap-in 正常工作，无需感知 local/remote 区分
+3. **Remote 模拟**：remote 请求的 KV 在 staging 完成后拷贝到 `remote_buffer`（RDMA MR），模拟"KV 存储在远端节点"
+4. **一次性 RDMA 预取**：remote 请求进入 decode 前，`prefetch_for_decode()` 调用**一次**，RDMA READ 全量 KV 回本地。Local 请求直接跳过，零 RDMA 开销
+5. **本地比例可配**：`local_ratio=0.0`（全部远端，每个请求都需 RDMA）→ `local_ratio=1.0`（全部本地，等同方案 A）
 
 ### 5.3 模块 2：Coordinator 适配（~20 行）
 
 **修改文件**：`python/sglang/srt/managers/hisparse_coordinator.py`
 
-在 Coordinator 的初始化中根据配置选择 host pool 后端，并在 decode 步开始时调用 RDMA 预取：
+在 Coordinator 的初始化中根据配置选择 host pool 后端，并在请求进入 decode 之前一次性 RDMA 预取：
 
 ```python
 # __init__ 中：
@@ -580,10 +601,20 @@ else:
     # 现有 DRAM 路径
     ...
 
-# decode 步回调中（如已有 _eager_backup_previous_token 同级别位置）：
-def _on_decode_step(self, batch):
-    if hasattr(self.mem_pool_host, 'prefetch_for_decode'):
-        self.mem_pool_host.prefetch_for_decode(batch.req_pool_indices)
+# collect_ready_reqs 中，staging 完成、进入 decode 之前：
+def collect_ready_reqs(self) -> List[Req]:
+    # ... (原有 staging 完成检查) ...
+    for req in newly_ready:
+        seq_len = len(req.fill_ids)
+        if hasattr(self.mem_pool_host, 'mark_request_locality'):
+            # 1. 按 local_ratio 概率标记请求为 local/remote
+            self.mem_pool_host.mark_request_locality(req.req_pool_idx)
+            # 2. remote 请求：将 host_pool KV 拷贝到 remote_buffer
+            self.mem_pool_host.simulate_remote_write(req.req_pool_idx, seq_len)
+            # 3. remote 请求：一次性 RDMA READ 拉回本地
+            self.mem_pool_host.prefetch_for_decode(req.req_pool_idx, seq_len)
+        self.alloc_device_buffer(req)
+        # ...
 ```
 
 ### 5.4 模块 3：端到端 Benchmark 脚本（~150 行）
@@ -792,48 +823,65 @@ double rdma_bulk_read(struct rdma_context *rctx, size_t total_bytes) {
 
 ### 6.2 本地缓存比例的实现方式
 
-KV Cache 的 token slot 按比例划分为"本地"和"远端"：
+`local_ratio` 控制的是**请求级别**的本地命中率，而非 token 级别的内存划分。同一个请求的全部 KV 要么全在本地 DRAM，要么全在远端——这符合真实分布式内存池的语义（同一请求的 KV 存储在同一个节点上）。
 
 ```
-total_slots = max_total_num_tokens × host_to_device_ratio
+请求到达，staging 完成时：
+  以 local_ratio 概率 → 标记为 local（KV 已在本地 DRAM，无需 RDMA）
+  以 (1-local_ratio) 概率 → 标记为 remote
 
-local_slots  = int(total_slots × local_ratio)
-remote_slots = total_slots - local_slots
+Local 请求:
+  staging → host_pool                      （直接可用）
+  decode: swap-in 从 host_pool 读取         （本地 DRAM 访问）
 
-Prefill 写入:
-  token 0 ~ local_slots-1     → 写入 local_buffer (pinned DRAM)
-  token local_slots ~ total-1 → 写入 remote_buffer (RDMA MR)
-                                + 拷贝到 staging_buffer 初始化
-
-Decode 每步:
-  1. RDMA READ: remote_buffer → staging_buffer (全量, 模拟远端预取)
-  2. HiSparse 从 unified_view = [local_buffer | staging_buffer] 读 top-k
+Remote 请求:
+  staging → host_pool → 拷贝到 remote_buffer （模拟"KV 写入远端"）
+  进入 decode 前（一次性）:
+    RDMA READ: remote_buffer → staging_buffer → 写回 host_pool
+  decode: swap-in 从 host_pool 读取          （已拉回本地）
 ```
 
-**token 分配策略**：token 按 slot index 自然落入 local 或 remote 区域。由于 NSA 的 top-k 选择是 query-aware 的随机模式，本地 vs 远端的 token 被选中的概率与 `local_ratio` 成正比——这自然模拟了"热数据在本地、冷数据在远端"的分布式缓存语义。
+**实验中的配置**：
+- `local_ratio=0.0`（B-0）：所有请求都需 RDMA 预取，最大化暴露 RDMA 开销
+- `local_ratio=0.3`（B-30）：30% 请求本地命中，70% 需 RDMA，模拟部分缓存命中
+- `local_ratio=1.0`（B-100）：等同方案 A（全部本地），作为 RDMA 方案的上界基线
 
 ### 6.3 RDMA 预取的触发时机
 
-在 HiSparse 的 decode 路径中，`prefetch_for_decode()` 在以下位置调用：
+`prefetch_for_decode()` 在请求从 staging 完成进入 decode 阶段时**调用一次**，而非每步 decode 重复调用：
 
 ```python
-# hisparse_coordinator.py 中的 decode 步流程（简化）:
+# hisparse_coordinator.py — collect_ready_reqs（简化）:
 
+def collect_ready_reqs(self) -> List[Req]:
+    ready_reqs = []
+    for req in staging_completed_reqs:
+        seq_len = len(req.fill_ids)
+        if hasattr(self.mem_pool_host, 'mark_request_locality'):
+            # ★ 按 local_ratio 标记 local/remote
+            self.mem_pool_host.mark_request_locality(req.req_pool_idx)
+            # ★ remote 请求：host_pool → remote_buffer（模拟远端写入）
+            self.mem_pool_host.simulate_remote_write(req.req_pool_idx, seq_len)
+            # ★ remote 请求：RDMA READ remote → local（一次性预取）
+            #   local 请求：直接跳过，零开销
+            self.mem_pool_host.prefetch_for_decode(req.req_pool_idx, seq_len)
+
+        self.alloc_device_buffer(req)
+        ready_reqs.append(req)
+    return ready_reqs
+
+# 之后的每步 decode（不涉及 RDMA，local/remote 请求行为一致）:
 def _process_decode_step(self, batch):
-    # 1. 备份上一步新生成的 token KV 到 host
     self._eager_backup_previous_token(batch)
-
-    # 2. [新增] RDMA 预取（仅方案 B）
-    if hasattr(self.mem_pool_host, 'prefetch_for_decode'):
-        self.mem_pool_host.prefetch_for_decode(batch)
-
-    # 3. 逐层执行 sparse attention
     for layer_id in range(self.num_layers):
         self.swap_in_selected_pages(layer_id, ...)
-        # attention computation ...
+        # swap-in 从 host_pool 读取，全部是本地 DRAM 操作
 ```
 
-**关键**：RDMA 预取在所有层的 swap-in 之前一次性完成（全量预取），这正是 RDMA 方案的标准做法——因为 RDMA 无法逐层按需取。
+**关键**：
+- **按请求划分**：同一请求的全部 KV 要么全在本地、要么全需 RDMA，符合真实分布式语义
+- **一次性开销**：remote 请求的 RDMA READ 在进入 decode 前完成一次，之后所有 decode step 都是本地内存操作
+- **开销体现**：RDMA 的代价是**请求级的一次性延迟**（影响该请求的首步 decode / TTFT），local 请求无任何额外开销
 
 ---
 
