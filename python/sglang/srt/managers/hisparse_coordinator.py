@@ -40,6 +40,8 @@ class PrefixHostCacheEntry:
     cache_key: PrefixHostCacheKey
     host_indices: torch.Tensor  # shape (prefix_len,), on coordinator device
     ref_count: int = 0
+    restored_device_block: Optional[torch.Tensor] = None
+    restored_prefix_len: int = 0
 
 
 @dataclass
@@ -165,11 +167,6 @@ class HiSparseCoordinator:
         self.prefix_host_cache: Dict[PrefixHostCacheKey, PrefixHostCacheEntry] = {}
         # Per-request: tracks which prefix_host_cache entry the request uses.
         self.req_prefix_info: Dict[int, ReqPrefixInfo] = {}
-        # Spare hisparse slots from page-aligned prefix reload allocations.
-        self._reload_spare_hisparse_indices = torch.empty(
-            (0,), dtype=torch.int64, device=device
-        )
-
     def _make_prefix_cache_key(
         self, req: Req, token_ids: Tuple[int, ...]
     ) -> PrefixHostCacheKey:
@@ -199,29 +196,34 @@ class HiSparseCoordinator:
                 best_entry = entry
         return best_key, best_entry
 
-    def _alloc_reload_hisparse_slots(self, need_size: int) -> torch.Tensor:
-        if need_size <= 0:
-            return torch.empty((0,), dtype=torch.int64, device=self.device)
+    def _ensure_restored_device_block(
+        self, entry: PrefixHostCacheEntry, prefix_len: int
+    ) -> torch.Tensor:
+        page_size = self.mem_pool_device.page_size
+        alloc_size = ((prefix_len + page_size - 1) // page_size) * page_size
 
-        candidate = self._reload_spare_hisparse_indices
-        if candidate.numel() < need_size:
-            page_size = self.mem_pool_device.page_size
-            extra_need = need_size - candidate.numel()
-            alloc_size = ((extra_need + page_size - 1) // page_size) * page_size
-            extra = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-                alloc_size
-            )
-            if extra is None:
-                raise RuntimeError(
-                    f"HiSparse prefix reload failed: need {alloc_size} device slots"
-                )
-            candidate = (
-                torch.cat([candidate, extra]) if candidate.numel() > 0 else extra
+        if (
+            entry.restored_device_block is not None
+            and entry.restored_device_block.numel() >= alloc_size
+            and entry.restored_prefix_len >= prefix_len
+        ):
+            return entry.restored_device_block[:prefix_len]
+
+        if entry.restored_device_block is not None:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(
+                entry.restored_device_block
             )
 
-        used = candidate[:need_size]
-        self._reload_spare_hisparse_indices = candidate[need_size:]
-        return used
+        block = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+            alloc_size
+        )
+        if block is None:
+            raise RuntimeError(
+                f"HiSparse prefix reload failed: need {alloc_size} device slots"
+            )
+        entry.restored_device_block = block
+        entry.restored_prefix_len = prefix_len
+        return block[:prefix_len]
 
     def _restore_prefix_kv_for_prefill(
         self,
@@ -246,25 +248,28 @@ class HiSparseCoordinator:
         if not torch.any(missing_mask):
             return 0
 
-        missing_logical = logical_prefix[missing_mask]
-        missing_host = entry.host_indices[:prefix_len][missing_mask].contiguous()
-        missing_device = self._alloc_reload_hisparse_slots(
-            int(missing_logical.numel())
-        ).contiguous()
+        restored_device = self._ensure_restored_device_block(entry, prefix_len).contiguous()
+        old_positive = torch.unique(mapping[mapping > 0])
+        if old_positive.numel() > 0:
+            to_free_mask = ~torch.isin(old_positive, restored_device)
+            to_free = old_positive[to_free_mask]
+            if to_free.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(to_free)
 
         self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
-            missing_logical
-        ] = missing_device
+            logical_prefix
+        ] = restored_device
 
+        host_prefix = entry.host_indices[:prefix_len].contiguous()
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
-                missing_host,
-                missing_device,
+                host_prefix,
+                restored_device,
                 layer_id,
                 io_backend="kernel",
             )
-        return int(missing_logical.numel())
+        return int(prefix_len)
 
     def prepare_prefill_prefix_mappings(self, reqs: List[Req]) -> None:
         """Restore prefix logical->device mappings before alloc_for_extend.
@@ -1035,6 +1040,10 @@ class HiSparseCoordinator:
                 if entry.host_indices.numel() > 0:
                     self.mem_pool_host.free(entry.host_indices)
                     freed += entry.host_indices.numel()
+                if entry.restored_device_block is not None:
+                    self.token_to_kv_pool_allocator.free_hisparse_indices(
+                        entry.restored_device_block
+                    )
         for key in to_delete:
             del self.prefix_host_cache[key]
         if freed > 0:
