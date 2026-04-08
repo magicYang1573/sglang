@@ -201,6 +201,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])
+        elif len(hisparse_indices) == 0:
+            # Prefix-hit with no extend: allocate a fresh device buffer entirely.
+            buffer_indices = self.hisparse_attn_allocator.alloc(need_size)
+            assert (
+                buffer_indices is not None
+            ), "Hisparse allocation failed in alloc_device_buffer (prefix-hit, no extend)"
         else:
             # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size

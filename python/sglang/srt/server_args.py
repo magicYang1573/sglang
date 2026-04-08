@@ -6184,9 +6184,11 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
-            assert (
-                self.disable_radix_cache
-            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "HiSparse with radix cache enabled (prefix caching mode). "
+                    "Prefix KV will be shared in the host pool via reference counting."
+                )
             for attr, label in [
                 ("nsa_prefill_backend", "prefill"),
                 ("nsa_decode_backend", "decode"),

@@ -1,7 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import Dict, List, NamedTuple, Optional
+from dataclasses import dataclass
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -19,6 +20,30 @@ from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PrefixHostCacheEntry:
+    """Tracks a shared prefix's host pool slots for reference-counted reuse.
+
+    When the first request with a given prefix completes staging, its prefix
+    portion's host indices are registered here.  Subsequent requests that hit
+    the same prefix in the radix cache reuse these host indices directly
+    (no DMA), and only stage the extend portion.
+
+    ref_count tracks how many in-flight requests reference this entry.
+    When it drops to 0 the host slots can be reclaimed.
+    """
+    token_ids: Tuple[int, ...]
+    host_indices: torch.Tensor  # shape (prefix_len,), on coordinator device
+    ref_count: int = 0
+
+
+@dataclass
+class ReqPrefixInfo:
+    """Per-request record of which prefix host cache entry it references."""
+    cache_key: Optional[Tuple[int, ...]] = None
+    prefix_len: int = 0
 
 
 class HiSparseAct(NamedTuple):
@@ -130,6 +155,14 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
 
+        # --- Prefix caching support ---
+        # Maps prefix token tuple -> PrefixHostCacheEntry.
+        # When radix cache is enabled, prefix-hit requests reuse host indices
+        # from the first cold-start request instead of re-staging them.
+        self.prefix_host_cache: Dict[Tuple[int, ...], PrefixHostCacheEntry] = {}
+        # Per-request: tracks which prefix_host_cache entry the request uses.
+        self.req_prefix_info: Dict[int, ReqPrefixInfo] = {}
+
     def _init_cxl_host_pool(
         self,
         cxl_config: Dict,
@@ -181,20 +214,94 @@ class HiSparseCoordinator:
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
+        total_len = len(req.fill_ids)
+        prefix_len = len(req.prefix_indices)
+
         logical_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, :total_len
         ]
+
+        # --- Prefix-hit path ---
+        # If radix cache matched a prefix, try to reuse host pool entries.
+        prefix_cache_key = None
+        if prefix_len > 0:
+            prefix_cache_key = tuple(req.fill_ids[:prefix_len])
+            entry = self.prefix_host_cache.get(prefix_cache_key)
+            if entry is not None and len(entry.host_indices) >= prefix_len:
+                # Reuse prefix host indices: no DMA needed for prefix portion.
+                entry.ref_count += 1
+                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                    cache_key=prefix_cache_key,
+                    prefix_len=prefix_len,
+                )
+                self.req_to_host_pool[
+                    req.req_pool_idx, :prefix_len
+                ] = entry.host_indices[:prefix_len]
+
+                # Only stage the extend portion (tokens after prefix).
+                extend_len = total_len - prefix_len
+                if extend_len > 0:
+                    extend_logical = logical_indices[prefix_len:]
+                    extend_device = (
+                        self.mem_pool_device._translate_loc_to_hisparse_device(
+                            extend_logical
+                        )
+                    )
+                    extend_host = self.mem_pool_host.alloc(extend_len)
+                    if extend_host is None:
+                        logger.error(
+                            "HiSparse: host alloc failed for %d extend tokens (req %s)",
+                            extend_len, req.rid,
+                        )
+                        raise RuntimeError(
+                            f"HiSparse host alloc failed for {extend_len} extend tokens"
+                        )
+                    extend_host = extend_host.to(device=self.device)
+                    self.req_to_host_pool[
+                        req.req_pool_idx, prefix_len:total_len
+                    ] = extend_host
+
+                    start_event = device_module.Event()
+                    finish_event = device_module.Event()
+                    start_event.record()
+                    with device_module.stream(self.write_staging_stream):
+                        start_event.wait(self.write_staging_stream)
+                        self.mem_pool_host.backup_from_device_all_layer(
+                            self.mem_pool_device, extend_host, extend_device,
+                            io_backend="kernel",
+                        )
+                        finish_event.record()
+                        if extend_host.is_cuda:
+                            extend_host.record_stream(self.write_staging_stream)
+                        if extend_device.is_cuda:
+                            extend_device.record_stream(self.write_staging_stream)
+                else:
+                    # Pure prefix hit, no extend: staging completes immediately.
+                    start_event = device_module.Event()
+                    finish_event = device_module.Event()
+                    start_event.record()
+                    finish_event.record()
+
+                logger.debug(
+                    "HiSparse prefix-hit: req %s reuses %d prefix host slots, "
+                    "staging %d extend tokens",
+                    req.rid, prefix_len, total_len - prefix_len,
+                )
+                self.ack_staging_queue.append(
+                    HiSparseAct(start_event, finish_event, req)
+                )
+                return
+
+        # --- Cold-start path (no prefix hit or prefix cache not populated) ---
         device_indices = self.mem_pool_device._translate_loc_to_hisparse_device(
             logical_indices
         )
-
         prefill_len = len(device_indices)
         host_indices = self.mem_pool_host.alloc(prefill_len)
         if host_indices is None:
             logger.error(
                 "HiSparse: host mem pool alloc failed for %d tokens (req %s)",
-                prefill_len,
-                req.rid,
+                prefill_len, req.rid,
             )
             raise RuntimeError(
                 f"HiSparse host mem pool alloc failed for {prefill_len} tokens"
@@ -208,7 +315,8 @@ class HiSparseCoordinator:
         with device_module.stream(self.write_staging_stream):
             start_event.wait(self.write_staging_stream)
             self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, io_backend="kernel"
+                self.mem_pool_device, host_indices, device_indices,
+                io_backend="kernel",
             )
             finish_event.record()
             if host_indices.is_cuda:
@@ -216,13 +324,65 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
+        # Register prefix portion in host cache for future reuse.
+        if prefix_len > 0 and prefix_cache_key is not None:
+            if prefix_cache_key not in self.prefix_host_cache:
+                self.prefix_host_cache[prefix_cache_key] = PrefixHostCacheEntry(
+                    token_ids=prefix_cache_key,
+                    host_indices=host_indices[:prefix_len].clone(),
+                    ref_count=1,
+                )
+                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                    cache_key=prefix_cache_key,
+                    prefix_len=prefix_len,
+                )
+            else:
+                # Another request already registered this prefix concurrently.
+                entry = self.prefix_host_cache[prefix_cache_key]
+                entry.ref_count += 1
+                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                    cache_key=prefix_cache_key,
+                    prefix_len=prefix_len,
+                )
+        elif prefix_len == 0 and total_len > 0:
+            # No radix cache match at all — register full sequence as potential prefix.
+            full_key = tuple(req.fill_ids[:total_len])
+            if full_key not in self.prefix_host_cache:
+                self.prefix_host_cache[full_key] = PrefixHostCacheEntry(
+                    token_ids=full_key,
+                    host_indices=host_indices[:total_len].clone(),
+                    ref_count=1,
+                )
+                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                    cache_key=full_key,
+                    prefix_len=total_len,
+                )
+
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
     def alloc_device_buffer(self, req: Req) -> None:
-        allocated_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_allocated_len
-        ]
         page_size = self.mem_pool_device.page_size
+
+        # Determine if this is a prefix-hit request.
+        pinfo = self.req_prefix_info.get(req.req_pool_idx)
+        is_prefix_hit = (
+            pinfo is not None
+            and pinfo.prefix_len > 0
+            and pinfo.prefix_len < req.kv_allocated_len
+        )
+
+        if is_prefix_hit:
+            # Prefix-hit: only pass extend indices to device buffer allocation.
+            # The prefix KV is in host pool and will be swap-in'd on demand.
+            extend_start = pinfo.prefix_len
+            allocated_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, extend_start : req.kv_allocated_len
+            ]
+        else:
+            allocated_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.kv_allocated_len
+            ]
+
         # Allocate only enough for current tokens (page-aligned).
         # When prefill already fills device_buffer_size, include the reserved page.
         alloc_size = min(
@@ -248,9 +408,16 @@ class HiSparseCoordinator:
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
 
-        self.req_device_buffer_tokens[
-            :, req.req_pool_idx, : self.device_buffer_size
-        ] = torch.arange(self.device_buffer_size, device=self.device)
+        if is_prefix_hit:
+            # Prefix-hit: initialize device buffer tokens to -1 (empty).
+            # First decode step will swap-in the needed top-k from host pool.
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = -1
+        else:
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = torch.arange(self.device_buffer_size, device=self.device)
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
@@ -560,11 +727,37 @@ class HiSparseCoordinator:
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
-        # Free host memory that was allocated during admit_request_into_staging
-        host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
-        host_indices = host_indices[host_indices >= 0]
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
+        # Clean up prefix cache reference if applicable.
+        pinfo = self.req_prefix_info.pop(req.req_pool_idx, None)
+        prefix_len = pinfo.prefix_len if pinfo is not None else 0
+        prefix_cache_key = pinfo.cache_key if pinfo is not None else None
+
+        # Free extend portion only (prefix portion managed by ref count).
+        if prefix_len < req.kv_allocated_len:
+            extend_host = self.req_to_host_pool[
+                req.req_pool_idx, prefix_len : req.kv_allocated_len
+            ]
+            extend_host = extend_host[extend_host >= 0]
+            if extend_host.numel() > 0:
+                self.mem_pool_host.free(extend_host)
+
+        if prefix_cache_key is not None and prefix_cache_key in self.prefix_host_cache:
+            entry = self.prefix_host_cache[prefix_cache_key]
+            entry.ref_count -= 1
+            if entry.ref_count <= 0:
+                prefix_host = entry.host_indices
+                if prefix_host.numel() > 0:
+                    self.mem_pool_host.free(prefix_host)
+                del self.prefix_host_cache[prefix_cache_key]
+        elif prefix_len == 0:
+            # No prefix tracking — free all host indices (original behavior).
+            host_indices = self.req_to_host_pool[
+                req.req_pool_idx, : req.kv_allocated_len
+            ]
+            host_indices = host_indices[host_indices >= 0]
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
@@ -592,10 +785,42 @@ class HiSparseCoordinator:
             allocated_locs
         ] = 0
 
-        host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
-        host_indices = host_indices[host_indices >= 0]
-        if host_indices.numel() > 0:
-            self.mem_pool_host.free(host_indices)
+        # Free host pool indices with prefix-aware reference counting.
+        pinfo = self.req_prefix_info.pop(req.req_pool_idx, None)
+        prefix_len = pinfo.prefix_len if pinfo is not None else 0
+        prefix_cache_key = pinfo.cache_key if pinfo is not None else None
+
+        # Free extend portion (non-prefix host indices).
+        if prefix_len < req.kv_allocated_len:
+            extend_host = self.req_to_host_pool[
+                req.req_pool_idx, prefix_len : req.kv_allocated_len
+            ]
+            extend_host = extend_host[extend_host >= 0]
+            if extend_host.numel() > 0:
+                self.mem_pool_host.free(extend_host)
+
+        # Decrement prefix host cache ref_count; free if no more references.
+        if prefix_cache_key is not None and prefix_cache_key in self.prefix_host_cache:
+            entry = self.prefix_host_cache[prefix_cache_key]
+            entry.ref_count -= 1
+            if entry.ref_count <= 0:
+                prefix_host = entry.host_indices
+                if prefix_host.numel() > 0:
+                    self.mem_pool_host.free(prefix_host)
+                del self.prefix_host_cache[prefix_cache_key]
+                logger.debug(
+                    "HiSparse: prefix cache entry evicted (key len=%d, ref dropped to 0)",
+                    len(prefix_cache_key),
+                )
+        elif prefix_len == 0:
+            # No prefix tracking — free all host indices (original behavior).
+            host_indices = self.req_to_host_pool[
+                req.req_pool_idx, : req.kv_allocated_len
+            ]
+            host_indices = host_indices[host_indices >= 0]
+            if host_indices.numel() > 0:
+                self.mem_pool_host.free(host_indices)
+
         # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
