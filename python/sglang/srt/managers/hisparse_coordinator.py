@@ -567,9 +567,24 @@ class HiSparseCoordinator:
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
-        allocated_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.kv_allocated_len
-        ]
+        pinfo = self.req_prefix_info.get(req.req_pool_idx)
+        is_prefix_hit = (
+            pinfo is not None
+            and pinfo.prefix_len > 0
+            and pinfo.prefix_len < req.kv_allocated_len
+        )
+        if is_prefix_hit:
+            # Prefix-hit requests should not consume the shared/restored prefix
+            # device block as part of their private device buffer. The device
+            # buffer only manages extend tokens; prefix tokens are served from
+            # host (or eagerly materialized for short-seq fast path).
+            allocated_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, pinfo.prefix_len : req.kv_allocated_len
+            ]
+        else:
+            allocated_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : req.kv_allocated_len
+            ]
         page_size = self.mem_pool_device.page_size
         # Allocate only enough for current tokens (page-aligned).
         # When prefill already fills device_buffer_size, include the reserved page.
@@ -595,17 +610,6 @@ class HiSparseCoordinator:
 
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
-
-        # Determine if this is a prefix-hit request.
-        # Prefix-hit requests have some tokens whose KV data is only in the
-        # host pool (not in the device buffer), so we initialize device_buffer_tokens
-        # to -1 and let the first decode step swap-in the needed top-k.
-        pinfo = self.req_prefix_info.get(req.req_pool_idx)
-        is_prefix_hit = (
-            pinfo is not None
-            and pinfo.prefix_len > 0
-            and pinfo.prefix_len < req.kv_allocated_len
-        )
 
         if is_prefix_hit:
             self.req_device_buffer_tokens[
