@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Two-round e2e benchmark with repeated prompts to shorten Round 1 prefill.
+"""Fast two-round e2e benchmark for repeated-request prefix-cache experiments.
 
-Builds ``--num-unique-prompts`` distinct prompts, then expands to
-``--num-requests`` total HTTP calls per round by repetition. Later repeats hit
-radix cache during Round 1, so full prefill runs only ~once per unique prompt.
+Round 1 (Warmup):
+  Send only ``--num-unique-prompts`` requests, one copy per unique prompt.
+  This populates radix / prefix cache with minimal cold-prefill cost.
 
-Server-side behaviour (e.g. HiSparse RDMA locality per request) is unchanged:
-each HTTP request is still one independent Req.
+Round 2 (Measurement):
+  Expand the same unique prompts to ``--num-requests`` total HTTP requests by
+  repetition, then replay that full repeated sequence on the warmed cache.
+
+Server-side behaviour (e.g. HiSparse RDMA locality / one-time prefetch) is not
+changed: every HTTP request is still one independent Req.
 
 Repeat modes:
-  block       — [A]*k, [B]*k, ... (default; e.g. 8 unique × 64 = 512)
+  block       — [A]*k, [B]*k, ... (default; e.g. 8 unique x 64 = 512)
   interleaved — A,B,C,...,A,B,C,... cycling until num-requests
 
 Usage:
@@ -30,15 +34,18 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-# Same directory as e2e_bench.py → import shared implementation
+# Same directory as e2e_bench.py -> import shared implementation.
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import e2e_bench as eb  # noqa: E402
 
-SGLANG_ROOT = _SCRIPT_DIR.parents[2]
-sys.path.insert(0, str(SGLANG_ROOT / "python"))
+
+def _repeat_counts(num_unique: int, total: int) -> List[int]:
+    base = total // num_unique
+    rem = total % num_unique
+    return [base + (1 if i < rem else 0) for i in range(num_unique)]
 
 
 def expand_repeat_prompts(
@@ -46,11 +53,7 @@ def expand_repeat_prompts(
     total: int,
     mode: str,
 ) -> List[Tuple[str, int, int]]:
-    """Expand ``unique`` prompts to length ``total`` by repetition.
-
-    Each tuple is (text, prompt_len, output_len); repeated entries share the
-    same object references (same strings), matching identical HTTP bodies.
-    """
+    """Expand ``unique`` prompts to length ``total`` by repetition."""
     u = len(unique)
     if u == 0:
         raise ValueError("No unique prompts to expand.")
@@ -58,18 +61,25 @@ def expand_repeat_prompts(
         raise ValueError(
             f"--num-requests ({total}) must be >= --num-unique-prompts ({u})."
         )
+
+    counts = _repeat_counts(u, total)
+
     if mode == "interleaved":
-        return [unique[i % u] for i in range(total)]
+        rem = list(counts)
+        out: List[Tuple[str, int, int]] = []
+        while any(x > 0 for x in rem):
+            for i, prompt in enumerate(unique):
+                if rem[i] > 0:
+                    out.append(prompt)
+                    rem[i] -= 1
+        return out
 
     if mode != "block":
         raise ValueError(f"Unknown repeat mode: {mode}")
 
-    base = total // u
-    rem = total % u
     out: List[Tuple[str, int, int]] = []
-    for i in range(u):
-        cnt = base + (1 if i < rem else 0)
-        out.extend([unique[i]] * cnt)
+    for i, prompt in enumerate(unique):
+        out.extend([prompt] * counts[i])
     return out
 
 
@@ -112,35 +122,49 @@ async def main_async(args):
             seed=args.seed,
         )
 
-    round_prompts = expand_repeat_prompts(
+    round1_prompts = list(unique_prompts)
+    round2_prompts = expand_repeat_prompts(
         unique_prompts, args.num_requests, args.repeat_mode
     )
 
-    prompt_lens = [p[1] for p in round_prompts]
-    output_lens = [p[2] for p in round_prompts]
+    round1_prompt_lens = [p[1] for p in round1_prompts]
+    round1_output_lens = [p[2] for p in round1_prompts]
+    round2_prompt_lens = [p[1] for p in round2_prompts]
+    round2_output_lens = [p[2] for p in round2_prompts]
+
     print(f"  Unique prompts: {len(unique_prompts)}")
-    print(f"  Total requests per round: {len(round_prompts)}  "
-          f"(repeat_mode={args.repeat_mode})")
-    print(f"  Prompt length: min={min(prompt_lens)} max={max(prompt_lens)} "
-          f"mean={int(np.mean(prompt_lens))} tokens")
-    print(f"  Output length: min={min(output_lens)} max={max(output_lens)} "
-          f"mean={int(np.mean(output_lens))} tokens")
-    print(f"\nRound 1 and Round 2 replay the same {len(round_prompts)} requests in order.")
-    print(f"Request rate: {args.request_rate} req/s  |  Max concurrency: {args.max_concurrency}")
+    print(
+        f"  Round 1 requests: {len(round1_prompts)} (warmup only, one per unique prompt)"
+    )
+    print(
+        f"  Round 2 requests: {len(round2_prompts)} "
+        f"(repeat_mode={args.repeat_mode})"
+    )
+    print(
+        f"  Prompt length: min={min(round2_prompt_lens)} max={max(round2_prompt_lens)} "
+        f"mean={int(np.mean(round2_prompt_lens))} tokens"
+    )
+    print(
+        f"  Output length: min={min(round2_output_lens)} max={max(round2_output_lens)} "
+        f"mean={int(np.mean(round2_output_lens))} tokens"
+    )
+    print(
+        f"Request rate: {args.request_rate} req/s  |  Max concurrency: {args.max_concurrency}"
+    )
 
     all_results: Dict = {}
 
     print(f"\n{'#'*60}")
-    print("  ROUND 1: Cold Start")
+    print("  ROUND 1: Warmup (unique requests only)")
     print(f"{'#'*60}")
     r1_results, r1_duration = await eb.run_round(
         url=args.server_url,
-        prompts=round_prompts,
+        prompts=round1_prompts,
         model=args.model,
         request_rate=args.request_rate,
         max_concurrency=args.max_concurrency,
     )
-    r1_metrics = eb.compute_round_metrics("Round 1: Cold Start", r1_results, r1_duration)
+    r1_metrics = eb.compute_round_metrics("Round 1: Warmup", r1_results, r1_duration)
     eb.print_metrics(r1_metrics)
     all_results["round1"] = {
         "metrics": vars(r1_metrics),
@@ -151,16 +175,18 @@ async def main_async(args):
     await asyncio.sleep(args.pause_between_rounds)
 
     print(f"\n{'#'*60}")
-    print("  ROUND 2: Warm Start (same sequence)")
+    print("  ROUND 2: Measurement (repeated requests on warm cache)")
     print(f"{'#'*60}")
     r2_results, r2_duration = await eb.run_round(
         url=args.server_url,
-        prompts=round_prompts,
+        prompts=round2_prompts,
         model=args.model,
         request_rate=args.request_rate,
         max_concurrency=args.max_concurrency,
     )
-    r2_metrics = eb.compute_round_metrics("Round 2: Warm Start", r2_results, r2_duration)
+    r2_metrics = eb.compute_round_metrics(
+        "Round 2: Warm Measurement", r2_results, r2_duration
+    )
     eb.print_metrics(r2_metrics)
     all_results["round2"] = {
         "metrics": vars(r2_metrics),
@@ -170,19 +196,28 @@ async def main_async(args):
     print(f"\n{'='*60}")
     print("  COMPARISON: Round 2 vs Round 1")
     print(f"{'='*60}")
+    print(
+        "  Note: Round 1 is unique-only warmup, Round 2 is full repeated-load measurement; "
+        "throughput is not directly comparable."
+    )
     if r1_metrics.ttft_mean_ms > 0 and r2_metrics.ttft_mean_ms > 0:
         ttft_speedup = r1_metrics.ttft_mean_ms / r2_metrics.ttft_mean_ms
-        print(f"  TTFT speedup:      {ttft_speedup:.2f}x"
-              f"  ({r1_metrics.ttft_mean_ms:.1f} -> {r2_metrics.ttft_mean_ms:.1f} ms)")
-    if r1_metrics.output_throughput_tok_s > 0 and r2_metrics.output_throughput_tok_s > 0:
-        tput_ratio = r2_metrics.output_throughput_tok_s / r1_metrics.output_throughput_tok_s
-        print(f"  Throughput change: {tput_ratio:.2f}x")
+        print(
+            f"  TTFT speedup:      {ttft_speedup:.2f}x"
+            f"  ({r1_metrics.ttft_mean_ms:.1f} -> {r2_metrics.ttft_mean_ms:.1f} ms)"
+        )
     if r1_metrics.tbt_mean_ms > 0 and r2_metrics.tbt_mean_ms > 0:
         tbt_ratio = r1_metrics.tbt_mean_ms / r2_metrics.tbt_mean_ms
-        print(f"  TBT speedup:       {tbt_ratio:.2f}x")
+        print(
+            f"  TBT speedup:       {tbt_ratio:.2f}x"
+            f"  ({r1_metrics.tbt_mean_ms:.1f} -> {r2_metrics.tbt_mean_ms:.1f} ms)"
+        )
     if r1_metrics.e2e_mean_ms > 0 and r2_metrics.e2e_mean_ms > 0:
         e2e_speedup = r1_metrics.e2e_mean_ms / r2_metrics.e2e_mean_ms
-        print(f"  E2E speedup:       {e2e_speedup:.2f}x")
+        print(
+            f"  E2E speedup:       {e2e_speedup:.2f}x"
+            f"  ({r1_metrics.e2e_mean_ms:.1f} -> {r2_metrics.e2e_mean_ms:.1f} ms)"
+        )
 
     all_results["config"] = {
         "variant": "e2e_bench_fast",
@@ -192,6 +227,8 @@ async def main_async(args):
         "local_files_only": args.local_files_only,
         "prompt_mode": args.prompt_mode,
         "target_input_tokens": args.target_input_tokens,
+        "round1_num_requests": len(round1_prompts),
+        "round2_num_requests": len(round2_prompts),
         "num_requests": args.num_requests,
         "num_unique_prompts": args.num_unique_prompts,
         "repeat_mode": args.repeat_mode,
@@ -201,9 +238,13 @@ async def main_async(args):
         "request_rate": args.request_rate,
         "max_concurrency": args.max_concurrency,
         "seed": args.seed,
-        "prompt_stats": {
-            "mean_prompt_len": int(np.mean(prompt_lens)),
-            "mean_output_len": int(np.mean(output_lens)),
+        "round1_prompt_stats": {
+            "mean_prompt_len": int(np.mean(round1_prompt_lens)),
+            "mean_output_len": int(np.mean(round1_output_lens)),
+        },
+        "round2_prompt_stats": {
+            "mean_prompt_len": int(np.mean(round2_prompt_lens)),
+            "mean_output_len": int(np.mean(round2_output_lens)),
         },
     }
 
@@ -235,19 +276,19 @@ def main():
         "--num-requests",
         type=int,
         default=512,
-        help="Total HTTP requests per round (both rounds)",
+        help="Round 2 total HTTP requests (measurement round)",
     )
     p.add_argument(
         "--num-unique-prompts",
         type=int,
         default=8,
-        help="How many distinct prompts to generate before repeating (e.g. 8 with 512 total → 64× each in block mode)",
+        help="Round 1 warmup requests, and unique template count for Round 2 repeats",
     )
     p.add_argument(
         "--repeat-mode",
         choices=("block", "interleaved"),
         default="block",
-        help="block: A…A,B…B; interleaved: A,B,C,A,B,C,…",
+        help="block: A...A,B...B; interleaved: A,B,C,A,B,C,...",
     )
     p.add_argument("--output-tokens", type=int, default=1024)
     p.add_argument("--min-prompt-tokens", type=int, default=64)

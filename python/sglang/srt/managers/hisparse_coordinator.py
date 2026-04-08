@@ -420,9 +420,12 @@ class HiSparseCoordinator:
         prefix_cache_key = None
         if prefix_len > 0:
             prefix_token_ids = tuple(req.fill_ids[:prefix_len])
+            exact_prefix_cache_key = self._make_prefix_cache_key(req, prefix_token_ids)
             prefix_cache_key, entry = self._find_prefix_host_entry(
                 req, prefix_token_ids
             )
+            if prefix_cache_key is None:
+                prefix_cache_key = exact_prefix_cache_key
             if entry is not None and len(entry.host_indices) >= prefix_len:
                 # Reuse prefix host indices: no DMA needed for prefix portion.
                 pinfo = self.req_prefix_info.get(req.req_pool_idx)
