@@ -22,6 +22,9 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 logger = logging.getLogger(__name__)
 
 
+PrefixHostCacheKey = Tuple[Optional[str], Tuple[int, ...]]
+
+
 @dataclass
 class PrefixHostCacheEntry:
     """Tracks a shared prefix's host pool slots for reference-counted reuse.
@@ -34,7 +37,7 @@ class PrefixHostCacheEntry:
     ref_count tracks how many in-flight requests reference this entry.
     When it drops to 0 the host slots can be reclaimed.
     """
-    token_ids: Tuple[int, ...]
+    cache_key: PrefixHostCacheKey
     host_indices: torch.Tensor  # shape (prefix_len,), on coordinator device
     ref_count: int = 0
 
@@ -42,7 +45,7 @@ class PrefixHostCacheEntry:
 @dataclass
 class ReqPrefixInfo:
     """Per-request record of which prefix host cache entry it references."""
-    cache_key: Optional[Tuple[int, ...]] = None
+    cache_key: Optional[PrefixHostCacheKey] = None
     prefix_len: int = 0
 
 
@@ -159,7 +162,7 @@ class HiSparseCoordinator:
         # Maps prefix token tuple -> PrefixHostCacheEntry.
         # When radix cache is enabled, prefix-hit requests reuse host indices
         # from the first cold-start request instead of re-staging them.
-        self.prefix_host_cache: Dict[Tuple[int, ...], PrefixHostCacheEntry] = {}
+        self.prefix_host_cache: Dict[PrefixHostCacheKey, PrefixHostCacheEntry] = {}
         # Per-request: tracks which prefix_host_cache entry the request uses.
         self.req_prefix_info: Dict[int, ReqPrefixInfo] = {}
         # Spare hisparse slots from page-aligned prefix reload allocations.
@@ -167,22 +170,31 @@ class HiSparseCoordinator:
             (0,), dtype=torch.int64, device=device
         )
 
+    def _make_prefix_cache_key(
+        self, req: Req, token_ids: Tuple[int, ...]
+    ) -> PrefixHostCacheKey:
+        return (req.extra_key, token_ids)
+
     def _find_prefix_host_entry(
-        self, prefix_token_ids: Tuple[int, ...]
-    ) -> Tuple[Optional[Tuple[int, ...]], Optional[PrefixHostCacheEntry]]:
+        self, req: Req, prefix_token_ids: Tuple[int, ...]
+    ) -> Tuple[Optional[PrefixHostCacheKey], Optional[PrefixHostCacheEntry]]:
         """Find a host-cache entry whose token_ids start with the prefix."""
-        exact = self.prefix_host_cache.get(prefix_token_ids)
+        exact_key = self._make_prefix_cache_key(req, prefix_token_ids)
+        exact = self.prefix_host_cache.get(exact_key)
         if exact is not None and len(exact.host_indices) >= len(prefix_token_ids):
-            return prefix_token_ids, exact
+            return exact_key, exact
 
         best_key = None
         best_entry = None
         for key, entry in self.prefix_host_cache.items():
-            if len(key) < len(prefix_token_ids):
+            extra_key, token_ids = key
+            if extra_key != req.extra_key:
                 continue
-            if key[: len(prefix_token_ids)] != prefix_token_ids:
+            if len(token_ids) < len(prefix_token_ids):
                 continue
-            if best_key is None or len(key) < len(best_key):
+            if token_ids[: len(prefix_token_ids)] != prefix_token_ids:
+                continue
+            if best_key is None or len(token_ids) < len(best_key[1]):
                 best_key = key
                 best_entry = entry
         return best_key, best_entry
@@ -260,7 +272,7 @@ class HiSparseCoordinator:
                 continue
 
             prefix_token_ids = tuple(req.fill_ids[:prefix_len])
-            cache_key, entry = self._find_prefix_host_entry(prefix_token_ids)
+            cache_key, entry = self._find_prefix_host_entry(req, prefix_token_ids)
             if entry is None:
                 continue
 
@@ -337,7 +349,9 @@ class HiSparseCoordinator:
         prefix_cache_key = None
         if prefix_len > 0:
             prefix_token_ids = tuple(req.fill_ids[:prefix_len])
-            prefix_cache_key, entry = self._find_prefix_host_entry(prefix_token_ids)
+            prefix_cache_key, entry = self._find_prefix_host_entry(
+                req, prefix_token_ids
+            )
             if entry is not None and len(entry.host_indices) >= prefix_len:
                 # Reuse prefix host indices: no DMA needed for prefix portion.
                 pinfo = self.req_prefix_info.get(req.req_pool_idx)
@@ -441,7 +455,7 @@ class HiSparseCoordinator:
         if prefix_len > 0 and prefix_cache_key is not None:
             if prefix_cache_key not in self.prefix_host_cache:
                 self.prefix_host_cache[prefix_cache_key] = PrefixHostCacheEntry(
-                    token_ids=prefix_cache_key,
+                    cache_key=prefix_cache_key,
                     host_indices=host_indices[:prefix_len].clone(),
                     ref_count=1,
                 )
@@ -455,10 +469,12 @@ class HiSparseCoordinator:
             # Keep the first cold-start request's full host backup alive so a later
             # prefix-hit request can recover its prefix KV back into device memory
             # before prefill.
-            full_cache_key = tuple(req.fill_ids[:total_len])
+            full_cache_key = self._make_prefix_cache_key(
+                req, tuple(req.fill_ids[:total_len])
+            )
             if full_cache_key not in self.prefix_host_cache:
                 self.prefix_host_cache[full_cache_key] = PrefixHostCacheEntry(
-                    token_ids=full_cache_key,
+                    cache_key=full_cache_key,
                     host_indices=host_indices[:total_len].clone(),
                     ref_count=1,
                 )

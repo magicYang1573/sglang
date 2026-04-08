@@ -44,7 +44,18 @@ class SchedulerRuntimeCheckerMixin:
     def _get_token_info(self: Scheduler):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
+        if getattr(self, "enable_hisparse", False):
+            # HiSparse uses a dual-pool design:
+            # - available_size(): physical hisparse/device-side capacity
+            # - evictable_size(): logical radix-tree capacity
+            #
+            # Adding them together can exceed max_total_num_tokens, which makes
+            # num_used negative and pollutes logs / metrics / prefill-delayer
+            # heuristics. For HiSparse we report physical pool usage here.
+            num_used = self.max_total_num_tokens - available_size
+        else:
+            num_used = self.max_total_num_tokens - (available_size + evictable_size)
+        num_used = max(0, min(self.max_total_num_tokens, num_used))
         token_usage = num_used / self.max_total_num_tokens
         return num_used, token_usage, available_size, evictable_size
 
