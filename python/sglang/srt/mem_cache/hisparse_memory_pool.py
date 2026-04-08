@@ -188,6 +188,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
+    def logical_available_size(self) -> int:
+        """Return the logical allocator's free count for memory accounting.
+
+        The radix cache memory-leak check needs the logical allocator's value
+        (not the min with hisparse) because the tree's evictable/protected
+        accounting is against the logical pool whose size equals
+        max_total_num_tokens * host_to_device_ratio.
+        """
+        return self.logical_attn_allocator.available_size()
+
     def alloc(self, need_size: int):
         raise NotImplementedError(
             "Page size = 1 is not supported in HiSparse allocator"
@@ -198,25 +208,31 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
-        if len(hisparse_indices) >= need_size:
-            buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
-        elif len(hisparse_indices) == 0:
-            # Prefix-hit with no extend: allocate a fresh device buffer entirely.
+
+        # Filter out zero-mapped indices (e.g. from radix cache deduplication
+        # where cache_unfinished_req freed some logical indices and zeroed
+        # their hisparse mappings). Only keep valid (> 0) hisparse device slots.
+        valid_mask = hisparse_indices > 0
+        valid_hisparse = hisparse_indices[valid_mask]
+
+        if len(valid_hisparse) >= need_size:
+            buffer_indices = valid_hisparse[:need_size]
+            self.free_hisparse_indices(valid_hisparse[need_size:])
+        elif len(valid_hisparse) == 0:
             buffer_indices = self.hisparse_attn_allocator.alloc(need_size)
             assert (
                 buffer_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer (prefix-hit, no extend)"
+            ), "Hisparse allocation failed in alloc_device_buffer (no valid existing slots)"
         else:
             # page alignment, claiming the residual space for an incomplete page
-            page_residual_length = len(hisparse_indices) % self.page_size
+            page_residual_length = len(valid_hisparse) % self.page_size
             if page_residual_length != 0:
-                hisparse_indices = torch.cat(
+                valid_hisparse = torch.cat(
                     [
-                        hisparse_indices,
+                        valid_hisparse,
                         torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
+                            valid_hisparse[-1] + 1,
+                            valid_hisparse[-1]
                             + self.page_size
                             - page_residual_length
                             + 1,
@@ -225,12 +241,12 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     ]
                 )
             extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
+                need_size - len(valid_hisparse)
             )
             assert (
                 extra_indices is not None
             ), "Hisparse allocation failed in alloc_device_buffer"
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
+            buffer_indices = torch.cat([valid_hisparse, extra_indices])
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):

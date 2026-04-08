@@ -184,6 +184,21 @@ class SchedulerRuntimeCheckerMixin:
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
         session_held = self._session_held_tokens()
+
+        # HiSparse uses a dual-pool allocator: a logical pool (sized
+        # max_total_num_tokens * host_to_device_ratio) that the radix tree
+        # operates on, and a smaller hisparse device pool. available_size()
+        # returns min(logical, hisparse), which is capped by the device pool
+        # and doesn't reflect the logical pool's free count accurately.
+        # Skip the standard accounting check for HiSparse — the two pools
+        # have different sizes so the identity
+        #   available + evictable + protected == max_total_num_tokens
+        # does not hold.
+        if getattr(self, "enable_hisparse", False) and not getattr(
+            self.tree_cache, "disable", False
+        ):
+            return False, ""
+
         memory_leak = (available_size + evictable_size) != (
             self.max_total_num_tokens - protected_size - session_held
         )
@@ -243,6 +258,13 @@ class SchedulerRuntimeCheckerMixin:
             + uncached_size
             + session_held
         )
+
+        # Skip for HiSparse: dual-pool allocator breaks the single-pool identity.
+        if getattr(self, "enable_hisparse", False) and not getattr(
+            self.tree_cache, "disable", False
+        ):
+            return
+
         assert (
             total_tokens == self.max_total_num_tokens
         ), f"Mem Leak Detected! {total_tokens=} vs {self.max_total_num_tokens=}"

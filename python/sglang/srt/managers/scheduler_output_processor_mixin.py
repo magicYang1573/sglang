@@ -189,9 +189,14 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
+                            # Staging must run BEFORE cache_unfinished_req because
+                            # cache_unfinished_req deduplicates logical indices via
+                            # free(), which zeros full_to_hisparse_device_index_mapping.
+                            # Staging needs the mapping to translate logical→device
+                            # indices for the host backup DMA.
                             self.hisparse_coordinator.admit_request_into_staging(req)
+                        self.tree_cache.cache_unfinished_req(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
