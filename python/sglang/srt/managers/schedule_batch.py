@@ -1554,6 +1554,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.prepare_prefill_prefix_mappings(reqs)
+
         # Allocate memory
         out_cache_loc, req_pool_indices_tensor, req_pool_indices = alloc_for_extend(
             self

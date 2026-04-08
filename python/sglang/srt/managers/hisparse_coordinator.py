@@ -228,14 +228,15 @@ class HiSparseCoordinator:
         req: Req,
         prefix_len: int,
         entry: PrefixHostCacheEntry,
-    ) -> None:
+    ) -> int:
         """Restore missing prefix KV mappings/device data before prefill."""
         if prefix_len <= 0:
-            return
+            return 0
 
-        self.req_to_host_pool[req.req_pool_idx, :prefix_len] = entry.host_indices[
-            :prefix_len
-        ]
+        if req.req_pool_idx is not None:
+            self.req_to_host_pool[req.req_pool_idx, :prefix_len] = entry.host_indices[
+                :prefix_len
+            ]
 
         logical_prefix = req.prefix_indices[:prefix_len]
         mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
@@ -243,7 +244,7 @@ class HiSparseCoordinator:
         ]
         missing_mask = mapping <= 0
         if not torch.any(missing_mask):
-            return
+            return 0
 
         missing_logical = logical_prefix[missing_mask]
         missing_host = entry.host_indices[:prefix_len][missing_mask].contiguous()
@@ -263,6 +264,32 @@ class HiSparseCoordinator:
                 layer_id,
                 io_backend="kernel",
             )
+        return int(missing_logical.numel())
+
+    def prepare_prefill_prefix_mappings(self, reqs: List[Req]) -> None:
+        """Restore prefix logical->device mappings before alloc_for_extend.
+
+        This must run before alloc_for_extend because HiSparse alloc_extend()
+        consults the prefix tail's hisparse mapping to allocate the extend part.
+        """
+        for req in reqs:
+            prefix_len = len(req.prefix_indices)
+            if prefix_len <= 0:
+                continue
+
+            prefix_token_ids = tuple(req.fill_ids[:prefix_len])
+            _, entry = self._find_prefix_host_entry(req, prefix_token_ids)
+            if entry is None:
+                continue
+
+            restored = self._restore_prefix_kv_for_prefill(req, prefix_len, entry)
+            if restored > 0:
+                logger.info(
+                    "HiSparse prefix-cache prefill-restore: req=%s prefix_len=%d restored_tokens=%d",
+                    req.rid,
+                    prefix_len,
+                    restored,
+                )
 
     def prepare_prefill_prefix_kv(self, reqs: List[Req]) -> None:
         """Restore prefix KV from host before a prefix-hit prefill batch runs."""
@@ -284,7 +311,13 @@ class HiSparseCoordinator:
                     prefix_len=prefix_len,
                 )
 
-            self._restore_prefix_kv_for_prefill(req, prefix_len, entry)
+            restored = self._restore_prefix_kv_for_prefill(req, prefix_len, entry)
+            logger.info(
+                "HiSparse prefix-cache active: req=%s prefix_len=%d restored_tokens=%d",
+                req.rid,
+                prefix_len,
+                restored,
+            )
 
     def _init_cxl_host_pool(
         self,
@@ -413,6 +446,12 @@ class HiSparseCoordinator:
                     "HiSparse prefix-hit: req %s reuses %d prefix host slots, "
                     "staging %d extend tokens",
                     req.rid, prefix_len, total_len - prefix_len,
+                )
+                logger.info(
+                    "HiSparse prefix-cache staging-reuse: req=%s prefix_len=%d extend_len=%d",
+                    req.rid,
+                    prefix_len,
+                    total_len - prefix_len,
                 )
                 self.ack_staging_queue.append(
                     HiSparseAct(start_event, finish_event, req)
