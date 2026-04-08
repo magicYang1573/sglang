@@ -198,7 +198,7 @@ class HiSparseCoordinator:
 
     def _ensure_restored_device_block(
         self, entry: PrefixHostCacheEntry, prefix_len: int
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         page_size = self.mem_pool_device.page_size
         alloc_size = ((prefix_len + page_size - 1) // page_size) * page_size
 
@@ -207,12 +207,9 @@ class HiSparseCoordinator:
             and entry.restored_device_block.numel() >= alloc_size
             and entry.restored_prefix_len >= prefix_len
         ):
-            return entry.restored_device_block[:prefix_len]
+            return entry.restored_device_block[:prefix_len], None
 
-        if entry.restored_device_block is not None:
-            self.token_to_kv_pool_allocator.free_hisparse_indices(
-                entry.restored_device_block
-            )
+        old_block = entry.restored_device_block
 
         block = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
             alloc_size
@@ -223,7 +220,7 @@ class HiSparseCoordinator:
             )
         entry.restored_device_block = block
         entry.restored_prefix_len = prefix_len
-        return block[:prefix_len]
+        return block[:prefix_len], old_block
 
     def _restore_prefix_kv_for_prefill(
         self,
@@ -248,8 +245,17 @@ class HiSparseCoordinator:
         if not torch.any(missing_mask):
             return 0
 
-        restored_device = self._ensure_restored_device_block(entry, prefix_len).contiguous()
+        restored_device, retired_block = self._ensure_restored_device_block(
+            entry, prefix_len
+        )
+        restored_device = restored_device.contiguous()
         old_positive = torch.unique(mapping[mapping > 0])
+        if retired_block is not None and retired_block.numel() > 0:
+            old_positive = (
+                torch.unique(torch.cat([old_positive, retired_block]))
+                if old_positive.numel() > 0
+                else torch.unique(retired_block)
+            )
         if old_positive.numel() > 0:
             to_free_mask = ~torch.isin(old_positive, restored_device)
             to_free = old_positive[to_free_mask]
