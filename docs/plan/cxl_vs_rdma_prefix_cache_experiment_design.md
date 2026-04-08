@@ -163,24 +163,27 @@ CXL host pool（`cxl_memory_pool.py`）已实现且与 HiSparse 集成完毕。P
 ### 3.4 Phase 3：RDMA 后端 + Benchmark
 
 
-| 文件                        | 改动量        | 说明                                               |
-| ------------------------- | ---------- | ------------------------------------------------ |
-| `rdma_memory_pool.py`（新增） | ~200 行     | RDMA loopback host pool（local/remote/staging 分层） |
-| `hisparse_coordinator.py` | ~20 行      | 后端选择 + decode prefetch 调用                        |
-| `rdma_scatter_read.c`     | ~40 行      | bulk read 扩展                                     |
-| `e2e_bench.py`（新增）        | ~150 行     | 两轮实验自动化                                          |
-| **Phase 3 合计**            | **~410 行** |                                                  |
+| 文件                              | 改动量        | 说明                                       |
+| ------------------------------- | ---------- | ---------------------------------------- |
+| `rdma_memory_pool.py`（新增）       | ~260 行     | RDMA loopback host pool（local/remote/staging 分层） |
+| `hisparse_coordinator.py`       | ~40 行      | 后端选择 + decode prefetch + cleanup           |
+| `factory.py` + `SparseConfig`   | ~15 行      | rdma_pool JSON 解析 + 互斥校验                   |
+| `model_runner.py`               | ~2 行       | 传递 rdma_config                            |
+| `rdma_scatter_read.c/.h/_py.cpp` | ~60 行      | bulk read 扩展                               |
+| `e2e_bench.py`（新增）              | ~350 行     | 两轮实验自动化，ShareGPT 多样化请求，TTFT/TBT/TPOT      |
+| `run_all_experiments.sh`（新增）    | ~150 行     | 四方案 × 多 prefix 实验矩阵自动化                    |
+| **Phase 3 合计**                  | **~880 行** |                                          |
 
 
 ### 3.5 代码总量
 
 
-| Phase       | 代码量        | 累计     | 关键产出                                            |
-| ----------- | ---------- | ------ | ----------------------------------------------- |
-| **Phase 1** | **~150 行** | ~150 行 | HiSparse + radix cache 兼容，prefix-hit 跳过 prefill |
-| Phase 2     | ~0 行       | ~150 行 | CXL 端到端验证                                       |
-| Phase 3     | ~410 行     | ~560 行 | RDMA 后端 + 实验工具链                                 |
-| Phase 4     | ~0 行       | ~560 行 | 完整实验数据                                          |
+| Phase       | 代码量        | 累计      | 关键产出                                            |
+| ----------- | ---------- | ------- | ----------------------------------------------- |
+| **Phase 1** | **~150 行** | ~150 行  | HiSparse + radix cache 兼容，prefix-hit 跳过 prefill |
+| Phase 2     | ~0 行       | ~150 行  | CXL 端到端验证                                       |
+| Phase 3     | ~880 行     | ~1030 行 | RDMA 后端 + 多样化 e2e benchmark + 实验自动化              |
+| Phase 4     | ~0 行       | ~1030 行 | 完整实验数据                                          |
 
 
 ---
@@ -425,13 +428,16 @@ Radix cache eviction（`RadixCache.evict()`）只释放 GPU 侧资源：调用 `
 ### 5.1 Phase 3 代码量（RDMA 后端 + Benchmark）
 
 
-| 模块                 | 新代码量       | 修改/新增                        | 说明                                |
-| ------------------ | ---------- | ---------------------------- | --------------------------------- |
-| **RDMA Host Pool** | ~200 行     | 新增 `rdma_memory_pool.py`     | 方案 B 的核心：RDMA loopback + 本地缓存分层   |
-| **Coordinator 适配** | ~20 行      | 修改 `hisparse_coordinator.py` | 根据配置选择 A/B/C 后端 + decode prefetch |
-| **Benchmark 脚本**   | ~150 行     | 新增 `e2e_bench.py`            | 两轮实验自动化                           |
-| **RDMA C 扩展**      | ~40 行      | 修改 `rdma_scatter_read.c`     | bulk read 接口                      |
-| **合计**             | **~410 行** | 2 新增 + 2 修改                  |                                   |
+| 模块                 | 新代码量       | 修改/新增                           | 说明                                       |
+| ------------------ | ---------- | ------------------------------- | ---------------------------------------- |
+| **RDMA Host Pool** | ~260 行     | 新增 `rdma_memory_pool.py`        | 方案 B 的核心：RDMA loopback + 本地缓存分层          |
+| **Coordinator 适配** | ~40 行      | 修改 `hisparse_coordinator.py`    | 根据配置选择 A/B/C 后端 + decode prefetch + cleanup |
+| **Config 扩展**      | ~15 行      | 修改 `factory.py` + `SparseConfig` | rdma_pool JSON 解析 + 互斥校验                   |
+| **ModelRunner**     | ~2 行       | 修改 `model_runner.py`           | 传递 rdma_config                            |
+| **RDMA C 扩展**      | ~60 行      | 修改 `.c` + `.h` + `_py.cpp`     | rdma_bulk_read 接口                         |
+| **Benchmark 脚本**   | ~350 行     | 新增 `e2e_bench.py`              | 两轮实验自动化，ShareGPT 多样化请求，TTFT/TBT/TPOT      |
+| **自动化脚本**         | ~150 行     | 新增 `run_all_experiments.sh`     | 四方案 × 多 prefix 完整实验矩阵                    |
+| **合计**             | **~880 行** | 3 新增 + 5 修改                    |                                          |
 
 
 ### 5.2 模块 1：RDMAMLATokenToKVPoolHost（~200 行）
@@ -617,152 +623,91 @@ def collect_ready_reqs(self) -> List[Req]:
         # ...
 ```
 
-### 5.4 模块 3：端到端 Benchmark 脚本（~150 行）
+### 5.4 模块 3：端到端 Benchmark 脚本（~350 行）
 
 **新文件**：`test/cxl_utils/e2e_bench.py`
 
-自动化两轮实验，向运行中的 SGLang 服务器发送请求并收集指标。
+自动化两轮实验，向运行中的 SGLang 服务器发送请求并收集精细指标。
 
-```python
-"""Two-round end-to-end benchmark: cold start + prefix cache hit.
+#### 5.4.1 设计原则
 
-Round 1 (Cold):
-  Send N requests with shared prefix → full prefill → KV stored
-  Measure: TTFT, Decode TBT, Total Throughput
+1. **两轮请求完全相同**：Round 1 和 Round 2 发送**完全一致**的 N 个请求（同一批 prompt，同一顺序），Round 2 因此能命中 Round 1 建立的 prefix cache
+2. **单 round 内请求各不相同**：N 个 prompt 来自 ShareGPT 数据集的 N 条不同对话，每条内容唯一，不存在公共 system prompt
+3. **cache 粒度为请求自身**：每个请求的 prefix cache key 是其自身 token 序列，Round 2 复用 Round 1 留下的完整 KV，prefill 跳过，仅计算 extend（即新生成的 output tokens 中的 decode 部分）
+4. **精细指标**：通过 streaming API 逐 token 计时，测量 TTFT、TBT、TPOT、E2E latency、吞吐
+5. **复用 bench_serving 生态**：使用 sglang 的 `benchmark.utils` 自动下载 ShareGPT 数据集、tokenizer
 
-Round 2 (Warm):
-  Send M new requests with same prefix → prefix cache hit
-  Measure: TTFT (should drop), Decode TBT, Max Concurrency
+#### 5.4.2 请求构造
 
-Usage:
-  python e2e_bench.py \
+```
+N 个 prompt（从 ShareGPT 采样，一次采样，两轮共用）:
+  prompt_0 = sharegpt_conversation[0].user_turn   ← 独立对话，互不相关
+  prompt_1 = sharegpt_conversation[1].user_turn
+  ...
+  prompt_{N-1} = sharegpt_conversation[N-1].user_turn
+
+Round 1 (Cold):  发送 prompt_0 .. prompt_{N-1}  → 填充 prefix cache
+Round 2 (Warm):  重发 prompt_0 .. prompt_{N-1}  → 全部 cache hit
+
+关键特性：
+  ✓ 两轮请求数量一致（都是 N）
+  ✓ 两轮发送完全相同的 N 个请求
+  ✓ Round 内部每个请求内容各不相同（不同 ShareGPT 对话）
+  ✗ 没有人工构造的共享 system prompt（每条请求独立）
+```
+
+#### 5.4.3 指标对比矩阵
+
+| 指标 | Round 1 (Cold) | Round 2 (Warm) | 预期变化 |
+| --- | --- | --- | --- |
+| **TTFT** | 完整 prefill 延迟 | prefix cache 命中，仅 extend | **大幅下降** |
+| **TBT** | decode 逐 token 延迟 | decode，但 KV 已在 host pool | 方案间对比核心 |
+| **TPOT** | (latency - TTFT) / tokens | 同 | 反映 decode 效率 |
+| **Throughput** | output tok/s | output tok/s | Round 2 应更高（prefill 省去） |
+| **E2E Latency** | 整体请求延迟 | 整体请求延迟 | 综合指标 |
+
+#### 5.4.4 使用方式
+
+```bash
+# 单次实验（ShareGPT 自动下载）
+python test/cxl_utils/e2e_bench.py \
     --server-url http://localhost:30000 \
-    --prefix-tokens 32768 \
-    --query-tokens 256 \
-    --output-tokens 256 \
-    --round1-requests 8 \
-    --round2-requests 32 \
-    --concurrency 1,2,4,8,16 \
+    --model deepseek-ai/DeepSeek-V3.2 \
+    --num-requests 16 \
+    --output-tokens 128 \
+    --min-prompt-tokens 64 \
+    --max-prompt-tokens 8192 \
+    --request-rate 4 \
     --output results.json
-"""
 
-import argparse, json, time, requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import numpy as np
+# 指定本地 ShareGPT 路径
+python test/cxl_utils/e2e_bench.py \
+    --dataset-path /data/ShareGPT_V3_unfiltered_cleaned_split.json \
+    --num-requests 32 \
+    --output-tokens 0    # 0 = use dataset ground truth output length
+    ...
 
+# 完整实验矩阵（自动化）
+bash test/cxl_utils/run_all_experiments.sh \
+    --model deepseek-ai/DeepSeek-V3.2 \
+    --tp 8 \
+    --num-requests 16
+```
 
-def generate_prefix(num_tokens: int) -> str:
-    """Generate a synthetic prefix of approximately num_tokens tokens."""
-    # Use a fixed seed for reproducibility
-    # Each English word ≈ 1.3 tokens, pad to target
-    words = ["The", "quick", "brown", "fox", "jumps", "over", "the", "lazy",
-             "dog", "and", "runs", "across", "the", "vast", "open", "field"]
-    text_words = []
-    for i in range(num_tokens * 2):  # over-generate, will be trimmed by server
-        text_words.append(words[i % len(words)])
-    return " ".join(text_words)
+#### 5.4.5 自动化脚本
 
+**新文件**：`test/cxl_utils/run_all_experiments.sh`
 
-def make_query(prefix: str, query_id: int) -> str:
-    """Append a unique query to the shared prefix."""
-    return prefix + f"\n\nQuestion {query_id}: " \
-           f"Based on the text above, provide a detailed analysis #{query_id}."
+对四种方案 (DRAM / RDMA-0% / RDMA-30% / CXL) 自动启停服务器、运行 benchmark、汇总结果：
 
-
-def send_and_measure(url: str, prompt: str, max_new_tokens: int) -> dict:
-    """Send generation request, return timing info."""
-    payload = {
-        "text": prompt,
-        "sampling_params": {"max_new_tokens": max_new_tokens, "temperature": 0},
-    }
-    t0 = time.monotonic()
-    resp = requests.post(f"{url}/generate", json=payload, timeout=600)
-    t1 = time.monotonic()
-    meta = resp.json().get("meta_info", {})
-    return {
-        "wall_time_s": t1 - t0,
-        "prompt_tokens": meta.get("prompt_tokens", 0),
-        "completion_tokens": meta.get("completion_tokens", 0),
-    }
-
-
-def run_round(url, prefix, query_ids, max_new_tokens, concurrency):
-    """Run one round of benchmark with given concurrency."""
-    prompts = [make_query(prefix, qid) for qid in query_ids]
-    results = []
-
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(send_and_measure, url, p, max_new_tokens)
-                   for p in prompts]
-        for f in as_completed(futures):
-            results.append(f.result())
-
-    times = np.array([r["wall_time_s"] for r in results])
-    tokens = np.array([r["completion_tokens"] for r in results])
-    total_tokens = int(tokens.sum())
-    wall_time = float(times.max())
-
-    return {
-        "num_requests": len(results),
-        "concurrency": concurrency,
-        "total_output_tokens": total_tokens,
-        "wall_time_s": round(wall_time, 3),
-        "throughput_tok_per_s": round(total_tokens / wall_time, 1),
-        "avg_latency_ms": round(float(times.mean()) * 1000, 1),
-        "p50_latency_ms": round(float(np.percentile(times, 50)) * 1000, 1),
-        "p99_latency_ms": round(float(np.percentile(times, 99)) * 1000, 1),
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--server-url", default="http://localhost:30000")
-    parser.add_argument("--prefix-tokens", type=int, default=32768)
-    parser.add_argument("--query-tokens", type=int, default=256)
-    parser.add_argument("--output-tokens", type=int, default=256)
-    parser.add_argument("--round1-requests", type=int, default=8)
-    parser.add_argument("--round2-requests", type=int, default=32)
-    parser.add_argument("--concurrency", default="1,2,4,8")
-    parser.add_argument("--output", default="results.json")
-    args = parser.parse_args()
-
-    prefix = generate_prefix(args.prefix_tokens)
-    concurrencies = [int(c) for c in args.concurrency.split(",")]
-    all_results = {"round1": [], "round2": []}
-
-    # Round 1: Cold start
-    print("=" * 60)
-    print("Round 1: Cold start (no prefix cache)")
-    print("=" * 60)
-    for conc in concurrencies:
-        n = min(args.round1_requests, conc * 4)
-        query_ids = list(range(n))
-        r = run_round(args.server_url, prefix, query_ids,
-                      args.output_tokens, conc)
-        all_results["round1"].append(r)
-        print(f"  conc={conc}: {r['throughput_tok_per_s']} tok/s, "
-              f"p50={r['p50_latency_ms']}ms, p99={r['p99_latency_ms']}ms")
-
-    # Brief pause to let KV settle in cache
-    time.sleep(2)
-
-    # Round 2: Prefix cache hit
-    print("\n" + "=" * 60)
-    print("Round 2: Warm start (prefix cache hit)")
-    print("=" * 60)
-    for conc in concurrencies:
-        n = min(args.round2_requests, conc * 4)
-        # Use different query IDs to avoid exact match
-        query_ids = list(range(1000, 1000 + n))
-        r = run_round(args.server_url, prefix, query_ids,
-                      args.output_tokens, conc)
-        all_results["round2"].append(r)
-        print(f"  conc={conc}: {r['throughput_tok_per_s']} tok/s, "
-              f"p50={r['p50_latency_ms']}ms, p99={r['p99_latency_ms']}ms")
-
-    with open(args.output, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"\nResults saved to {args.output}")
+```bash
+# 流程：
+for scheme in dram rdma_0 rdma_30 cxl; do
+    launch_server --hisparse-config $config
+    python e2e_bench.py --output results/${scheme}.json
+    kill_server
+done
+# 最后打印 TTFT/TBT 对比汇总表
 ```
 
 ---
@@ -943,71 +888,94 @@ python -m sglang.launch_server \
 
 ## 8. 两轮实验执行流程
 
-### 8.1 完整流程
+### 8.1 请求设计
+
+**核心设计原则**：两轮发送完全相同的请求，round 内部各请求内容各不相同，不使用共享 system prompt。
+
+```
+N 个 prompt（一次采样，两轮共用）:
+  来自 ShareGPT 数据集的 N 条不同对话的用户提问
+  每条 prompt 内容唯一，相互之间没有公共前缀
+
+Round 1 (N 个请求，cold start):
+  发送 prompt_0 .. prompt_{N-1}  → 填充 radix prefix cache
+
+Round 2 (N 个请求，warm start):
+  重发完全相同的 prompt_0 .. prompt_{N-1}
+  → radix cache 全部命中，prefill 跳过，仅 extend
+
+关键特性：
+  ✓ 两轮请求数量一致（都是 N）
+  ✓ 两轮发送完全相同的 N 个请求（same prompts, same order）
+  ✓ Round 内部每个请求内容各不相同（N 条不同 ShareGPT 对话）
+  ✗ 没有人工构造的公共 system prompt（每条请求独立）
+  ✓ Cache 命中粒度：每条请求自身的完整 token 序列
+```
+
+### 8.2 测量指标
+
+通过 OpenAI-compatible **streaming API** 逐 token 计时：
+
+| 指标 | 定义 | 意义 |
+| --- | --- | --- |
+| **TTFT** | 首 token 到达时间 | 反映 prefill 延迟，prefix cache 命中时大幅下降 |
+| **TBT** | 相邻 token 间延迟 (inter-token latency) | 反映 decode 阶段效率，CXL 按需读取 vs RDMA 全量预取核心对比 |
+| **TPOT** | (latency - TTFT) / (output_len - 1) | 每 output token 平均延迟 |
+| **E2E Latency** | 整体请求延迟 | 综合指标 |
+| **Throughput** | output_tokens / wall_time | 系统吞吐 |
+
+### 8.3 完整流程
 
 ```bash
 # 对每种方案 (A / B-0 / B-30 / C)：
 
 # 1. 启动服务器（方案 X 配置）
-python -m sglang.launch_server ... &
+python -m sglang.launch_server \
+    --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
+    --enable-hisparse --hisparse-config "$config" &
 wait_for_server_ready
 
-# 2. 运行两轮 benchmark
+# 2. 运行两轮 benchmark（两轮发送相同的 N 条 ShareGPT 请求）
 python test/cxl_utils/e2e_bench.py \
     --server-url http://localhost:30000 \
-    --prefix-tokens 32768 \
-    --output-tokens 256 \
-    --round1-requests 16 \
-    --round2-requests 64 \
-    --concurrency 1,2,4,8,16 \
-    --output results_${scheme}.json
+    --model deepseek-ai/DeepSeek-V3.2 \
+    --num-requests 16 \
+    --output-tokens 128 \
+    --min-prompt-tokens 64 \
+    --max-prompt-tokens 8192 \
+    --request-rate 4 \
+    --output results/${scheme}.json
 
 # 3. 收集系统指标
-free -h > mem_${scheme}.txt
-nvidia-smi > gpu_${scheme}.txt
+free -h > results/${scheme}_mem.txt
+nvidia-smi > results/${scheme}_gpu.txt
 
 # 4. 关闭服务器，切换方案
 ```
 
-### 8.2 自动化脚本
+### 8.4 自动化脚本
+
+`test/cxl_utils/run_all_experiments.sh` 自动化完整实验矩阵：
 
 ```bash
-#!/bin/bash
-# run_all_experiments.sh
+# 一键运行所有实验
+bash test/cxl_utils/run_all_experiments.sh \
+    --model deepseek-ai/DeepSeek-V3.2 \
+    --tp 8 \
+    --num-requests 16
 
-SCHEMES=("dram" "rdma_0" "rdma_30" "cxl")
-CONFIGS=(
-    '{"top_k":2048,"device_buffer_size":4096}'
-    '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"ib_dev":"mlx5_0","local_ratio":0.0}}'
-    '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"ib_dev":"mlx5_0","local_ratio":0.3}}'
-    '{"top_k":2048,"device_buffer_size":4096,"cxl":{"enabled":true,"dev_path":"/dev/dax0.0","map_bytes":68719476736}}'
-)
+# 可配置参数：
+#   --model           模型名
+#   --tp              tensor parallelism
+#   --num-requests    每轮请求数（两轮相同）
+#   --output-tokens   每请求输出 tokens（0=dataset ground truth）
+#   --request-rate    请求发送速率 (req/s)
+#   --results-dir     结果输出目录
 
-for i in "${!SCHEMES[@]}"; do
-    scheme="${SCHEMES[$i]}"
-    config="${CONFIGS[$i]}"
-    echo "=== Running scheme: $scheme ==="
-
-    python -m sglang.launch_server \
-        --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
-        --enable-hisparse --hisparse-config "$config" \
-        --port 30000 &
-    SERVER_PID=$!
-    sleep 120  # wait for model loading
-
-    for prefix_len in 4096 16384 32768 65536; do
-        python test/cxl_utils/e2e_bench.py \
-            --server-url http://localhost:30000 \
-            --prefix-tokens $prefix_len \
-            --output-tokens 256 \
-            --concurrency 1,2,4,8,16 \
-            --output "results/${scheme}_prefix${prefix_len}.json"
-    done
-
-    kill $SERVER_PID
-    wait $SERVER_PID 2>/dev/null
-    sleep 10
-done
+# 自动执行：
+#   1. 对 dram / rdma_0 / rdma_30 / cxl 四种方案
+#   2. 每种方案启动服务器 → 运行 e2e_bench（两轮相同请求）→ 收集系统指标 → 关闭服务器
+#   3. 最后打印 TTFT/TBT 对比汇总表
 ```
 
 ---

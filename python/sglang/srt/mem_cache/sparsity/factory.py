@@ -89,6 +89,17 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
     cxl_config = extra_config.pop("cxl", None)
+    rdma_config = extra_config.pop("rdma_pool", None)
+
+    if (
+        cxl_config
+        and cxl_config.get("enabled")
+        and rdma_config
+        and rdma_config.get("enabled")
+    ):
+        raise ValueError(
+            "cxl.enabled and rdma_pool.enabled are mutually exclusive"
+        )
 
     return SparseConfig(
         top_k=top_k,
@@ -99,6 +110,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
         cxl_config=cxl_config,
+        rdma_config=rdma_config,
         sparse_extra_config=extra_config,
     )
 

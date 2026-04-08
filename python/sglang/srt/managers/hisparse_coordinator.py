@@ -68,6 +68,7 @@ class HiSparseCoordinator:
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
         cxl_config: Optional[Dict] = None,
+        rdma_config: Optional[Dict] = None,
         tp_rank: int = 0,
         tp_size: int = 1,
         gpu_id: int = 0,
@@ -83,7 +84,11 @@ class HiSparseCoordinator:
         )
 
         self._cxl_region = None
-        if cxl_config is not None and cxl_config.get("enabled", False):
+        if rdma_config is not None and rdma_config.get("enabled", False):
+            self.mem_pool_host = self._init_rdma_host_pool(
+                rdma_config, host_to_device_ratio
+            )
+        elif cxl_config is not None and cxl_config.get("enabled", False):
             self.mem_pool_host = self._init_cxl_host_pool(
                 cxl_config, host_to_device_ratio, tp_rank, tp_size, gpu_id
             )
@@ -329,6 +334,28 @@ class HiSparseCoordinator:
                 prefix_len,
                 restored,
             )
+
+    def _init_rdma_host_pool(
+        self,
+        rdma_config: Dict,
+        host_to_device_ratio: int,
+    ) -> "RDMAMLATokenToKVPoolHost":
+        from sglang.srt.mem_cache.rdma_memory_pool import RDMAMLATokenToKVPoolHost
+
+        logger.info(
+            "HiSparse: initializing RDMA host pool with local_ratio=%.2f, ib_dev=%s",
+            rdma_config.get("local_ratio", 0.0),
+            rdma_config.get("ib_dev", "mlx5_0"),
+        )
+        return RDMAMLATokenToKVPoolHost(
+            device_pool=self.mem_pool_device,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=0,
+            page_size=1,
+            layout="layer_first",
+            rdma_config=rdma_config,
+            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+        )
 
     def _init_cxl_host_pool(
         self,
@@ -663,6 +690,29 @@ class HiSparseCoordinator:
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
+
+            # RDMA prefetch: if the host pool is RDMA-backed, simulate
+            # remote KV and one-time prefetch before decode starts.
+            if hasattr(self.mem_pool_host, "mark_request_locality"):
+                seq_len = len(req.fill_ids)
+                host_indices = self.req_to_host_pool[
+                    req.req_pool_idx, :seq_len
+                ]
+                is_remote = self.mem_pool_host.mark_request_locality(
+                    req.req_pool_idx
+                )
+                if is_remote:
+                    self.mem_pool_host.simulate_remote_write(
+                        req.req_pool_idx, host_indices
+                    )
+                    rdma_us = self.mem_pool_host.prefetch_for_decode(
+                        req.req_pool_idx, host_indices
+                    )
+                    logger.debug(
+                        "RDMA prefetch for req %s: %.1f us",
+                        req.rid, rdma_us,
+                    )
+
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
             req.hisparse_staging = False
@@ -970,6 +1020,10 @@ class HiSparseCoordinator:
             if host_indices.numel() > 0:
                 self.mem_pool_host.free(host_indices)
 
+        # Clean up RDMA locality tracking if applicable
+        if hasattr(self.mem_pool_host, "clear_request_locality"):
+            self.mem_pool_host.clear_request_locality(req.req_pool_idx)
+
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
@@ -1027,6 +1081,10 @@ class HiSparseCoordinator:
             host_indices = host_indices[host_indices >= 0]
             if host_indices.numel() > 0:
                 self.mem_pool_host.free(host_indices)
+
+        # Clean up RDMA locality tracking if applicable
+        if hasattr(self.mem_pool_host, "clear_request_locality"):
+            self.mem_pool_host.clear_request_locality(req.req_pool_idx)
 
         # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1

@@ -70,6 +70,17 @@ double rdma_scatter_read(struct rdma_context *rctx,
                          int item_size);
 
 /*
+ * Perform a bulk contiguous RDMA READ of total_bytes from remote MR offset 0
+ * into local MR offset 0.  Splits into max-message-size chunks internally.
+ *
+ * Used by RDMAMLATokenToKVPoolHost.prefetch_for_decode() to simulate
+ * one-shot full-KV prefetch for a request entering decode.
+ *
+ * Returns elapsed time in microseconds (CLOCK_MONOTONIC).
+ */
+double rdma_bulk_read(struct rdma_context *rctx, size_t total_bytes);
+
+/*
  * Tear down all RDMA resources.
  */
 void rdma_destroy(struct rdma_context *rctx);

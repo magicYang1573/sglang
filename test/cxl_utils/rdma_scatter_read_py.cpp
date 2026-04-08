@@ -63,6 +63,16 @@ static double py_rdma_scatter_read(uint64_t indices_ptr,
     return us;
 }
 
+static double py_rdma_bulk_read(size_t total_bytes) {
+    if (!g_ctx)
+        throw std::runtime_error("rdma: context not initialised; call rdma_init first");
+
+    double us = rdma_bulk_read(g_ctx, total_bytes);
+    if (us < 0)
+        throw std::runtime_error("rdma: rdma_bulk_read failed");
+    return us;
+}
+
 static void py_rdma_destroy() {
     if (g_ctx) {
         rdma_destroy(g_ctx);
@@ -84,6 +94,10 @@ PYBIND11_MODULE(rdma_scatter_ext, m) {
     m.def("rdma_scatter_read", &py_rdma_scatter_read,
           py::arg("indices_ptr"), py::arg("top_k"), py::arg("item_size"),
           "Perform top_k discrete RDMA READs. Returns elapsed microseconds.");
+
+    m.def("rdma_bulk_read", &py_rdma_bulk_read,
+          py::arg("total_bytes"),
+          "Perform a bulk contiguous RDMA READ. Returns elapsed microseconds.");
 
     m.def("rdma_destroy", &py_rdma_destroy,
           "Destroy the RDMA context and free resources.");
