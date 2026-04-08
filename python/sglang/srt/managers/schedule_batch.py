@@ -1670,6 +1670,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                 )
 
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.prepare_prefill_prefix_kv(reqs)
+
         if self.return_logprob:
             extend_input_logprob_token_ids = torch.tensor(
                 extend_input_logprob_token_ids

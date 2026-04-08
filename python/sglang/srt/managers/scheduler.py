@@ -2483,6 +2483,8 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        if self.enable_hisparse:
+            new_batch.hisparse_coordinator = self.hisparse_coordinator
         new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward

@@ -162,6 +162,117 @@ class HiSparseCoordinator:
         self.prefix_host_cache: Dict[Tuple[int, ...], PrefixHostCacheEntry] = {}
         # Per-request: tracks which prefix_host_cache entry the request uses.
         self.req_prefix_info: Dict[int, ReqPrefixInfo] = {}
+        # Spare hisparse slots from page-aligned prefix reload allocations.
+        self._reload_spare_hisparse_indices = torch.empty(
+            (0,), dtype=torch.int64, device=device
+        )
+
+    def _find_prefix_host_entry(
+        self, prefix_token_ids: Tuple[int, ...]
+    ) -> Tuple[Optional[Tuple[int, ...]], Optional[PrefixHostCacheEntry]]:
+        """Find a host-cache entry whose token_ids start with the prefix."""
+        exact = self.prefix_host_cache.get(prefix_token_ids)
+        if exact is not None and len(exact.host_indices) >= len(prefix_token_ids):
+            return prefix_token_ids, exact
+
+        best_key = None
+        best_entry = None
+        for key, entry in self.prefix_host_cache.items():
+            if len(key) < len(prefix_token_ids):
+                continue
+            if key[: len(prefix_token_ids)] != prefix_token_ids:
+                continue
+            if best_key is None or len(key) < len(best_key):
+                best_key = key
+                best_entry = entry
+        return best_key, best_entry
+
+    def _alloc_reload_hisparse_slots(self, need_size: int) -> torch.Tensor:
+        if need_size <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        candidate = self._reload_spare_hisparse_indices
+        if candidate.numel() < need_size:
+            page_size = self.mem_pool_device.page_size
+            extra_need = need_size - candidate.numel()
+            alloc_size = ((extra_need + page_size - 1) // page_size) * page_size
+            extra = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                alloc_size
+            )
+            if extra is None:
+                raise RuntimeError(
+                    f"HiSparse prefix reload failed: need {alloc_size} device slots"
+                )
+            candidate = (
+                torch.cat([candidate, extra]) if candidate.numel() > 0 else extra
+            )
+
+        used = candidate[:need_size]
+        self._reload_spare_hisparse_indices = candidate[need_size:]
+        return used
+
+    def _restore_prefix_kv_for_prefill(
+        self,
+        req: Req,
+        prefix_len: int,
+        entry: PrefixHostCacheEntry,
+    ) -> None:
+        """Restore missing prefix KV mappings/device data before prefill."""
+        if prefix_len <= 0:
+            return
+
+        self.req_to_host_pool[req.req_pool_idx, :prefix_len] = entry.host_indices[
+            :prefix_len
+        ]
+
+        logical_prefix = req.prefix_indices[:prefix_len]
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+            logical_prefix
+        ]
+        missing_mask = mapping <= 0
+        if not torch.any(missing_mask):
+            return
+
+        missing_logical = logical_prefix[missing_mask]
+        missing_host = entry.host_indices[:prefix_len][missing_mask].contiguous()
+        missing_device = self._alloc_reload_hisparse_slots(
+            int(missing_logical.numel())
+        ).contiguous()
+
+        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+            missing_logical
+        ] = missing_device
+
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                missing_host,
+                missing_device,
+                layer_id,
+                io_backend="kernel",
+            )
+
+    def prepare_prefill_prefix_kv(self, reqs: List[Req]) -> None:
+        """Restore prefix KV from host before a prefix-hit prefill batch runs."""
+        for req in reqs:
+            prefix_len = len(req.prefix_indices)
+            if prefix_len <= 0 or req.req_pool_idx is None:
+                continue
+
+            prefix_token_ids = tuple(req.fill_ids[:prefix_len])
+            cache_key, entry = self._find_prefix_host_entry(prefix_token_ids)
+            if entry is None:
+                continue
+
+            pinfo = self.req_prefix_info.get(req.req_pool_idx)
+            if pinfo is None or pinfo.cache_key != cache_key:
+                entry.ref_count += 1
+                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                    cache_key=cache_key,
+                    prefix_len=prefix_len,
+                )
+
+            self._restore_prefix_kv_for_prefill(req, prefix_len, entry)
 
     def _init_cxl_host_pool(
         self,
@@ -225,15 +336,17 @@ class HiSparseCoordinator:
         # If radix cache matched a prefix, try to reuse host pool entries.
         prefix_cache_key = None
         if prefix_len > 0:
-            prefix_cache_key = tuple(req.fill_ids[:prefix_len])
-            entry = self.prefix_host_cache.get(prefix_cache_key)
+            prefix_token_ids = tuple(req.fill_ids[:prefix_len])
+            prefix_cache_key, entry = self._find_prefix_host_entry(prefix_token_ids)
             if entry is not None and len(entry.host_indices) >= prefix_len:
                 # Reuse prefix host indices: no DMA needed for prefix portion.
-                entry.ref_count += 1
-                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
-                    cache_key=prefix_cache_key,
-                    prefix_len=prefix_len,
-                )
+                pinfo = self.req_prefix_info.get(req.req_pool_idx)
+                if pinfo is None or pinfo.cache_key != prefix_cache_key:
+                    entry.ref_count += 1
+                    self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                        cache_key=prefix_cache_key,
+                        prefix_len=prefix_len,
+                    )
                 self.req_to_host_pool[
                     req.req_pool_idx, :prefix_len
                 ] = entry.host_indices[:prefix_len]
@@ -324,12 +437,7 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        # Register prefix portion in host cache for future reuse.
-        # Only register when this request has a radix-cache prefix match
-        # (prefix_len > 0). The first cold-start request (prefix_len == 0)
-        # populates the radix tree via cache_unfinished_req; the second
-        # request with the same prefix will have prefix_len > 0 and register
-        # the host cache entry here for third+ requests to reuse.
+        # Register host cache entry for future prefix reuse.
         if prefix_len > 0 and prefix_cache_key is not None:
             if prefix_cache_key not in self.prefix_host_cache:
                 self.prefix_host_cache[prefix_cache_key] = PrefixHostCacheEntry(
@@ -337,17 +445,29 @@ class HiSparseCoordinator:
                     host_indices=host_indices[:prefix_len].clone(),
                     ref_count=1,
                 )
-                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
-                    cache_key=prefix_cache_key,
-                    prefix_len=prefix_len,
+            else:
+                self.prefix_host_cache[prefix_cache_key].ref_count += 1
+            self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                cache_key=prefix_cache_key,
+                prefix_len=prefix_len,
+            )
+        elif prefix_len == 0 and total_len > 0:
+            # Keep the first cold-start request's full host backup alive so a later
+            # prefix-hit request can recover its prefix KV back into device memory
+            # before prefill.
+            full_cache_key = tuple(req.fill_ids[:total_len])
+            if full_cache_key not in self.prefix_host_cache:
+                self.prefix_host_cache[full_cache_key] = PrefixHostCacheEntry(
+                    token_ids=full_cache_key,
+                    host_indices=host_indices[:total_len].clone(),
+                    ref_count=1,
                 )
             else:
-                entry = self.prefix_host_cache[prefix_cache_key]
-                entry.ref_count += 1
-                self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
-                    cache_key=prefix_cache_key,
-                    prefix_len=prefix_len,
-                )
+                self.prefix_host_cache[full_cache_key].ref_count += 1
+            self.req_prefix_info[req.req_pool_idx] = ReqPrefixInfo(
+                cache_key=full_cache_key,
+                prefix_len=total_len,
+            )
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
