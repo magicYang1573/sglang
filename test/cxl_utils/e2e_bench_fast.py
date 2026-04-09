@@ -5,8 +5,8 @@ Round 1 (Warmup):
   Send enough copies of each unique prompt to populate the radix / prefix cache
   on **every DP rank**.  The server's ``dp_size`` is auto-detected via
   ``/server_info``; warmup sends ``num_unique_prompts * dp_size`` requests
-  (one copy per unique prompt per DP rank) sequentially so each rank sees at
-  least one copy.
+  (one copy per unique prompt per DP rank).  They are launched in parallel up to
+  ``min(len(warmup), --max-concurrency)`` so all ranks can be warmed concurrently.
 
 Round 2 (Measurement):
   Expand the same unique prompts to ``--num-requests`` total HTTP requests by
@@ -187,17 +187,27 @@ async def main_async(args):
 
     all_results: Dict = {}
 
-    # Warmup: send one-at-a-time sequentially so the round-robin load
-    # balancer distributes them evenly across DP ranks.
+    # Parallel warmup: cap in-flight HTTP clients so all DP-warmup copies can
+    # run together (subject to --max-concurrency; 0 = unlimited per e2e_bench).
+    r1_len = len(round1_prompts)
+    if r1_len == 0:
+        r1_max_concurrency = 1
+    elif args.max_concurrency == 0:
+        r1_max_concurrency = 0
+    else:
+        r1_max_concurrency = min(r1_len, args.max_concurrency)
+
     print(f"\n{'#'*60}")
-    print(f"  ROUND 1: Warmup ({len(round1_prompts)} requests, 1 per DP rank per prompt)")
+    print(
+        f"  ROUND 1: Warmup ({r1_len} requests, max_concurrency={r1_max_concurrency})"
+    )
     print(f"{'#'*60}")
     r1_results, r1_duration = await eb.run_round(
         url=args.server_url,
         prompts=round1_prompts,
         model=args.model,
         request_rate=args.request_rate,
-        max_concurrency=1,
+        max_concurrency=r1_max_concurrency,
     )
     r1_metrics = eb.compute_round_metrics("Round 1: Warmup", r1_results, r1_duration)
     eb.print_metrics(r1_metrics)
@@ -263,6 +273,7 @@ async def main_async(args):
         "prompt_mode": args.prompt_mode,
         "target_input_tokens": args.target_input_tokens,
         "dp_size": dp_size,
+        "round1_max_concurrency": r1_max_concurrency,
         "round1_num_requests": len(round1_prompts),
         "round2_num_requests": len(round2_prompts),
         "num_requests": args.num_requests,
