@@ -2,8 +2,11 @@
 """Fast two-round e2e benchmark for repeated-request prefix-cache experiments.
 
 Round 1 (Warmup):
-  Send only ``--num-unique-prompts`` requests, one copy per unique prompt.
-  This populates radix / prefix cache with minimal cold-prefill cost.
+  Send enough copies of each unique prompt to populate the radix / prefix cache
+  on **every DP rank**.  The server's ``dp_size`` is auto-detected via
+  ``/server_info``; warmup sends ``num_unique_prompts * dp_size`` requests
+  (one copy per unique prompt per DP rank) sequentially so each rank sees at
+  least one copy.
 
 Round 2 (Measurement):
   Expand the same unique prompts to ``--num-requests`` total HTTP requests by
@@ -32,6 +35,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import aiohttp
 import numpy as np
 
 # Same directory as e2e_bench.py -> import shared implementation.
@@ -40,6 +44,23 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import e2e_bench as eb  # noqa: E402
+
+
+async def _query_dp_size(server_url: str) -> int:
+    """Query dp_size from the SGLang server via /server_info."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{server_url}/server_info",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    info = await resp.json()
+                    dp = int(info.get("dp_size", 1))
+                    return max(dp, 1)
+    except Exception as e:
+        print(f"  Warning: failed to query /server_info ({e}), assuming dp_size=1")
+    return 1
 
 
 def _repeat_counts(num_unique: int, total: int) -> List[int]:
@@ -122,7 +143,18 @@ async def main_async(args):
             seed=args.seed,
         )
 
-    round1_prompts = list(unique_prompts)
+    # Auto-detect DP size so warmup covers all DP ranks.
+    dp_size = await _query_dp_size(args.server_url)
+    print(f"  Server dp_size: {dp_size}")
+
+    # Round 1: send enough copies to populate every DP rank's radix cache.
+    # With round-robin load balancing, sending N*dp_size sequential requests
+    # ensures each rank sees at least N copies.
+    warmup_copies = dp_size
+    round1_prompts: List[Tuple[str, int, int]] = []
+    for prompt in unique_prompts:
+        round1_prompts.extend([prompt] * warmup_copies)
+
     round2_prompts = expand_repeat_prompts(
         unique_prompts, args.num_requests, args.repeat_mode
     )
@@ -134,7 +166,8 @@ async def main_async(args):
 
     print(f"  Unique prompts: {len(unique_prompts)}")
     print(
-        f"  Round 1 requests: {len(round1_prompts)} (warmup only, one per unique prompt)"
+        f"  Round 1 requests: {len(round1_prompts)} "
+        f"({len(unique_prompts)} unique x {warmup_copies} copies for {dp_size} DP ranks)"
     )
     print(
         f"  Round 2 requests: {len(round2_prompts)} "
@@ -154,15 +187,17 @@ async def main_async(args):
 
     all_results: Dict = {}
 
+    # Warmup: send one-at-a-time sequentially so the round-robin load
+    # balancer distributes them evenly across DP ranks.
     print(f"\n{'#'*60}")
-    print("  ROUND 1: Warmup (unique requests only)")
+    print(f"  ROUND 1: Warmup ({len(round1_prompts)} requests, 1 per DP rank per prompt)")
     print(f"{'#'*60}")
     r1_results, r1_duration = await eb.run_round(
         url=args.server_url,
         prompts=round1_prompts,
         model=args.model,
         request_rate=args.request_rate,
-        max_concurrency=args.max_concurrency,
+        max_concurrency=1,
     )
     r1_metrics = eb.compute_round_metrics("Round 1: Warmup", r1_results, r1_duration)
     eb.print_metrics(r1_metrics)
@@ -227,6 +262,7 @@ async def main_async(args):
         "local_files_only": args.local_files_only,
         "prompt_mode": args.prompt_mode,
         "target_input_tokens": args.target_input_tokens,
+        "dp_size": dp_size,
         "round1_num_requests": len(round1_prompts),
         "round2_num_requests": len(round2_prompts),
         "num_requests": args.num_requests,
