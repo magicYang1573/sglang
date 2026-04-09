@@ -21,6 +21,10 @@
 #   export MODEL_PATH=/data3/yt/models/DeepSeek-V3.2-AWQ   # server weights
 #   bash test/cxl_utils/run_all_experiments.sh
 #
+# Python / conda (required so `python -m sglang.launch_server` finds sglang):
+#   Default: source ${HOME}/env.sh if present (e.g. PATH to miniconda + activate sgl).
+#   Override: SGLANG_ENV_SCRIPT=/path/to/env.sh  or  PYTHON_BIN=/path/to/sgl/bin/python
+#
 # Optional env overrides:
 #   MODEL_CLIENT   — HF id for tokenizer/client (default: deepseek-ai/DeepSeek-V3.2)
 #   PORT, TP, DP_SIZE, IB_DEVICE, CXL_DEV_PATH, CXL_MAP_BYTES
@@ -62,8 +66,12 @@ SEED="${SEED:-42}"
 PAUSE_BETWEEN_ROUNDS="${PAUSE_BETWEEN_ROUNDS:-3.0}"
 
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-300}"
+SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-600}"
 SKIP_SERVER="${SKIP_SERVER:-0}"
+
+# Conda / venv: same interpreter for launch_server and e2e_bench_fast (override before run)
+SGLANG_ENV_SCRIPT="${SGLANG_ENV_SCRIPT:-${HOME}/env.sh}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_FAST="${E2E_FAST:-${SCRIPT_DIR}/e2e_bench_fast.py}"
@@ -109,13 +117,31 @@ while [[ $# -gt 0 ]]; do
     --ib-device) IB_DEVICE="$2"; shift 2 ;;
     --cxl-dev) CXL_DEV_PATH="$2"; shift 2 ;;
     --cxl-map-bytes) CXL_MAP_BYTES="$2"; shift 2 ;;
+    --env-script) SGLANG_ENV_SCRIPT="$2"; shift 2 ;;
+    --python) PYTHON_BIN="$2"; shift 2 ;;
     -h|--help)
-      sed -n '1,35p' "$0"
+      sed -n '1,40p' "$0"
       exit 0
       ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
+
+# Load conda env (typical: export PATH=.../miniconda3/bin:\$PATH ; source activate sgl)
+if [[ -f "${SGLANG_ENV_SCRIPT}" ]]; then
+  echo "Sourcing: ${SGLANG_ENV_SCRIPT}"
+  # shellcheck disable=SC1090
+  source "${SGLANG_ENV_SCRIPT}"
+else
+  echo "Note: SGLANG_ENV_SCRIPT not found (${SGLANG_ENV_SCRIPT}); using current PATH." >&2
+fi
+
+if ! "${PYTHON_BIN}" -c "import sglang" 2>/dev/null; then
+  echo "ERROR: '${PYTHON_BIN}' cannot import sglang (resolved: $(command -v "${PYTHON_BIN}" 2>/dev/null || echo 'not in PATH'))." >&2
+  echo "  Fix: put Miniconda on PATH + activate sgl in ${SGLANG_ENV_SCRIPT}, or set PYTHON_BIN to that env's python." >&2
+  exit 1
+fi
+echo "Python for server + client: $(command -v "${PYTHON_BIN}") ($("${PYTHON_BIN}" -c 'import sys; print(sys.executable)'))"
 
 mkdir -p "${RESULTS_DIR}"
 META_FILE="${RESULTS_DIR}/run_meta.txt"
@@ -174,7 +200,7 @@ start_server_for_scheme() {
 
   echo "  Launching server: scheme=${scheme} (log -> ${log_file##*/})"
   # shellcheck disable=SC2086
-  SGLANG_ENABLE_JIT_DEEPGEMM=0 python -m sglang.launch_server \
+  SGLANG_ENABLE_JIT_DEEPGEMM=0 "${PYTHON_BIN}" -m sglang.launch_server \
     --model "${MODEL_PATH}" \
     --tp "${TP}" \
     --dp-size "${DP_SIZE}" \
@@ -194,7 +220,7 @@ run_e2e_fast() {
   local target_tokens="$2"
   export HF_ENDPOINT
   # shellcheck disable=SC2086
-  python "${E2E_FAST}" \
+  "${PYTHON_BIN}" "${E2E_FAST}" \
     --server-url "http://127.0.0.1:${PORT}" \
     --model "${MODEL_CLIENT}" \
     --prompt-mode "${PROMPT_MODE}" \
@@ -227,6 +253,9 @@ run_e2e_fast() {
   echo "ROUND2_OUTPUT_MIN=${ROUND2_OUTPUT_MIN} ROUND2_OUTPUT_MAX=${ROUND2_OUTPUT_MAX}"
   echo "MAX_CONCURRENCY=${MAX_CONCURRENCY}"
   echo "server_lifecycle=one_start_stop_per_scheme_x_context (no shared KV between cases)"
+  echo "SGLANG_ENV_SCRIPT=${SGLANG_ENV_SCRIPT}"
+  echo "PYTHON_BIN=${PYTHON_BIN}"
+  echo "python_executable=$("${PYTHON_BIN}" -c 'import sys; print(sys.executable)')"
 } > "${META_FILE}"
 
 if [[ "${SKIP_SERVER}" == "1" ]]; then
@@ -288,7 +317,7 @@ echo "Done. All JSON + *.log under: ${RESULTS_DIR}/"
 echo "============================================================"
 
 export RESULTS_DIR
-python3 << 'PY'
+"${PYTHON_BIN}" << 'PY'
 import json, os, glob, sys
 
 results_dir = os.environ.get("RESULTS_DIR", "")
