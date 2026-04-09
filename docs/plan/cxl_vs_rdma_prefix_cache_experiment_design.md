@@ -419,6 +419,26 @@ Radix cache eviction（`RadixCache.evict()`）只释放 GPU 侧资源：调用 `
 1. **Host→device reload**：radix miss 时检查 `prefix_host_cache`，从 host DMA 回 device 重建 radix 节点（类似 HiCache load-back）
 2. **Host pool LRU 淘汰**：ref_count=0 的 prefix entry 按 LRU 释放，防止 host pool 耗尽
 
+### 4.9 实验原型 Workaround（最小化可跑系统）
+
+为尽快在单机上跑通端到端对比、控制改动面，当前原型与「理想化 prefix-hit 完全跳过 GPU 计算」有两点刻意简化，实验结论应在此前提下解读。
+
+**（1）Prefix-hit 后首步仍是 EXTEND，仅恢复 tail page**
+
+即便 radix cache `match_prefix` 命中，调度上**第一个 forward batch 仍然是 EXTEND**（`alloc_for_extend` / `prepare_for_extend` 路径），而不是整段 prefix 当作已算完跳过。为降低显存与 DMA 压力、让系统先跑通，HiSparse coordinator 在「长 prefix + host-extend」路径上**只把 prefix 的最后一个 page（tail page）的 logical→hisparse 映射与 KV 加载进 GPU**，满足 `alloc_extend` 对尾页对齐的依赖；其后行为更接近「从该状态进入 decode」：后续步仍按 HiSparse decode 从 host 做 top-k swap-in。这与「prefix 全量在 GPU 上、首步即纯 decode」的理想形态不等价，但足以对比 **CXL 按需读 vs RDMA 预取** 在 decode 阶段的主差异。
+
+**（2）DPA 下每 DP 独立 radix cache：`e2e_bench_fast.py` 的 warmup 策略**
+
+开启 **DP Attention（DPA）** 时，`dp_size > 1` 表示多个数据并行组，**每组各自一份 radix tree / HiSparse 状态**，prefix cache **不能跨 DP rank 共享**。若 Round 1 只发 **1 条** HTTP 请求，负载均衡只会 warm **其中一个 rank** 的 cache，Round 2 发到其他 rank 的请求仍会走完整长上下文 prefill（日志上可见部分 DP `#cached-token: 0`、部分 DP 有高 `#cached-token`）。
+
+基准脚本 `test/cxl_utils/e2e_bench_fast.py` 的 workaround：
+
+- 启动时通过 `/server_info` 读取 `dp_size`；
+- **Round 1**：对每个 unique prompt 发送 **`dp_size` 份**相同请求（并行度受 `--max-concurrency` 限制），使 round-robin 下**每个 DP rank 至少执行过一次**该 prompt 的冷启动，从而各 rank 的 radix / prefix_host 均被填充；
+- **Round 2**：仍按 `--num-requests` 与 `repeat-mode` **重复同一批 prompt**，在已 warm 的多 rank 上测量 prefix-hit 行为。
+
+因此：实验报告中若涉及 DPA，应写明「Round 1 请求数 = `num_unique_prompts × dp_size`」，并与单 DP（`dp_size=1`）时的语义区分说明。
+
 ---
 
 ## 5. 需要开发的代码

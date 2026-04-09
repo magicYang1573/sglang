@@ -11,6 +11,9 @@ Round 1 (Warmup):
 Round 2 (Measurement):
   Expand the same unique prompts to ``--num-requests`` total HTTP requests by
   repetition, then replay that full repeated sequence on the warmed cache.
+  Each Round-2 request samples ``max_tokens`` uniformly from
+  ``--round2-output-min`` … ``--round2-output-max`` (inclusive).  If those two
+  flags are omitted, every request uses ``--output-tokens`` (fixed length).
 
 Server-side behaviour (e.g. HiSparse RDMA locality / one-time prefetch) is not
 changed: every HTTP request is still one independent Req.
@@ -31,9 +34,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
@@ -104,6 +108,41 @@ def expand_repeat_prompts(
     return out
 
 
+def _round2_output_range(
+    output_tokens: int,
+    r2_min: Optional[int],
+    r2_max: Optional[int],
+) -> Tuple[int, int]:
+    """Resolve Round-2 output length bounds (inclusive)."""
+    if r2_min is None and r2_max is None:
+        return output_tokens, output_tokens
+    if r2_min is None or r2_max is None:
+        raise ValueError(
+            "Set both --round2-output-min and --round2-output-max, or omit both "
+            f"(got min={r2_min!r}, max={r2_max!r})."
+        )
+    if r2_min < 1 or r2_max < 1:
+        raise ValueError(
+            f"Round-2 output bounds must be >= 1 (got min={r2_min}, max={r2_max})."
+        )
+    if r2_min > r2_max:
+        raise ValueError(
+            f"--round2-output-min ({r2_min}) must be <= --round2-output-max ({r2_max})."
+        )
+    return r2_min, r2_max
+
+
+def assign_round2_random_output_lens(
+    prompts: List[Tuple[str, int, int]],
+    lo: int,
+    hi: int,
+    seed: int,
+) -> List[Tuple[str, int, int]]:
+    """Per request: same prompt text/len, ``max_tokens`` in [lo, hi] inclusive."""
+    rng = random.Random(seed ^ 0x9E3779B9)
+    return [(text, plen, rng.randint(lo, hi)) for text, plen, _ in prompts]
+
+
 async def main_async(args):
     from transformers import AutoTokenizer
 
@@ -155,9 +194,22 @@ async def main_async(args):
     for prompt in unique_prompts:
         round1_prompts.extend([prompt] * warmup_copies)
 
-    round2_prompts = expand_repeat_prompts(
+    round2_expanded = expand_repeat_prompts(
         unique_prompts, args.num_requests, args.repeat_mode
     )
+    r2_lo, r2_hi = _round2_output_range(
+        args.output_tokens,
+        args.round2_output_min,
+        args.round2_output_max,
+    )
+    if r2_lo == r2_hi:
+        round2_prompts = [
+            (text, plen, r2_lo) for text, plen, _ in round2_expanded
+        ]
+    else:
+        round2_prompts = assign_round2_random_output_lens(
+            round2_expanded, r2_lo, r2_hi, args.seed
+        )
 
     round1_prompt_lens = [p[1] for p in round1_prompts]
     round1_output_lens = [p[2] for p in round1_prompts]
@@ -173,6 +225,12 @@ async def main_async(args):
         f"  Round 2 requests: {len(round2_prompts)} "
         f"(repeat_mode={args.repeat_mode})"
     )
+    if r2_lo == r2_hi:
+        print(f"  Round 2 output tokens: fixed at {r2_lo}")
+    else:
+        print(
+            f"  Round 2 output tokens: uniform random in [{r2_lo}, {r2_hi}] (seed={args.seed})"
+        )
     print(
         f"  Prompt length: min={min(round2_prompt_lens)} max={max(round2_prompt_lens)} "
         f"mean={int(np.mean(round2_prompt_lens))} tokens"
@@ -280,6 +338,8 @@ async def main_async(args):
         "num_unique_prompts": args.num_unique_prompts,
         "repeat_mode": args.repeat_mode,
         "output_tokens": args.output_tokens,
+        "round2_output_min": r2_lo,
+        "round2_output_max": r2_hi,
         "min_prompt_tokens": args.min_prompt_tokens,
         "max_prompt_tokens": args.max_prompt_tokens,
         "request_rate": args.request_rate,
@@ -338,6 +398,19 @@ def main():
         help="block: A...A,B...B; interleaved: A,B,C,A,B,C,...",
     )
     p.add_argument("--output-tokens", type=int, default=1024)
+    p.add_argument(
+        "--round2-output-min",
+        type=int,
+        default=None,
+        help="Round 2 only: min max_tokens per request (inclusive). "
+        "Use with --round2-output-max; omit both to fix length at --output-tokens.",
+    )
+    p.add_argument(
+        "--round2-output-max",
+        type=int,
+        default=None,
+        help="Round 2 only: max max_tokens per request (inclusive).",
+    )
     p.add_argument("--min-prompt-tokens", type=int, default=64)
     p.add_argument("--max-prompt-tokens", type=int, default=8192)
     p.add_argument("--request-rate", type=float, default=0.0)
@@ -353,6 +426,9 @@ def main():
         p.error("--num-unique-prompts must be <= --num-requests")
     if args.num_unique_prompts < 1:
         p.error("--num-unique-prompts must be >= 1")
+
+    if (args.round2_output_min is None) ^ (args.round2_output_max is None):
+        p.error("Set both --round2-output-min and --round2-output-max, or neither.")
 
     asyncio.run(main_async(args))
 
