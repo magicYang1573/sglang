@@ -42,6 +42,8 @@ class PrefixHostCacheEntry:
     ref_count: int = 0
     restored_device_block: Optional[torch.Tensor] = None
     restored_prefix_len: int = 0
+    restored_tail_device_block: Optional[torch.Tensor] = None
+    restored_tail_page_start: int = -1
 
 
 @dataclass
@@ -201,6 +203,20 @@ class HiSparseCoordinator:
                 best_entry = entry
         return best_key, best_entry
 
+    def _should_use_host_extend_path(self, req: Req, prefix_len: int) -> bool:
+        """Use host-backed extend for long prefix-hit requests.
+
+        When the request only needs to extend one token after a very long prefix
+        hit, restoring the full prefix back into a contiguous device block is
+        too expensive. In this case we keep the prefix in host memory and let
+        the EXTEND path fetch top-k entries from host, similar to decode.
+        """
+        return (
+            prefix_len > 0
+            and req.extend_input_len == 1
+            and len(req.fill_ids) > self.device_buffer_size
+        )
+
     def _ensure_restored_device_block(
         self, entry: PrefixHostCacheEntry, prefix_len: int
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -226,6 +242,38 @@ class HiSparseCoordinator:
         entry.restored_device_block = block
         entry.restored_prefix_len = prefix_len
         return block[:prefix_len], old_block
+
+    def _ensure_restored_tail_device_block(
+        self, entry: PrefixHostCacheEntry, prefix_len: int
+    ) -> Tuple[torch.Tensor, int, Optional[torch.Tensor]]:
+        """Allocate one page for the prefix tail only.
+
+        This is sufficient for HiSparse alloc_extend(), which only needs the
+        tail-page device mapping to continue page-aligned allocation of the
+        newly extended token(s).
+        """
+        page_size = self.mem_pool_device.page_size
+        page_start = ((prefix_len - 1) // page_size) * page_size
+        used = prefix_len - page_start
+
+        if (
+            entry.restored_tail_device_block is not None
+            and entry.restored_tail_device_block.numel() >= page_size
+            and entry.restored_tail_page_start == page_start
+        ):
+            return entry.restored_tail_device_block[:used], page_start, None
+
+        old_block = entry.restored_tail_device_block
+        block = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+            page_size
+        )
+        if block is None:
+            raise RuntimeError(
+                f"HiSparse prefix tail reload failed: need {page_size} device slots"
+            )
+        entry.restored_tail_device_block = block
+        entry.restored_tail_page_start = page_start
+        return block[:used], page_start, old_block
 
     def _restore_prefix_kv_for_prefill(
         self,
@@ -282,6 +330,100 @@ class HiSparseCoordinator:
             )
         return int(prefix_len)
 
+    def _restore_prefix_tail_for_prefill(
+        self,
+        req: Req,
+        prefix_len: int,
+        entry: PrefixHostCacheEntry,
+    ) -> int:
+        """Restore only the final prefix page's device mapping.
+
+        This lightweight path avoids materialising the entire long prefix in
+        VRAM, while still making alloc_extend() valid for the upcoming token.
+        """
+        if prefix_len <= 0:
+            return 0
+
+        page_size = self.mem_pool_device.page_size
+        page_start = ((prefix_len - 1) // page_size) * page_size
+        logical_tail = req.prefix_indices[page_start:prefix_len]
+        if logical_tail.numel() == 0:
+            return 0
+
+        restored_device, page_start, retired_block = (
+            self._ensure_restored_tail_device_block(entry, prefix_len)
+        )
+        restored_device = restored_device.contiguous()
+
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+            logical_tail
+        ]
+        old_positive = torch.unique(mapping[mapping > 0])
+        if retired_block is not None and retired_block.numel() > 0:
+            old_positive = (
+                torch.unique(torch.cat([old_positive, retired_block]))
+                if old_positive.numel() > 0
+                else torch.unique(retired_block)
+            )
+        if old_positive.numel() > 0:
+            to_free_mask = ~torch.isin(old_positive, restored_device)
+            to_free = old_positive[to_free_mask]
+            if to_free.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(to_free)
+
+        self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+            logical_tail
+        ] = restored_device
+
+        host_tail = entry.host_indices[page_start:prefix_len].contiguous()
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_tail,
+                restored_device,
+                layer_id,
+                io_backend="kernel",
+            )
+        return int(logical_tail.numel())
+
+    def _ensure_empty_device_buffer_for_prefix_extend(self, req: Req) -> None:
+        """Allocate an empty per-request device buffer without touching mappings.
+
+        Unlike alloc_device_buffer(), this helper does not zero logical->device
+        mappings for the new token. It is used only before EXTEND forward so the
+        kernel can swap top-k prefix KV from host into a temporary buffer.
+        """
+        req_idx = req.req_pool_idx
+        if req_idx is None:
+            return
+
+        if int(self.req_device_buffer_size[req_idx]) > 0:
+            return
+
+        page_size = self.mem_pool_device.page_size
+        alloc_size = min(
+            ((req.kv_allocated_len + page_size - 1) // page_size) * page_size,
+            self.device_buffer_size,
+        )
+        if alloc_size == self.device_buffer_size:
+            alloc_size = self.padded_buffer_size
+
+        buffer_indices = self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+            alloc_size
+        )
+        if buffer_indices is None:
+            raise RuntimeError(
+                f"HiSparse prefix-extend buffer alloc failed for req {req.rid} "
+                f"(alloc_size={alloc_size})"
+            )
+
+        self.req_to_device_buffer[req_idx, :alloc_size] = buffer_indices
+        self.req_device_buffer_size[req_idx] = alloc_size
+        self.req_device_buffer_tokens[:, req_idx, : self.device_buffer_size] = -1
+        self.req_device_buffer_token_locs[:, req_idx, :alloc_size] = (
+            buffer_indices[:alloc_size]
+        )
+
     def prepare_prefill_prefix_mappings(self, reqs: List[Req]) -> None:
         """Restore prefix logical->device mappings before alloc_for_extend.
 
@@ -296,6 +438,19 @@ class HiSparseCoordinator:
             prefix_token_ids = tuple(req.fill_ids[:prefix_len])
             _, entry = self._find_prefix_host_entry(req, prefix_token_ids)
             if entry is None:
+                continue
+
+            if self._should_use_host_extend_path(req, prefix_len):
+                restored = self._restore_prefix_tail_for_prefill(
+                    req, prefix_len, entry
+                )
+                if restored > 0:
+                    logger.info(
+                        "HiSparse prefix-cache tail-restore: req=%s prefix_len=%d restored_tail_tokens=%d",
+                        req.rid,
+                        prefix_len,
+                        restored,
+                    )
                 continue
 
             restored = self._restore_prefix_kv_for_prefill(req, prefix_len, entry)
@@ -326,6 +481,20 @@ class HiSparseCoordinator:
                     cache_key=cache_key,
                     prefix_len=prefix_len,
                 )
+
+            self.req_to_host_pool[req.req_pool_idx, :prefix_len] = entry.host_indices[
+                :prefix_len
+            ]
+
+            if self._should_use_host_extend_path(req, prefix_len):
+                self._ensure_empty_device_buffer_for_prefix_extend(req)
+                logger.info(
+                    "HiSparse prefix-cache active (host-extend mode): req=%s prefix_len=%d extend_len=%d",
+                    req.rid,
+                    prefix_len,
+                    req.extend_input_len,
+                )
+                continue
 
             restored = self._restore_prefix_kv_for_prefill(req, prefix_len, entry)
             logger.info(
@@ -603,6 +772,10 @@ class HiSparseCoordinator:
             )
 
     def alloc_device_buffer(self, req: Req) -> None:
+        req_idx = req.req_pool_idx
+        if req_idx is not None and int(self.req_device_buffer_size[req_idx]) > 0:
+            return
+
         pinfo = self.req_prefix_info.get(req.req_pool_idx)
         is_prefix_hit = (
             pinfo is not None
@@ -1114,6 +1287,10 @@ class HiSparseCoordinator:
                 if entry.restored_device_block is not None:
                     self.token_to_kv_pool_allocator.free_hisparse_indices(
                         entry.restored_device_block
+                    )
+                if entry.restored_tail_device_block is not None:
+                    self.token_to_kv_pool_allocator.free_hisparse_indices(
+                        entry.restored_tail_device_block
                     )
         for key in to_delete:
             del self.prefix_host_cache[key]

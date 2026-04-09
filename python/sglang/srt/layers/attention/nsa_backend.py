@@ -1350,11 +1350,32 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
+        use_hisparse_host_extend = (
+            forward_batch.hisparse_coordinator is not None
+            and forward_batch.extend_seq_lens_cpu is not None
+            and forward_batch.extend_prefix_lens_cpu is not None
+            and len(forward_batch.extend_seq_lens_cpu) > 0
+            and all(x == 1 for x in forward_batch.extend_seq_lens_cpu)
+            and all(x > 0 for x in forward_batch.extend_prefix_lens_cpu)
+            and any(
+                x > forward_batch.hisparse_coordinator.device_buffer_size
+                for x in forward_batch.extend_prefix_lens_cpu
+            )
+        )
+
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if use_hisparse_host_extend:
+            assert topk_indices is not None
+            page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                topk_indices,
+                layer.layer_id,
+            )
+        elif envs.SGLANG_NSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1379,7 +1400,10 @@ class NativeSparseAttnBackend(
                 )
 
         # todo hisparse: to cover more backends
-        if forward_batch.hisparse_coordinator is not None:
+        if (
+            forward_batch.hisparse_coordinator is not None
+            and not use_hisparse_host_extend
+        ):
             page_table_1 = (
                 forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1
@@ -1400,7 +1424,7 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            if topk_transform_method == TopkTransformMethod.RAGGED and not use_hisparse_host_extend:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
