@@ -113,7 +113,11 @@ def _round2_output_range(
     r2_min: Optional[int],
     r2_max: Optional[int],
 ) -> Tuple[int, int]:
-    """Resolve Round-2 output length bounds (inclusive)."""
+    """Resolve Round-2 output length bounds (inclusive).
+
+    ``r2_min`` may be 0 for a uniform draw in [0, hi]; values below 1 are clamped
+    to 1 when issuing ``max_tokens`` (API requirement).
+    """
     if r2_min is None and r2_max is None:
         return output_tokens, output_tokens
     if r2_min is None or r2_max is None:
@@ -121,9 +125,13 @@ def _round2_output_range(
             "Set both --round2-output-min and --round2-output-max, or omit both "
             f"(got min={r2_min!r}, max={r2_max!r})."
         )
-    if r2_min < 1 or r2_max < 1:
+    if r2_min < 0 or r2_max < 0:
         raise ValueError(
-            f"Round-2 output bounds must be >= 1 (got min={r2_min}, max={r2_max})."
+            f"Round-2 output bounds must be >= 0 (got min={r2_min}, max={r2_max})."
+        )
+    if r2_max < 1:
+        raise ValueError(
+            "--round2-output-max must be >= 1 (generation needs a positive max_tokens cap)."
         )
     if r2_min > r2_max:
         raise ValueError(
@@ -138,9 +146,14 @@ def assign_round2_random_output_lens(
     hi: int,
     seed: int,
 ) -> List[Tuple[str, int, int]]:
-    """Per request: same prompt text/len, ``max_tokens`` in [lo, hi] inclusive."""
+    """Per request: uniform ``max_tokens`` in [lo, hi], then clamped to >= 1."""
     rng = random.Random(seed ^ 0x9E3779B9)
-    return [(text, plen, rng.randint(lo, hi)) for text, plen, _ in prompts]
+    out: List[Tuple[str, int, int]] = []
+    for text, plen, _ in prompts:
+        olen = rng.randint(lo, hi)
+        olen = max(1, olen)
+        out.append((text, plen, olen))
+    return out
 
 
 async def main_async(args):
@@ -228,8 +241,9 @@ async def main_async(args):
     if r2_lo == r2_hi:
         print(f"  Round 2 output tokens: fixed at {r2_lo}")
     else:
+        clamp_note = " (sampled 0 → 1 for API)" if r2_lo == 0 else ""
         print(
-            f"  Round 2 output tokens: uniform random in [{r2_lo}, {r2_hi}] (seed={args.seed})"
+            f"  Round 2 output tokens: uniform random in [{r2_lo}, {r2_hi}] (seed={args.seed}){clamp_note}"
         )
     print(
         f"  Prompt length: min={min(round2_prompt_lens)} max={max(round2_prompt_lens)} "
@@ -402,14 +416,14 @@ def main():
         "--round2-output-min",
         type=int,
         default=None,
-        help="Round 2 only: min max_tokens per request (inclusive). "
+        help="Round 2 only: min max_tokens per request (inclusive); may be 0 (0 is clamped to 1). "
         "Use with --round2-output-max; omit both to fix length at --output-tokens.",
     )
     p.add_argument(
         "--round2-output-max",
         type=int,
         default=None,
-        help="Round 2 only: max max_tokens per request (inclusive).",
+        help="Round 2 only: max max_tokens per request (inclusive); must be >= 1.",
     )
     p.add_argument("--min-prompt-tokens", type=int, default=64)
     p.add_argument("--max-prompt-tokens", type=int, default=8192)
