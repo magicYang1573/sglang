@@ -71,7 +71,8 @@ SKIP_SERVER="${SKIP_SERVER:-0}"
 
 # Conda / venv: same interpreter for launch_server and e2e_bench_fast (override before run)
 SGLANG_ENV_SCRIPT="${SGLANG_ENV_SCRIPT:-${HOME}/env.sh}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+# Default: lab sgl env; override with PYTHON_BIN or --python on other machines.
+PYTHON_BIN="${PYTHON_BIN:-/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_FAST="${E2E_FAST:-${SCRIPT_DIR}/e2e_bench_fast.py}"
