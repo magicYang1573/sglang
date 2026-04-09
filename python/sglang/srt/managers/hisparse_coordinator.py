@@ -206,20 +206,20 @@ class HiSparseCoordinator:
     def _should_use_host_extend_path(self, req: Req, prefix_len: int) -> bool:
         """Use host-backed extend for long prefix-hit requests.
 
-        When the request only needs to extend one token after a very long prefix
-        hit, restoring the full prefix back into a contiguous device block is
-        too expensive. In this case we keep the prefix in host memory and let
-        the EXTEND path fetch top-k entries from host, similar to decode.
+        When the prefix is longer than the device buffer, restoring the full
+        prefix back into a contiguous device block is infeasible.  In this case
+        we only restore the tail page (needed by alloc_extend) and keep the
+        rest in host memory, letting the decode path fetch top-k entries from
+        host via swap-in as usual.
+
+        This applies regardless of extend_input_len — even multi-token extends
+        only need the tail page restored for page-aligned allocation.
         """
-        return (
-            prefix_len > 0
-            and req.extend_input_len == 1
-            and len(req.fill_ids) > self.device_buffer_size
-        )
+        return prefix_len > 0 and prefix_len > self.device_buffer_size
 
     def _ensure_restored_device_block(
         self, entry: PrefixHostCacheEntry, prefix_len: int
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         page_size = self.mem_pool_device.page_size
         alloc_size = ((prefix_len + page_size - 1) // page_size) * page_size
 
@@ -236,9 +236,12 @@ class HiSparseCoordinator:
             alloc_size
         )
         if block is None:
-            raise RuntimeError(
-                f"HiSparse prefix reload failed: need {alloc_size} device slots"
+            logger.warning(
+                "HiSparse prefix full-restore alloc failed: need %d device slots, "
+                "falling back to tail-page restore",
+                alloc_size,
             )
+            return None, old_block
         entry.restored_device_block = block
         entry.restored_prefix_len = prefix_len
         return block[:prefix_len], old_block
@@ -301,6 +304,11 @@ class HiSparseCoordinator:
         restored_device, retired_block = self._ensure_restored_device_block(
             entry, prefix_len
         )
+        if restored_device is None:
+            if retired_block is not None and retired_block.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(retired_block)
+            return self._restore_prefix_tail_for_prefill(req, prefix_len, entry)
+
         restored_device = restored_device.contiguous()
         old_positive = torch.unique(mapping[mapping > 0])
         if retired_block is not None and retired_block.numel() > 0:
