@@ -1,0 +1,16 @@
+run_all_experiments.sh
+timestamp=20260409_184722
+MODEL_PATH=/data3/yt/models/DeepSeek-V3.2-AWQ
+MODEL_CLIENT=deepseek-ai/DeepSeek-V3.2
+TP=8 DP_SIZE=8 PORT=30000
+RESULTS_DIR=./my_run_all
+CONTEXT_LENGTHS=16384 32768 65536 131072
+SCHEMES=dram cxl rdma_local_0 rdma_local_50
+NUM_REQUESTS=512 NUM_UNIQUE_PROMPTS=1
+OUTPUT_TOKENS=512 (Round 1 / synthetic)
+ROUND2_OUTPUT_MIN=0 ROUND2_OUTPUT_MAX=1024
+MAX_CONCURRENCY=128
+server_lifecycle=one_start_stop_per_scheme_x_context (no shared KV between cases)
+SGLANG_ENV_SCRIPT=/root/env.sh
+PYTHON_BIN=/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+python_executable=/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
