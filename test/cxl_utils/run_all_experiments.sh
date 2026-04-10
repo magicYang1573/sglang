@@ -12,7 +12,7 @@
 #   e2e_bench_fast run → stop server.  No shared process between cases.
 #
 # Server (each case): DeepSeek-V3.2 AWQ, TP=8, dp-size=8, DPA, bfloat16,
-#   mem-fraction-static 0.7, HiSparse with scheme-specific JSON.
+#   mem-fraction-static 0.85, max-total-tokens 200000, HiSparse with scheme-specific JSON.
 #
 # Client: test/cxl_utils/e2e_bench_fast.py (two-round prefix-cache bench).
 #   All JSON + per-run logs go under RESULTS_DIR (single folder).
@@ -27,10 +27,10 @@
 #
 # Optional env overrides:
 #   MODEL_CLIENT   — HF id for tokenizer/client (default: deepseek-ai/DeepSeek-V3.2)
-#   PORT, TP, DP_SIZE, IB_DEVICE, CXL_DEV_PATH, CXL_MAP_BYTES
+#   PORT, TP, DP_SIZE, MEM_FRACTION_STATIC, MAX_TOTAL_TOKENS, IB_DEVICE, CXL_DEV_PATH, CXL_MAP_BYTES
 #   NUM_REQUESTS (default 512), NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS (Round 1 / synthetic)
 #   ROUND2_OUTPUT_MIN (default 0), ROUND2_OUTPUT_MAX (default 1024) — Round 2 random max_tokens
-#   MAX_CONCURRENCY (default 128), REPEAT_MODE
+#   MAX_CONCURRENCY (default 64), REPEAT_MODE
 #   HF_ENDPOINT, RESULTS_DIR, SERVER_STARTUP_WAIT
 #   SKIP_SERVER=1  — do not start/kill server (client-only; you must align server
 #                    with each case manually — not recommended for full matrix)
@@ -45,11 +45,13 @@ MODEL_CLIENT="${MODEL_CLIENT:-deepseek-ai/DeepSeek-V3.2}"
 TP="${TP:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 PORT="${PORT:-30000}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.7}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-200000}"
 
 IB_DEVICE="${IB_DEVICE:-mlx5_0}"
 CXL_DEV_PATH="${CXL_DEV_PATH:-/dev/dax0.0}"
-CXL_MAP_BYTES="${CXL_MAP_BYTES:-137438953472}"
+# Default 256 GiB (274877906944 bytes); override with CXL_MAP_BYTES or --cxl-map-bytes
+CXL_MAP_BYTES="${CXL_MAP_BYTES:-274877906944}"
 
 NUM_REQUESTS="${NUM_REQUESTS:-512}"
 NUM_UNIQUE_PROMPTS="${NUM_UNIQUE_PROMPTS:-1}"
@@ -59,7 +61,7 @@ OUTPUT_TOKENS="${OUTPUT_TOKENS:-512}"
 ROUND2_OUTPUT_MIN="${ROUND2_OUTPUT_MIN:-0}"
 ROUND2_OUTPUT_MAX="${ROUND2_OUTPUT_MAX:-1024}"
 REQUEST_RATE="${REQUEST_RATE:-0}"
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-128}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-64}"
 REPEAT_MODE="${REPEAT_MODE:-interleaved}"
 PROMPT_MODE="${PROMPT_MODE:-synthetic}"
 SEED="${SEED:-42}"
@@ -108,6 +110,8 @@ while [[ $# -gt 0 ]]; do
     --tp) TP="$2"; shift 2 ;;
     --dp-size) DP_SIZE="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --mem-fraction-static) MEM_FRACTION_STATIC="$2"; shift 2 ;;
+    --max-total-tokens) MAX_TOTAL_TOKENS="$2"; shift 2 ;;
     --results-dir) RESULTS_DIR="$2"; mkdir -p "${RESULTS_DIR}"; shift 2 ;;
     --num-requests) NUM_REQUESTS="$2"; shift 2 ;;
     --num-unique-prompts) NUM_UNIQUE_PROMPTS="$2"; shift 2 ;;
@@ -211,6 +215,7 @@ start_server_for_scheme() {
     --enable-hisparse \
     --hisparse-config "${cfg}" \
     --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+    --max-total-tokens "${MAX_TOTAL_TOKENS}" \
     --port "${PORT}" \
     >"${log_file}" 2>&1 &
   SERVER_PID=$!
@@ -246,6 +251,7 @@ run_e2e_fast() {
   echo "MODEL_PATH=${MODEL_PATH}"
   echo "MODEL_CLIENT=${MODEL_CLIENT}"
   echo "TP=${TP} DP_SIZE=${DP_SIZE} PORT=${PORT}"
+  echo "MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC} MAX_TOTAL_TOKENS=${MAX_TOTAL_TOKENS}"
   echo "RESULTS_DIR=${RESULTS_DIR}"
   echo "CONTEXT_LENGTHS=${CONTEXT_LENGTHS[*]}"
   echo "SCHEMES=${SCHEMES[*]}"
@@ -271,6 +277,7 @@ echo "============================================================"
 echo "Model (server):     ${MODEL_PATH}"
 echo "Model (client):     ${MODEL_CLIENT}"
 echo "TP / DP:            ${TP} / ${DP_SIZE}"
+echo "mem-fraction / max-total-tokens: ${MEM_FRACTION_STATIC} / ${MAX_TOTAL_TOKENS}"
 echo "Context lengths:    ${CONTEXT_LENGTHS[*]}"
 echo "Schemes:            ${SCHEMES[*]}"
 echo "Client: num-requests=${NUM_REQUESTS} max-concurrency=${MAX_CONCURRENCY}"
