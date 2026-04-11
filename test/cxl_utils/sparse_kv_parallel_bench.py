@@ -7,14 +7,15 @@ Measures **concurrent** GPU scatter-read latency to evaluate CXL interleave
 benefit under the DPA (Data-Parallel Attention) model, where multiple ranks
 (GPUs) read KV cache from host memory simultaneously.
 
+Iterates over GPU counts (e.g. 2, 4, 8) to show how contention scales:
+
 Backends:
-  - DRAM:   2 GPUs concurrently read from pinned DRAM (baseline)
-  - CXL-x1: 2 GPUs concurrently read from the SAME CXL device
-  - CXL-x2: 2 GPUs concurrently read from DIFFERENT CXL devices (interleave)
+  - DRAM:   N GPUs concurrently read from pinned DRAM (baseline)
+  - CXL-x1: N GPUs concurrently read from the SAME CXL device
+  - CXL-x2: N GPUs interleaved across 2 CXL devices (gpu_rank % 2)
 
 Each GPU reads num_tokens discrete entries of item_size bytes.
-The reported latency is the wall-clock time from launch to BOTH GPUs finishing
-(i.e. max of the two), which reflects the actual DPA decode latency.
+The reported latency is the wall-clock max across all GPUs per iteration.
 
 Uses DeepSeek-V3.2 FP8 packed MLA parameters:
   item_size = 656 bytes, store_dtype = uint8
@@ -26,11 +27,10 @@ import ctypes.util
 import json
 import mmap as _mmap_mod
 import os
-import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -66,13 +66,6 @@ extern "C" __global__ void scatter_read_kernel(
     const int64_t* __restrict__ indices,
     int64_t item_size_bytes);
 
-extern "C" __global__ void scatter_read_interleave_kernel(
-    const uint64_t* __restrict__ src_ptrs,
-    uint8_t* __restrict__ dst,
-    const int64_t* __restrict__ indices,
-    const int32_t* __restrict__ device_map,
-    int64_t item_size_bytes);
-
 void launch_scatter(int64_t src_ptr, torch::Tensor dst, torch::Tensor indices,
                     int64_t item_size) {
     int num_tokens = indices.size(0);
@@ -86,35 +79,14 @@ void launch_scatter(int64_t src_ptr, torch::Tensor dst, torch::Tensor indices,
         item_size);
 }
 
-void launch_scatter_interleave(torch::Tensor src_ptrs, torch::Tensor dst,
-                               torch::Tensor indices, torch::Tensor device_map,
-                               int64_t item_size) {
-    int num_tokens = indices.size(0);
-    dim3 grid(num_tokens);
-    dim3 block(256);
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
-    scatter_read_interleave_kernel<<<grid, block, 0, stream>>>(
-        reinterpret_cast<const uint64_t*>(src_ptrs.data_ptr<int64_t>()),
-        dst.data_ptr<uint8_t>(),
-        indices.data_ptr<int64_t>(),
-        device_map.data_ptr<int32_t>(),
-        item_size);
-}
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("launch_scatter", &launch_scatter,
-          "Single-source scatter read");
-    m.def("launch_scatter_interleave", &launch_scatter_interleave,
-          "Multi-source interleave scatter read");
+    m.def("launch_scatter", &launch_scatter, "Single-source scatter read");
 }
 """)
 
     _scatter_torch_module = load(
         name="scatter_torch_ext",
-        sources=[
-            str(ROOT / "sparse_kv_kernel.cu"),
-            str(wrapper_src),
-        ],
+        sources=[str(ROOT / "sparse_kv_kernel.cu"), str(wrapper_src)],
         extra_cuda_cflags=["-O3", "--use_fast_math"],
         build_directory=str(build_dir),
         verbose=False,
@@ -238,11 +210,10 @@ class CXLDeviceRegion:
 
 def compute_stats(latencies: List[float], num_tokens: int, item_size: int,
                   num_gpus: int = 1) -> Dict:
-    """Compute stats. Effective BW is total data across all GPUs / time."""
     arr = np.array(latencies)
-    data_bytes = num_tokens * item_size * num_gpus
+    total_data = num_tokens * item_size * num_gpus
     mean_us = float(np.mean(arr))
-    bw_gbs = (data_bytes / 1e9) / (mean_us / 1e6) if mean_us > 0 else 0.0
+    bw_gbs = (total_data / 1e9) / (mean_us / 1e6) if mean_us > 0 else 0.0
     return {
         "mean_us": mean_us,
         "std_us": float(np.std(arr)),
@@ -254,21 +225,25 @@ def compute_stats(latencies: List[float], num_tokens: int, item_size: int,
     }
 
 
+FMT_W = 24
+
+
 def fmt_row(name: str, s: Dict) -> str:
     return (
-        f"{name:<20s}| {s['mean_us']:>9.2f} | {s['std_us']:>8.2f} | "
+        f"{name:<{FMT_W}s}| {s['mean_us']:>9.2f} | {s['std_us']:>8.2f} | "
         f"{s['p50_us']:>9.2f} | {s['p99_us']:>9.2f} | {s['agg_bw_gbs']:>13.2f}"
     )
 
 
-TABLE_HDR = (
-    f"{'Backend':<20s}| {'Mean (μs)':>9s} | {'Std (μs)':>8s} | "
-    f"{'P50 (μs)':>9s} | {'P99 (μs)':>9s} | {'Agg.BW (GB/s)':>13s}"
-)
+def table_hdr() -> str:
+    return (
+        f"{'Backend':<{FMT_W}s}| {'Mean (μs)':>9s} | {'Std (μs)':>8s} | "
+        f"{'P50 (μs)':>9s} | {'P99 (μs)':>9s} | {'Agg.BW (GB/s)':>13s}"
+    )
 
 
 # ---------------------------------------------------------------------------
-#  Per-GPU worker: runs scatter read on a dedicated CUDA stream
+#  Per-GPU worker
 # ---------------------------------------------------------------------------
 
 def _gpu_worker(
@@ -284,25 +259,18 @@ def _gpu_worker(
     result_holder: list,
     worker_idx: int,
 ):
-    """Thread worker: each thread owns a GPU and runs scatter reads.
-
-    All workers synchronize via barrier before each timed iteration so that
-    the reads happen concurrently.
-    """
     torch.cuda.set_device(gpu_id)
-    device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device=f"cuda:{gpu_id}")
+    dev = f"cuda:{gpu_id}"
+    device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device=dev)
 
-    # Warmup
     for _ in range(warmup):
-        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device=f"cuda:{gpu_id}")
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device=dev)
         scatter_mod.launch_scatter(src_ptr, device_buf, indices, item_size)
         torch.cuda.synchronize(gpu_id)
 
     latencies = []
     for _ in range(iters):
-        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device=f"cuda:{gpu_id}")
-
-        # Sync all GPUs before launching
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device=dev)
         barrier.wait()
 
         start = torch.cuda.Event(enable_timing=True)
@@ -311,7 +279,7 @@ def _gpu_worker(
         scatter_mod.launch_scatter(src_ptr, device_buf, indices, item_size)
         end.record()
         torch.cuda.synchronize(gpu_id)
-        latencies.append(start.elapsed_time(end) * 1000.0)  # ms → μs
+        latencies.append(start.elapsed_time(end) * 1000.0)
 
     result_holder[worker_idx] = latencies
 
@@ -326,10 +294,7 @@ def bench_parallel(
     warmup: int,
     iters: int,
 ) -> List[float]:
-    """Run scatter reads on multiple GPUs concurrently.
-
-    Returns wall-clock latencies: for each iteration, max(gpu0_lat, gpu1_lat).
-    """
+    """Returns wall-clock latencies: max across GPUs per iteration."""
     num_gpus = len(gpu_ids)
     assert len(src_ptrs) == num_gpus
 
@@ -352,7 +317,6 @@ def bench_parallel(
     for t in threads:
         t.join()
 
-    # Wall-clock = max across GPUs per iteration
     wall_latencies = []
     for it in range(iters):
         max_lat = max(results[g][it] for g in range(num_gpus))
@@ -378,7 +342,7 @@ def cleanup_dram_pool(buf: torch.Tensor):
 
 
 # ---------------------------------------------------------------------------
-#  Main
+#  Run one (num_gpus, num_tokens) configuration
 # ---------------------------------------------------------------------------
 
 def run_config(
@@ -396,7 +360,7 @@ def run_config(
     results = {}
     num_gpus = len(gpu_ids)
 
-    # --- DRAM: all GPUs read from the same pinned DRAM buffer ---
+    # --- DRAM: all GPUs read from the same pinned DRAM ---
     if "dram" in backends:
         host_buf = init_dram_pool(seq_len, item_size)
         src_ptr = host_buf.data_ptr()
@@ -410,7 +374,7 @@ def run_config(
         cleanup_dram_pool(host_buf)
         del host_buf
 
-    # --- CXL x1: all GPUs read from the SAME CXL device ---
+    # --- CXL-x1: all GPUs read from the SAME CXL device ---
     if "cxl_x1" in backends:
         total_bytes = seq_len * item_size
         map_bytes = align_to_2mb(total_bytes)
@@ -426,17 +390,19 @@ def run_config(
         print(fmt_row(f"CXL-x1 ({num_gpus}GPU)", stats))
         region.close()
 
-    # --- CXL x2: each GPU reads from its OWN CXL device ---
+    # --- CXL-x2: GPUs interleaved across 2 CXL devices (rank % 2) ---
     if "cxl_x2" in backends:
         total_bytes = seq_len * item_size
         map_bytes = align_to_2mb(total_bytes)
+        num_cxl = len(cxl_devs)
         regions = []
-        ptrs = []
-        for i, dev_path in enumerate(cxl_devs[:num_gpus]):
-            r = CXLDeviceRegion(dev_path, map_bytes, gpu_ids[i])
+        for dev_path in cxl_devs:
+            r = CXLDeviceRegion(dev_path, map_bytes, gpu_ids[0])
             r.write_random_data(total_bytes)
             regions.append(r)
-            ptrs.append(r.device_ptr)
+
+        # gpu_rank % num_cxl → which CXL device
+        ptrs = [regions[i % num_cxl].device_ptr for i in range(num_gpus)]
 
         lats = bench_parallel(
             scatter_mod, gpu_ids, ptrs,
@@ -444,7 +410,14 @@ def run_config(
         )
         stats = compute_stats(lats, num_tokens, item_size, num_gpus)
         results["cxl_x2"] = stats
+        # Show distribution
+        dist = {}
+        for i in range(num_gpus):
+            d = i % num_cxl
+            dist.setdefault(d, []).append(gpu_ids[i])
+        dist_str = ", ".join(f"dev{k}→GPU{v}" for k, v in sorted(dist.items()))
         print(fmt_row(f"CXL-x2 ({num_gpus}GPU)", stats))
+        print(f"    interleave: {dist_str}")
         for r in regions:
             r.close()
 
@@ -453,19 +426,27 @@ def run_config(
 
 def print_comparison(results: Dict[str, Dict]):
     if "dram" in results and "cxl_x1" in results:
-        overhead = (results["cxl_x1"]["mean_us"] / results["dram"]["mean_us"] - 1) * 100
-        print(f"  CXL-x1 vs DRAM overhead: +{overhead:.1f}%")
+        ratio = results["cxl_x1"]["mean_us"] / results["dram"]["mean_us"]
+        print(f"  CXL-x1 vs DRAM: {ratio:.2f}x")
     if "cxl_x1" in results and "cxl_x2" in results:
         speedup = results["cxl_x1"]["mean_us"] / results["cxl_x2"]["mean_us"]
         print(f"  CXL-x2 vs CXL-x1 speedup: {speedup:.2f}x")
     if "dram" in results and "cxl_x2" in results:
-        overhead = (results["cxl_x2"]["mean_us"] / results["dram"]["mean_us"] - 1) * 100
-        print(f"  CXL-x2 vs DRAM overhead: +{overhead:.1f}%")
+        ratio = results["cxl_x2"]["mean_us"] / results["dram"]["mean_us"]
+        print(f"  CXL-x2 vs DRAM: {ratio:.2f}x")
     print()
 
 
-def print_sweep_table(sweep: Dict[int, Dict[str, Dict]], backends: List[str]):
-    print("\n[Sweep: varying num_tokens]\n")
+# ---------------------------------------------------------------------------
+#  Sweep table: one per (seq_len, num_gpus), varying num_tokens
+# ---------------------------------------------------------------------------
+
+def print_sweep_table(
+    sweep: Dict[int, Dict[str, Dict]],
+    backends: List[str],
+    num_gpus: int,
+):
+    print(f"\n[Sweep: {num_gpus} GPUs, varying num_tokens]\n")
     has_x1 = "cxl_x1" in backends
     has_x2 = "cxl_x2" in backends
 
@@ -478,6 +459,8 @@ def print_sweep_table(sweep: Dict[int, Dict[str, Dict]], backends: List[str]):
         cols.append("x1/DRAM")
     if has_x1 and has_x2:
         cols.append("x1/x2")
+    if has_x2:
+        cols.append("x2/DRAM")
 
     hdr = " | ".join(f"{c:>12s}" for c in cols)
     print(hdr)
@@ -502,9 +485,74 @@ def print_sweep_table(sweep: Dict[int, Dict[str, Dict]], backends: List[str]):
         if has_x1 and has_x2:
             speedup = x1_us / x2_us if x2_us > 0 else float("nan")
             vals.append(f"{speedup:>11.2f}x")
+        if has_x2:
+            ratio = x2_us / dram_us if dram_us > 0 else float("nan")
+            vals.append(f"{ratio:>11.2f}x")
 
         print(" | ".join(vals))
 
+
+# ---------------------------------------------------------------------------
+#  GPU-count scaling summary table
+# ---------------------------------------------------------------------------
+
+def print_gpu_scaling_summary(
+    all_gpu_results: Dict[int, Dict[int, Dict[str, Dict]]],
+    backends: List[str],
+    num_tokens_list: List[int],
+):
+    """Print a compact summary table: for each num_tokens, show latency across GPU counts."""
+    has_x1 = "cxl_x1" in backends
+    has_x2 = "cxl_x2" in backends
+    gpu_counts = sorted(all_gpu_results.keys())
+
+    print(f"\n{'='*78}")
+    print("  GPU Scaling Summary (mean latency μs)")
+    print(f"{'='*78}")
+
+    for nt in num_tokens_list:
+        print(f"\n  num_tokens = {nt}")
+        cols = ["#GPUs", "DRAM"]
+        if has_x1:
+            cols.append("CXL-x1")
+        if has_x2:
+            cols.append("CXL-x2")
+        if has_x1:
+            cols.append("x1/DRAM")
+        if has_x1 and has_x2:
+            cols.append("x1/x2")
+
+        hdr = " | ".join(f"{c:>10s}" for c in cols)
+        print(f"  {hdr}")
+        print(f"  {'-' * len(hdr)}")
+
+        for ng in gpu_counts:
+            sweep = all_gpu_results[ng]
+            if nt not in sweep:
+                continue
+            r = sweep[nt]
+            dram_us = r.get("dram", {}).get("mean_us", float("nan"))
+            vals = [f"{ng:>10d}", f"{dram_us:>10.2f}"]
+            x1_us = float("nan")
+            x2_us = float("nan")
+            if has_x1:
+                x1_us = r.get("cxl_x1", {}).get("mean_us", float("nan"))
+                vals.append(f"{x1_us:>10.2f}")
+            if has_x2:
+                x2_us = r.get("cxl_x2", {}).get("mean_us", float("nan"))
+                vals.append(f"{x2_us:>10.2f}")
+            if has_x1:
+                ratio = x1_us / dram_us if dram_us > 0 else float("nan")
+                vals.append(f"{ratio:>9.2f}x")
+            if has_x1 and has_x2:
+                speedup = x1_us / x2_us if x2_us > 0 else float("nan")
+                vals.append(f"{speedup:>9.2f}x")
+            print(f"  {' | '.join(vals)}")
+
+
+# ---------------------------------------------------------------------------
+#  Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -515,8 +563,12 @@ def main():
         help="Comma-separated backends: dram, cxl_x1, cxl_x2",
     )
     parser.add_argument(
-        "--gpu-ids", type=str, default="0,1",
-        help="Comma-separated GPU IDs (2 GPUs for parallel test)",
+        "--gpu-ids", type=str, default="0,1,2,3,4,5,6,7",
+        help="Comma-separated GPU IDs (full pool of available GPUs)",
+    )
+    parser.add_argument(
+        "--gpu-counts", type=str, default="2,4,8",
+        help="Comma-separated GPU counts to test (subset of --gpu-ids)",
     )
     parser.add_argument(
         "--cxl-dev", type=str, default="/dev/dax0.0",
@@ -524,16 +576,14 @@ def main():
     )
     parser.add_argument(
         "--cxl-devs", type=str, default="/dev/dax0.0,/dev/dax1.0",
-        help="Comma-separated CXL DAX devices for interleave (cxl_x2)",
+        help="CXL DAX devices for interleave (cxl_x2); GPUs assigned via rank %% num_devs",
     )
     parser.add_argument(
         "--seq-lens", type=str, default="32768,65536,131072",
-        help="Comma-separated sequence lengths",
     )
     parser.add_argument(
         "--num-tokens", type=str,
         default="64,128,256,512,1024,2048,4096,8192,16384",
-        help="Comma-separated num_tokens values",
     )
     parser.add_argument("--item-size", type=int, default=656)
     parser.add_argument("--warmup", type=int, default=50)
@@ -543,105 +593,123 @@ def main():
     args = parser.parse_args()
 
     backends = [b.strip().lower() for b in args.backends.split(",")]
-    gpu_ids = [int(g) for g in args.gpu_ids.split(",")]
+    all_gpu_ids = [int(g) for g in args.gpu_ids.split(",")]
+    gpu_counts = [int(c) for c in args.gpu_counts.split(",")]
     seq_lens = [int(s) for s in args.seq_lens.split(",")]
     num_tokens_list = [int(k) for k in args.num_tokens.split(",")]
     cxl_devs = [d.strip() for d in args.cxl_devs.split(",")]
 
-    num_gpus = len(gpu_ids)
+    # Validate GPU counts
+    for gc in gpu_counts:
+        if gc > len(all_gpu_ids):
+            print(f"[ERROR] --gpu-counts {gc} > available GPUs {len(all_gpu_ids)}")
+            return
 
     print("=" * 78)
     print("Multi-GPU Parallel Sparse KV Read Latency Benchmark")
     print("=" * 78)
     print(f"Model:       DeepSeek-V3.2 (MLA FP8, item_size={args.item_size}B)")
-    print(f"GPUs:        {gpu_ids} ({num_gpus} GPUs concurrent)")
+    print(f"GPU pool:    {all_gpu_ids}")
+    print(f"GPU counts:  {gpu_counts}")
     print(f"Backends:    {backends}")
     print(f"Seq lens:    {seq_lens}")
     print(f"Num tokens:  {num_tokens_list}")
     if "cxl_x1" in backends:
         print(f"CXL (x1):    {args.cxl_dev}")
     if "cxl_x2" in backends:
-        print(f"CXL (x2):    {cxl_devs}")
+        print(f"CXL (x2):    {cxl_devs} (GPUs assigned via rank %% {len(cxl_devs)})")
     print(f"Warmup: {args.warmup}, Iters: {args.iters}")
 
-    # Validate
-    if "cxl_x2" in backends and len(cxl_devs) < num_gpus:
-        print(f"[WARN] cxl_x2 requires {num_gpus} CXL devices but only "
-              f"{len(cxl_devs)} given; removing cxl_x2.")
-        backends.remove("cxl_x2")
-    for dp in (cxl_devs if "cxl_x2" in backends else []):
-        if not os.path.exists(dp):
-            print(f"[WARN] CXL device {dp} not found; removing cxl_x2.")
-            backends.remove("cxl_x2")
-            break
+    # Validate CXL devices
     if "cxl_x1" in backends and not os.path.exists(args.cxl_dev):
-        print(f"[WARN] CXL device {args.cxl_dev} not found; removing cxl_x1.")
+        print(f"[WARN] {args.cxl_dev} not found; removing cxl_x1.")
         backends.remove("cxl_x1")
+    if "cxl_x2" in backends:
+        for dp in cxl_devs:
+            if not os.path.exists(dp):
+                print(f"[WARN] {dp} not found; removing cxl_x2.")
+                backends.remove("cxl_x2")
+                break
 
     print("\nBuilding GPU scatter kernel...")
     scatter_mod = _build_scatter_torch_module()
 
-    all_results = {}
+    all_results = {}  # seq_len → gpu_count → num_tokens → backend → stats
 
     for seq_len in seq_lens:
-        print(f"\n{'='*78}")
-        print(f"  seq_len = {seq_len} ({seq_len // 1024}K)")
-        print(f"{'='*78}")
+        all_results[seq_len] = {}
 
-        sweep = {}
-        for num_tokens in num_tokens_list:
-            if num_tokens > seq_len:
-                print(f"\n  [SKIP] num_tokens={num_tokens} > seq_len={seq_len}")
-                continue
+        for num_gpus in gpu_counts:
+            gpu_ids = all_gpu_ids[:num_gpus]
 
-            data_kb = num_tokens * args.item_size / 1024
-            unit = "KB" if data_kb < 1024 else "MB"
-            data_val = data_kb if data_kb < 1024 else data_kb / 1024
-            print(f"\n[Config: seq_len={seq_len}, num_tokens={num_tokens}, "
-                  f"data/GPU={data_val:.2f}{unit}, GPUs={num_gpus}]")
-            print()
-            print(TABLE_HDR)
-            print("-" * len(TABLE_HDR))
+            print(f"\n{'='*78}")
+            print(f"  seq_len = {seq_len} ({seq_len // 1024}K), "
+                  f"GPUs = {gpu_ids} ({num_gpus} concurrent)")
+            print(f"{'='*78}")
 
-            results = run_config(
-                scatter_mod=scatter_mod,
-                backends=backends,
-                gpu_ids=gpu_ids,
-                seq_len=seq_len,
-                num_tokens=num_tokens,
-                item_size=args.item_size,
-                cxl_dev=args.cxl_dev,
-                cxl_devs=cxl_devs,
-                warmup=args.warmup,
-                iters=args.iters,
-            )
-            print_comparison(results)
-            sweep[num_tokens] = results
+            sweep = {}
 
-        if len(sweep) > 1:
-            print_sweep_table(sweep, backends)
+            for num_tokens in num_tokens_list:
+                if num_tokens > seq_len:
+                    print(f"\n  [SKIP] num_tokens={num_tokens} > seq_len={seq_len}")
+                    continue
 
-        all_results[seq_len] = sweep
+                data_kb = num_tokens * args.item_size / 1024
+                unit = "KB" if data_kb < 1024 else "MB"
+                data_val = data_kb if data_kb < 1024 else data_kb / 1024
+                print(f"\n[num_tokens={num_tokens}, data/GPU={data_val:.2f}{unit}, "
+                      f"{num_gpus} GPUs]")
+                print()
+                print(table_hdr())
+                print("-" * len(table_hdr()))
 
+                results = run_config(
+                    scatter_mod=scatter_mod,
+                    backends=backends,
+                    gpu_ids=gpu_ids,
+                    seq_len=seq_len,
+                    num_tokens=num_tokens,
+                    item_size=args.item_size,
+                    cxl_dev=args.cxl_dev,
+                    cxl_devs=cxl_devs,
+                    warmup=args.warmup,
+                    iters=args.iters,
+                )
+                print_comparison(results)
+                sweep[num_tokens] = results
+
+            if len(sweep) > 1:
+                print_sweep_table(sweep, backends, num_gpus)
+
+            all_results[seq_len][num_gpus] = sweep
+
+        # GPU scaling summary for this seq_len
+        print_gpu_scaling_summary(all_results[seq_len], backends, num_tokens_list)
+
+    # Save JSON
     if args.output:
         out_dir = Path(args.output)
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d_%H%M%S")
         out_path = out_dir / f"sparse_kv_parallel_bench_{ts}.json"
         serializable = {}
-        for sl, sr in all_results.items():
+        for sl, gpu_data in all_results.items():
             serializable[str(sl)] = {}
-            for nt, res in sr.items():
-                serializable[str(sl)][str(nt)] = res
+            for ng, sweep in gpu_data.items():
+                serializable[str(sl)][str(ng)] = {}
+                for nt, res in sweep.items():
+                    serializable[str(sl)][str(ng)][str(nt)] = res
         with open(out_path, "w") as f:
             json.dump(
                 {
                     "config": {
                         "backends": backends,
-                        "gpu_ids": gpu_ids,
+                        "gpu_ids": all_gpu_ids,
+                        "gpu_counts": gpu_counts,
                         "item_size": args.item_size,
                         "seq_lens": seq_lens,
                         "num_tokens": num_tokens_list,
+                        "cxl_devs": cxl_devs,
                         "warmup": args.warmup,
                         "iters": args.iters,
                     },
