@@ -7,14 +7,19 @@ registered CXL base pointer via torch.frombuffer (zero-copy).
 Data transfer does NOT use cxl_mem_ext's copy functions — all reads go
 through HiSparse's existing JIT kernel (ld.global.nc.b64) and cudaMemcpy,
 which achieve ~1.0-1.7x DRAM latency on CXL.
+
+Multi-device interleave: when multiple CXL DAX devices are configured,
+ranks are distributed across devices via ``tp_rank % num_devices``.  This
+spreads concurrent GPU reads across independent PCIe/CXL links, providing
+linear aggregate bandwidth scaling.  See design doc §8 for details.
 """
 
 from __future__ import annotations
 
 import ctypes
 import logging
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import torch
 
@@ -27,11 +32,30 @@ HUGE_PAGE_2MB = 2 * 1024 * 1024
 
 @dataclass
 class CXLConfig:
-    """CXL device configuration parsed from hisparse_config JSON."""
+    """CXL device configuration parsed from hisparse_config JSON.
+
+    Single-device (backward compatible):
+        dev_path + map_bytes
+
+    Multi-device interleave:
+        dev_paths + map_bytes_per_device
+        Ranks are assigned to devices via ``tp_rank % len(dev_paths)``.
+    """
 
     dev_path: str = "/dev/dax0.0"
     map_bytes: int = 64 * 1024 * 1024 * 1024  # 64 GB default
     gpu_id: int = 0
+    # Multi-device interleave fields
+    dev_paths: List[str] = field(default_factory=list)
+    map_bytes_per_device: int = 0
+
+    @property
+    def interleave_enabled(self) -> bool:
+        return len(self.dev_paths) > 1
+
+    @property
+    def num_devices(self) -> int:
+        return max(len(self.dev_paths), 1)
 
 
 _cxl_ext_cache = None
@@ -146,8 +170,9 @@ class CXLMemoryRegion:
 
     Lifecycle:
         1. cxl_ext.cxl_init() — mmap + optional cudaHostRegister
-        2. make_tensor() — bump-allocate + torch.frombuffer
-        3. close() — cxl_ext.cxl_close() (unregister + munmap)
+        2. set_partition() — restrict allocator to a rank-local slice
+        3. make_tensor() — bump-allocate + torch.frombuffer
+        4. close() — cxl_ext.cxl_close() (unregister + munmap)
     """
 
     def __init__(self, config: CXLConfig):
@@ -286,6 +311,28 @@ class CXLMemoryRegion:
 
     def __del__(self):
         self.close()
+
+
+def compute_interleave_assignment(
+    tp_rank: int, tp_size: int, num_devices: int
+) -> tuple:
+    """Compute which CXL device a rank uses and its local rank within that device.
+
+    With ``num_devices`` CXL devices and ``tp_size`` ranks, rank *i* is
+    assigned to device ``i % num_devices``.  The *local_rank* is the rank's
+    ordinal among all ranks sharing the same device, and *local_size* is
+    the total number of ranks on that device.
+
+    Returns:
+        (device_idx, local_rank, local_size)
+    """
+    device_idx = tp_rank % num_devices
+    # Ranks on this device: {r for r in range(tp_size) if r % num_devices == device_idx}
+    local_size = sum(1 for r in range(tp_size) if r % num_devices == device_idx)
+    local_rank = sum(
+        1 for r in range(tp_rank) if r % num_devices == device_idx
+    )
+    return device_idx, local_rank, local_size
 
 
 class CXLMLATokenToKVPoolHost(MLATokenToKVPoolHost):

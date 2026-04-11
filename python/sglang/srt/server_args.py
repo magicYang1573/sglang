@@ -5201,7 +5201,11 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'. '
+            "CXL single-device: add '\"cxl\": {\"enabled\": true, \"dev_path\": \"/dev/dax0.0\", \"map_bytes\": 68719476736}'. "
+            "CXL multi-device interleave: add '\"cxl\": {\"enabled\": true, "
+            "\"dev_paths\": [\"/dev/dax0.0\", \"/dev/dax1.0\"], \"map_bytes_per_device\": 34359738368}'. "
+            "Ranks are assigned to devices via tp_rank %% num_devices for linear bandwidth scaling.",
         )
 
         # LMCache

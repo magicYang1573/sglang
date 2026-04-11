@@ -833,7 +833,12 @@ class ModelRunnerKVCacheMixin:
         return capacity
 
     def _apply_cxl_capacity_cap(self: ModelRunner, capacity: int) -> int:
-        """Cap token capacity so the host pool fits in the CXL partition."""
+        """Cap token capacity so the host pool fits in the CXL partition.
+
+        Handles both single-device and multi-device interleave modes.
+        In interleave mode, each device is shared by fewer ranks, so
+        per-rank partition is larger (= more capacity per rank).
+        """
         import json
 
         try:
@@ -850,10 +855,30 @@ class ModelRunnerKVCacheMixin:
         hisparse_cfg = parse_hisparse_config(self.server_args)
         host_to_device_ratio = hisparse_cfg.host_to_device_ratio
 
-        cxl_total_bytes = cxl_cfg.get("map_bytes", 64 * 1024**3)
-        # Per-rank partition (2MB aligned down)
         huge_page = 2 * 1024 * 1024
-        per_rank = cxl_total_bytes // self.tp_size
+
+        dev_paths = cxl_cfg.get("dev_paths", [])
+        num_devices = len(dev_paths)
+
+        if num_devices > 1:
+            # Interleave mode: each device is shared by tp_size/num_devices ranks.
+            # Per-device bytes from map_bytes_per_device (fallback to map_bytes).
+            device_bytes = cxl_cfg.get(
+                "map_bytes_per_device", cxl_cfg.get("map_bytes", 64 * 1024**3)
+            )
+            from sglang.srt.mem_cache.cxl_memory_pool import (
+                compute_interleave_assignment,
+            )
+            _, _, local_size = compute_interleave_assignment(
+                self.tp_rank, self.tp_size, num_devices
+            )
+            per_rank = device_bytes // local_size
+        else:
+            # Single-device mode
+            cxl_total_bytes = cxl_cfg.get("map_bytes", 64 * 1024**3)
+            per_rank = cxl_total_bytes // self.tp_size
+
+        # Align down to 2MB boundary
         per_rank = (per_rank // huge_page) * huge_page
 
         # Compute host bytes per token (MLA: kv_cache_dim * dtype_size * layer_num)
@@ -865,11 +890,12 @@ class ModelRunnerKVCacheMixin:
         if host_bytes_per_token > 0 and host_to_device_ratio > 0:
             max_capacity = int(per_rank / (host_to_device_ratio * host_bytes_per_token))
             if max_capacity < capacity:
+                mode = "interleave" if num_devices > 1 else "single-device"
                 logger.info(
-                    "CXL capacity cap: reducing max_total_num_tokens from %d to %d "
-                    "(CXL partition=%.2f GB, host_to_device_ratio=%d, "
-                    "host_bytes_per_token=%d)",
-                    capacity, max_capacity,
+                    "CXL capacity cap (%s): reducing max_total_num_tokens "
+                    "from %d to %d (CXL partition=%.2f GB, "
+                    "host_to_device_ratio=%d, host_bytes_per_token=%d)",
+                    mode, capacity, max_capacity,
                     per_rank / 1e9, host_to_device_ratio, host_bytes_per_token,
                 )
                 capacity = max_capacity

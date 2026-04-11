@@ -546,30 +546,72 @@ class HiSparseCoordinator:
             CXLConfig,
             CXLMemoryRegion,
             CXLMLATokenToKVPoolHost,
+            compute_interleave_assignment,
         )
 
-        total_map_bytes = cxl_config.get("map_bytes", 64 * 1024**3)
-        region = CXLMemoryRegion(
-            CXLConfig(
-                dev_path=cxl_config.get("dev_path", "/dev/dax0.0"),
-                map_bytes=total_map_bytes,
-                gpu_id=gpu_id,
+        dev_paths = cxl_config.get("dev_paths", [])
+        num_devices = len(dev_paths)
+
+        if num_devices > 1:
+            # Multi-device interleave: tp_rank % num_devices → device selection.
+            # Each device is shared by (tp_size / num_devices) ranks.
+            map_bytes = cxl_config.get(
+                "map_bytes_per_device", cxl_config.get("map_bytes", 64 * 1024**3)
             )
-        )
-        region.init()
+            device_idx, local_rank, local_size = compute_interleave_assignment(
+                tp_rank, tp_size, num_devices
+            )
+            dev_path = dev_paths[device_idx]
 
-        # Partition the CXL region among TP ranks so each rank uses
-        # a disjoint slice. All TP processes mmap the same DAX device
-        # but only allocate from their own partition.
-        region.set_partition(tp_rank, tp_size)
-        self._cxl_region = region
+            region = CXLMemoryRegion(
+                CXLConfig(
+                    dev_path=dev_path,
+                    map_bytes=map_bytes,
+                    gpu_id=gpu_id,
+                    dev_paths=dev_paths,
+                    map_bytes_per_device=map_bytes,
+                )
+            )
+            region.init()
+            region.set_partition(local_rank, local_size)
+            self._cxl_region = region
 
-        logger.info(
-            "HiSparse tp_rank=%d/%d: CXL pool at %s, partition offset=0x%x, "
-            "partition size=%.2f GB",
-            tp_rank, tp_size, cxl_config.get("dev_path"),
-            region._alloc_offset, region._partition_size / 1e9,
-        )
+            logger.info(
+                "HiSparse tp_rank=%d/%d: CXL interleave mode, "
+                "%d devices, assigned to %s (device %d/%d), "
+                "local_rank=%d/%d, partition offset=0x%x, "
+                "partition size=%.2f GB",
+                tp_rank, tp_size, num_devices, dev_path,
+                device_idx, num_devices, local_rank, local_size,
+                region._alloc_offset, region._partition_size / 1e9,
+            )
+        else:
+            # Single-device mode (backward compatible)
+            dev_path = (
+                dev_paths[0]
+                if dev_paths
+                else cxl_config.get("dev_path", "/dev/dax0.0")
+            )
+            total_map_bytes = cxl_config.get("map_bytes", 64 * 1024**3)
+
+            region = CXLMemoryRegion(
+                CXLConfig(
+                    dev_path=dev_path,
+                    map_bytes=total_map_bytes,
+                    gpu_id=gpu_id,
+                )
+            )
+            region.init()
+            region.set_partition(tp_rank, tp_size)
+            self._cxl_region = region
+
+            logger.info(
+                "HiSparse tp_rank=%d/%d: CXL single-device mode at %s, "
+                "partition offset=0x%x, partition size=%.2f GB",
+                tp_rank, tp_size, dev_path,
+                region._alloc_offset, region._partition_size / 1e9,
+            )
+
         return CXLMLATokenToKVPoolHost(
             device_pool=self.mem_pool_device,
             host_to_device_ratio=host_to_device_ratio,

@@ -101,6 +101,16 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             "cxl.enabled and rdma_pool.enabled are mutually exclusive"
         )
 
+    # Validate CXL interleave config
+    if cxl_config and cxl_config.get("enabled"):
+        dev_paths = cxl_config.get("dev_paths", [])
+        if len(dev_paths) > 1 and not cxl_config.get("map_bytes_per_device"):
+            if not cxl_config.get("map_bytes"):
+                raise ValueError(
+                    "CXL interleave requires 'map_bytes_per_device' or "
+                    "'map_bytes' when 'dev_paths' has multiple devices"
+                )
+
     return SparseConfig(
         top_k=top_k,
         device_buffer_size=device_buffer_size,
