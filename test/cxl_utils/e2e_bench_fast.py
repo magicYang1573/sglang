@@ -280,6 +280,7 @@ async def main_async(args):
         model=args.model,
         request_rate=args.request_rate,
         max_concurrency=r1_max_concurrency,
+        request_timeout_s=args.request_timeout_s,
     )
     r1_metrics = eb.compute_round_metrics("Round 1: Warmup", r1_results, r1_duration)
     eb.print_metrics(r1_metrics)
@@ -300,6 +301,7 @@ async def main_async(args):
         model=args.model,
         request_rate=args.request_rate,
         max_concurrency=args.max_concurrency,
+        request_timeout_s=args.request_timeout_s,
     )
     r2_metrics = eb.compute_round_metrics(
         "Round 2: Warm Measurement", r2_results, r2_duration
@@ -358,6 +360,7 @@ async def main_async(args):
         "max_prompt_tokens": args.max_prompt_tokens,
         "request_rate": args.request_rate,
         "max_concurrency": args.max_concurrency,
+        "request_timeout_s": args.request_timeout_s,
         "seed": args.seed,
         "round1_prompt_stats": {
             "mean_prompt_len": int(np.mean(round1_prompt_lens)),
@@ -429,6 +432,13 @@ def main():
     p.add_argument("--max-prompt-tokens", type=int, default=8192)
     p.add_argument("--request-rate", type=float, default=0.0)
     p.add_argument("--max-concurrency", type=int, default=32)
+    p.add_argument(
+        "--request-timeout",
+        type=float,
+        default=600.0,
+        dest="request_timeout_s",
+        help="Per-request HTTP total timeout in seconds (streaming /v1/completions until done)",
+    )
     p.add_argument("--dataset-path", type=str, default="")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--pause-between-rounds", type=float, default=3.0)

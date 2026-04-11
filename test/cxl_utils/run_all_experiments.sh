@@ -28,7 +28,9 @@
 # Optional env overrides:
 #   MODEL_CLIENT   — HF id for tokenizer/client (default: deepseek-ai/DeepSeek-V3.2)
 #   PORT, TP, DP_SIZE, MEM_FRACTION_STATIC, MAX_TOTAL_TOKENS, IB_DEVICE, CXL_DEV_PATH, CXL_MAP_BYTES
-#   NUM_REQUESTS (default 512), NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS (Round 1 / synthetic)
+#   NUM_REQUESTS (default 512), NUM_REQUESTS_RDMA (default 256, rdma_local_* only)
+#   RDMA_REQUEST_TIMEOUT (default 1200) — per-request HTTP timeout for rdma_local_* only
+#   NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS (Round 1 / synthetic)
 #   ROUND2_OUTPUT_MIN (default 0), ROUND2_OUTPUT_MAX (default 1024) — Round 2 random max_tokens
 #   MAX_CONCURRENCY (default 64), REPEAT_MODE
 #   HF_ENDPOINT, RESULTS_DIR, SERVER_STARTUP_WAIT
@@ -54,6 +56,9 @@ CXL_DEV_PATH="${CXL_DEV_PATH:-/dev/dax0.0}"
 CXL_MAP_BYTES="${CXL_MAP_BYTES:-274877906944}"
 
 NUM_REQUESTS="${NUM_REQUESTS:-512}"
+# RDMA schemes use fewer Round-2 requests (same max-concurrency as DRAM/CXL).
+NUM_REQUESTS_RDMA="${NUM_REQUESTS_RDMA:-256}"
+RDMA_REQUEST_TIMEOUT="${RDMA_REQUEST_TIMEOUT:-1200}"
 NUM_UNIQUE_PROMPTS="${NUM_UNIQUE_PROMPTS:-1}"
 # Round 1 synthetic prompts + server warmup length (must be > 0)
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-512}"
@@ -224,7 +229,10 @@ start_server_for_scheme() {
 run_e2e_fast() {
   local out_json="$1"
   local target_tokens="$2"
+  local num_req="${3:?run_e2e_fast: missing num_req}"
+  shift 3
   export HF_ENDPOINT
+  # Remaining args: optional extra e2e_bench_fast flags (e.g. --request-timeout).
   # shellcheck disable=SC2086
   "${PYTHON_BIN}" "${E2E_FAST}" \
     --server-url "http://127.0.0.1:${PORT}" \
@@ -233,7 +241,7 @@ run_e2e_fast() {
     --target-input-tokens "${target_tokens}" \
     --output-tokens "${OUTPUT_TOKENS}" \
     --num-unique-prompts "${NUM_UNIQUE_PROMPTS}" \
-    --num-requests "${NUM_REQUESTS}" \
+    --num-requests "${num_req}" \
     --repeat-mode "${REPEAT_MODE}" \
     --request-rate "${REQUEST_RATE}" \
     --max-concurrency "${MAX_CONCURRENCY}" \
@@ -241,6 +249,7 @@ run_e2e_fast() {
     --pause-between-rounds "${PAUSE_BETWEEN_ROUNDS}" \
     --round2-output-min "${ROUND2_OUTPUT_MIN}" \
     --round2-output-max "${ROUND2_OUTPUT_MAX}" \
+    "$@" \
     --output "${out_json}" \
     2>&1 | tee "${out_json%.json}.log"
 }
@@ -255,7 +264,8 @@ run_e2e_fast() {
   echo "RESULTS_DIR=${RESULTS_DIR}"
   echo "CONTEXT_LENGTHS=${CONTEXT_LENGTHS[*]}"
   echo "SCHEMES=${SCHEMES[*]}"
-  echo "NUM_REQUESTS=${NUM_REQUESTS} NUM_UNIQUE_PROMPTS=${NUM_UNIQUE_PROMPTS}"
+  echo "NUM_REQUESTS=${NUM_REQUESTS} NUM_REQUESTS_RDMA=${NUM_REQUESTS_RDMA} RDMA_REQUEST_TIMEOUT=${RDMA_REQUEST_TIMEOUT}"
+  echo "NUM_UNIQUE_PROMPTS=${NUM_UNIQUE_PROMPTS}"
   echo "OUTPUT_TOKENS=${OUTPUT_TOKENS} (Round 1 / synthetic)"
   echo "ROUND2_OUTPUT_MIN=${ROUND2_OUTPUT_MIN} ROUND2_OUTPUT_MAX=${ROUND2_OUTPUT_MAX}"
   echo "MAX_CONCURRENCY=${MAX_CONCURRENCY}"
@@ -280,7 +290,8 @@ echo "TP / DP:            ${TP} / ${DP_SIZE}"
 echo "mem-fraction / max-total-tokens: ${MEM_FRACTION_STATIC} / ${MAX_TOTAL_TOKENS}"
 echo "Context lengths:    ${CONTEXT_LENGTHS[*]}"
 echo "Schemes:            ${SCHEMES[*]}"
-echo "Client: num-requests=${NUM_REQUESTS} max-concurrency=${MAX_CONCURRENCY}"
+echo "Client: num-requests=${NUM_REQUESTS} (RDMA: ${NUM_REQUESTS_RDMA}) max-concurrency=${MAX_CONCURRENCY}"
+echo "RDMA: --request-timeout ${RDMA_REQUEST_TIMEOUT}s"
 echo "Round 2 max_tokens: uniform [${ROUND2_OUTPUT_MIN}, ${ROUND2_OUTPUT_MAX}] (0→1)"
 echo "e2e_bench_fast:     ${E2E_FAST}"
 echo "SKIP_SERVER:        ${SKIP_SERVER}"
@@ -309,9 +320,18 @@ for scheme in "${SCHEMES[@]}"; do
       fi
     fi
 
+    CASE_NUM_REQUESTS="${NUM_REQUESTS}"
+    E2E_EXTRA_ARGS=()
+    case "${scheme}" in
+      rdma_local_0|rdma_local_50)
+        CASE_NUM_REQUESTS="${NUM_REQUESTS_RDMA}"
+        E2E_EXTRA_ARGS=(--request-timeout "${RDMA_REQUEST_TIMEOUT}")
+        ;;
+    esac
+
     echo ""
-    echo "  --- client -> ${out_file##*/} ---"
-    run_e2e_fast "${out_file}" "${tin}"
+    echo "  --- client -> ${out_file##*/} (num-requests=${CASE_NUM_REQUESTS}) ---"
+    run_e2e_fast "${out_file}" "${tin}" "${CASE_NUM_REQUESTS}" "${E2E_EXTRA_ARGS[@]}"
 
     if [[ "${SKIP_SERVER}" != "1" ]]; then
       kill_server

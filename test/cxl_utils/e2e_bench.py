@@ -297,6 +297,7 @@ async def send_request_streaming(
     prompt_len: int,
     max_new_tokens: int,
     model: str,
+    request_timeout_s: float = 600.0,
 ) -> RequestResult:
     """Send a streaming generation request and measure TTFT + per-token ITL."""
     payload = {
@@ -315,8 +316,9 @@ async def send_request_streaming(
 
     try:
         async with session.post(
-            f"{url}/v1/completions", json=payload,
-            timeout=aiohttp.ClientTimeout(total=600),
+            f"{url}/v1/completions",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=request_timeout_s),
         ) as resp:
             if resp.status != 200:
                 result.error = f"HTTP {resp.status}: {await resp.text()}"
@@ -375,6 +377,7 @@ async def run_round(
     model: str,
     request_rate: float,
     max_concurrency: int,
+    request_timeout_s: float = 600.0,
 ) -> Tuple[List[RequestResult], float]:
     """Run one benchmark round with rate-limited request dispatch.
 
@@ -389,13 +392,26 @@ async def run_round(
         if semaphore:
             async with semaphore:
                 return await send_request_streaming(
-                    session, url, prompt, prompt_len, output_len, model,
+                    session,
+                    url,
+                    prompt,
+                    prompt_len,
+                    output_len,
+                    model,
+                    request_timeout_s=request_timeout_s,
                 )
         return await send_request_streaming(
-            session, url, prompt, prompt_len, output_len, model,
+            session,
+            url,
+            prompt,
+            prompt_len,
+            output_len,
+            model,
+            request_timeout_s=request_timeout_s,
         )
 
-    timeout = aiohttp.ClientTimeout(total=3600)
+    session_total = max(3600.0, float(request_timeout_s))
+    timeout = aiohttp.ClientTimeout(total=session_total)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = []
         t0 = time.perf_counter()
@@ -511,6 +527,7 @@ async def main_async(args):
         model=args.model,
         request_rate=args.request_rate,
         max_concurrency=args.max_concurrency,
+        request_timeout_s=args.request_timeout_s,
     )
     r1_metrics = compute_round_metrics("Round 1: Cold Start", r1_results, r1_duration)
     print_metrics(r1_metrics)
@@ -535,6 +552,7 @@ async def main_async(args):
         model=args.model,
         request_rate=args.request_rate,
         max_concurrency=args.max_concurrency,
+        request_timeout_s=args.request_timeout_s,
     )
     r2_metrics = compute_round_metrics("Round 2: Warm Start", r2_results, r2_duration)
     print_metrics(r2_metrics)
@@ -579,6 +597,7 @@ async def main_async(args):
         "max_prompt_tokens": args.max_prompt_tokens,
         "request_rate": args.request_rate,
         "max_concurrency": args.max_concurrency,
+        "request_timeout_s": args.request_timeout_s,
         "seed": args.seed,
         "prompt_stats": {
             "mean_prompt_len": int(np.mean(prompt_lens)),
@@ -662,6 +681,13 @@ def main():
     parser.add_argument(
         "--pause-between-rounds", type=float, default=3.0,
         help="Seconds to pause between Round 1 and Round 2",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=600.0,
+        dest="request_timeout_s",
+        help="Per-request aiohttp total timeout in seconds (streaming read until complete)",
     )
     parser.add_argument(
         "--output", type=str, default="e2e_results.json",
