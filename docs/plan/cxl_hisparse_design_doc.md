@@ -36,7 +36,13 @@
   - 6.4 [HiSparseCoordinator 适配](#64-hisparsecoordinator-适配)
   - 6.5 [ServerArgs 与配置扩展](#65-serverargs-与配置扩展)
 7. [为什么不使用 cxl_utils 库的传输函数](#7-为什么不使用-cxl_utils-库的传输函数)
-8. [CXL 内存策略与优化](#8-cxl-内存策略与优化)
+8. [多 CXL 设备 Interleave 设计方案](#8-多-cxl-设备-interleave-设计方案)
+  - 8.1 [目标配置与 KV Cache 特性](#81-目标配置与-kv-cache-特性)
+  - 8.2 [单设备瓶颈与多设备机会](#82-单设备瓶颈与多设备机会)
+  - 8.3 [Interleave 策略](#83-interleave-策略)
+  - 8.4 [实现接口](#84-实现接口)
+  - 8.5 [容量规划](#85-容量规划)
+  - 8.6 [其他可选优化](#86-其他可选优化)
 9. [分阶段实施计划](#9-分阶段实施计划)
 10. [风险与缓解措施](#10-风险与缓解措施)
 
@@ -906,46 +912,138 @@ python -m sglang.launch_server \
 
 ---
 
-## 8. CXL 内存策略与优化
+## 8. 多 CXL 设备 Interleave 设计方案
 
-### 8.1 DAX 大页对齐
+### 8.1 目标配置与 KV Cache 特性
 
-CXL DAX 设备的 mmap 必须 2MB 对齐。`CXLMemoryRegion.init()` 中已自动处理：
+目标部署配置：
 
-```python
-aligned_size = ((raw_size + HUGE_PAGE_2MB - 1) // HUGE_PAGE_2MB) * HUGE_PAGE_2MB
+```bash
+--tp 8 --dp-size 8 --enable-dp-attention
 ```
 
-### 8.2 TLB 优化
+在此配置下，SGLang 的 `compute_dp_attention_world_info()` 计算得：
 
-sparse top-k 的离散访问模式会产生大量 TLB miss。DAX 设备天然使用大页（2MB），相比 4KB 页可将 TLB 条目覆盖范围扩大 512 倍。如需进一步优化，可通过内核配置启用 1GB 大页。
-
-### 8.3 多 CXL 设备 Interleave
-
-```python
-# 按 layer 分布到不同 CXL 设备：
-# layer_id % num_cxl_devices → 选择 CXL 设备
-# 利用 sparse attention 的层间独立性，不同层的 swap-in 可并行访问不同设备
-
-class InterleavedCXLPool:
-    def __init__(self, regions: List[CXLMemoryRegion], layer_num: int):
-        self.regions = regions
-        self.layer_to_device = [i % len(regions) for i in range(layer_num)]
-
-    def make_layer_tensor(self, layer_id, dims, dtype):
-        region = self.regions[self.layer_to_device[layer_id]]
-        return region.make_tensor(dims, dtype)
+```
+attn_tp_size = tp_size / dp_size = 8 / 8 = 1
+attn_dp_rank = tp_rank   (每个 rank 就是一个独立的 DP group)
+attn_tp_rank = 0          (无 attention TP 分片)
 ```
 
-### 8.4 写入一致性
+即 **每个 rank 独立处理不同的请求集，KV Cache 内容互不相同，零冗余**：
 
+```
+DataParallelController (负载均衡，8 路)
+  ├── rank 0 (dp=0): 请求集 A → 独立 KV Cache
+  ├── rank 1 (dp=1): 请求集 B → 独立 KV Cache
+  ├── ...
+  └── rank 7 (dp=7): 请求集 H → 独立 KV Cache
+```
 
-| 操作                      | 写入方                       | 是否需要 clflush         |
-| ----------------------- | ------------------------- | -------------------- |
-| Staging (GPU→CXL)       | GPU DMA                   | 不需要：DMA 直接写 CXL      |
-| Decode backup (GPU→CXL) | GPU DMA                   | 不需要                  |
-| Swap-in (CXL→GPU)       | GPU kernel `ld.global.nc` | 不需要：不经过 CPU cache    |
-| CPU 读 CXL（如有）           | CPU                       | 需要：但 HiSparse 流程无此操作 |
+这是 MLA KV Cache 存储效率最优的并行方式——8 个 rank 各自存储完全不同的 KV 数据，CXL 容量利用率 100%，无副本浪费。
+
+### 8.2 单设备瓶颈与多设备机会
+
+单 CXL 设备下，8 个 GPU 对**不同数据**的 swap-in 读事务汇聚到同一 CXL 控制器，共享带宽（典型 32~64 GB/s）。多设备 interleave 可将并发读取分散到多条独立 PCIe/CXL 链路，聚合带宽线性增长。
+
+### 8.3 Interleave 策略
+
+#### 8.3.1 按层交织 — 不可行
+
+`layer_id % num_devices` → 同一层所有 8 GPU 仍打同一设备。HiSparse 逐层串行，对并发带宽无改善。
+
+#### 8.3.2 按 Rank 交织 — 推荐方案
+
+由于 `dp_size = tp_size = 8`（即 `attn_dp_rank = tp_rank`），按 rank 交织天然等同于按 DP group 交织：
+
+```
+tp_rank % num_devices → 选择 CXL 设备
+```
+
+以 2 个 CXL 设备为例：
+
+```
+swap_in(layer_id=k), 8 GPU 并发:
+
+  rank 0 ──┐                    rank 1 ──┐
+  rank 2 ──┤──→ CXL device 0   rank 3 ──┤──→ CXL device 1
+  rank 4 ──┤                    rank 5 ──┤
+  rank 6 ──┘                    rank 7 ──┘
+  4 GPU / 设备                   4 GPU / 设备
+  (各自读不同数据, 无地址级冲突)
+```
+
+**核心优点**：
+
+1. 每个 rank 的 KV 数据互不相同，天然无跨设备数据依赖
+2. `DataParallelController` 保证各 rank 负载均衡 → 设备间负载均衡
+3. 实现极简——仅需 `tp_rank % num_devices` 一行映射
+4. N 个设备提供 N 倍聚合带宽
+
+**带宽收益**（单设备带宽上限 B）：
+
+| CXL 设备数 | 每设备并发 GPU | 每 GPU 有效带宽 | 提升 |
+| --- | --- | --- | --- |
+| 1 | 8 | B/8 | 基线 |
+| 2 | 4 | B/4 | **2x** |
+| 4 | 2 | B/2 | **4x** |
+| 8 | 1 | B | **8x** |
+
+### 8.4 实现接口
+
+多设备 interleave 只影响初始化阶段的设备选择和分区，运行时路径（JIT kernel、`data_ptrs`、`CXLMLATokenToKVPoolHost`）完全不变。
+
+**接入点**：`HiSparseCoordinator._init_cxl_host_pool()`
+
+现有单设备流程：
+
+```
+CXLMemoryRegion(config) → init() → set_partition(tp_rank, tp_size) → make_tensor()
+```
+
+多设备流程变更：
+
+```
+对每个 dev_path 创建 CXLMemoryRegion → init_all()
+tp_rank % num_devices → 选出本 rank 的 region
+在该 region 上 set_partition(local_rank, local_size) → make_tensor()
+```
+
+其中 `local_rank` / `local_size` 是本 rank 在所选设备上的局部排名和总数（如 2 设备 8 rank，设备 0 上有 rank 0/2/4/6，local_size=4）。
+
+**配置扩展**：`hisparse-config` 的 `cxl` 字段增加 `dev_paths`（列表）和 `map_bytes_per_device`。单设备时保持 `dev_path` + `map_bytes` 向后兼容。
+
+```json
+"cxl": {
+    "enabled": true,
+    "dev_paths": ["/dev/dax0.0", "/dev/dax1.0"],
+    "map_bytes_per_device": 34359738368
+}
+```
+
+### 8.5 容量规划
+
+```
+per_device_ranks = tp_size / num_devices
+per_rank_kv = max_total_num_tokens × host_to_device_ratio × 656 × 61 bytes
+per_device_capacity_needed = per_device_ranks × per_rank_kv
+```
+
+示例：8 rank, 2 CXL 设备（各 32GB），max_tokens=100K, ratio=2：
+
+```
+per_rank_kv = 100,000 × 2 × 656 × 61 ≈ 7.6 GB
+per_device = 4 ranks × 7.6 GB = 30.4 GB < 32 GB ✓
+```
+
+### 8.6 其他可选优化
+
+以下方案暂不实现，记录为后续方向。
+
+- **TLB 优化**：DAX 设备天然 2MB 大页；可通过 `daxctl` 启用 1GB 大页进一步减少 TLB miss。初始化后顺序遍历 CXL 区域可预热 TLB。
+- **按层交织 + 预取流水线**：利用层间 top-k 的高相似性，提前一层发起 prefetch 到不同 CXL 设备上，隐藏 swap-in 延迟。需修改 HiSparse 核心调度逻辑，预估 TBT 可降低 40~50%。
+- **写入一致性**：当前所有 CXL 读写均由 GPU DMA / kernel 执行，绕过 CPU cache，无需 `clflush`。
+- **NUMA 绑定**：将 GPU 进程绑定到 CXL 设备所在 NUMA node，减少跨 socket PCIe 路由开销。依赖具体硬件拓扑。
 
 
 ---
