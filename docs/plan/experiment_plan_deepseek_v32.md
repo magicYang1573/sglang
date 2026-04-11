@@ -37,9 +37,11 @@ SGLang 已合并的 **HiSparse**（PR#20343）恰好实现了 DeepSeek-V3.2 NSA 
 
 ## 2. 实验目标
 
-1. 在 DeepSeek-V3.2 上，端到端实测 **CXL 内存池** vs. **RDMA 内存池（全量预取，多档本地命中率）** vs. **Local DRAM** 的吞吐和延迟；**长上下文为主**：输入 **8K / 16K / 32K / 64K** tokens，输出 **1K / 2K / 4K** tokens；单次 e2e **每轮 512 请求、客户端最大并发 32**（长上下文下略低于 128 以降低 OOM / 排队风险；详见 §6.2）
-2. 通过 micro-benchmark 精确测量三种内存后端在 sparse KV 访问模式下的读取延迟和带宽
-3. 验证核心论点：sparse attention 下 CXL 按需读取 top-k 显著优于 RDMA 全量预取
+1. **Micro-benchmark（§6.1）**：在脱离 serving 栈的条件下，测量 **DRAM、CXL、RDMA** 三种后端在 sparse attention KV 访存模式下的**读取延迟**（及有效带宽）；脚本 `test/cxl_utils/sparse_kv_bench.py`。
+2. **端到端 DeepSeek-V3.2（§6.2）**：对比 **Local DRAM、CXL、RDMA（`local_ratio` = 0% 与 50%）**；**第一轮为 warmup**，**主要分析与展示第二轮（prefix / radix 已热）** 的 TTFT、TBT、吞吐等；客户端 **512 请求、最大并发 64**；**第二轮**每条请求的 `max_tokens` 在 **0～1024（均匀）** 上采样（0 在客户端会钳制为 1 以满足 API）；脚本 `test/cxl_utils/e2e_bench_fast.py`，矩阵批跑 `test/cxl_utils/run_all_experiments.sh`。
+3. **消融与系统扩展（§6.3–§6.5）**：多卡 **CXL interleave**（设计待落地）、**多 RDMA 网卡** 扩展、**本地 DRAM 容量受限** 下并发对吞吐的影响。
+4. **成本分析（§6.6）**：在 **TTFT、TBT** 等约束下，对比 DRAM / CXL / RDMA 等方案的 **单位有效吞吐成本**。
+5. 验证核心论点：sparse attention 下 **CXL 按需读 top-k** 相对 **RDMA 全量预取** 在延迟与带宽利用上更优。
 
 ---
 
@@ -155,7 +157,7 @@ CXL 2.0 type-3 设备通常作为独立的 NUMA node 暴露给 OS。当系统中
 - **多卡 CXL interleave**：通过 `numactl --interleave=cxl_node0,cxl_node1,...` 将 KV Cache 页面交错分配到多块 CXL 卡上。sparse top-k 的离散访问天然分散到多卡，聚合带宽随卡数增长。这是最大化 CXL 上行带宽的关键策略。
 - **热冷分层**：利用 HiSparse 的 LRU 统计信息，将高频访问的 KV 条目迁移到 VRAM buffer，低频条目留在 CXL。这与 HiSparse 已有的 device buffer LRU 机制天然配合。
 
-实验中需对比上述策略，尤其关注多卡 CXL interleave 在不同卡数（1/2/4）下的带宽扩展性。
+多卡 interleave 的对比实验单独列为 **§6.3（ablation-1）**；与 §5.2 中的分配策略设计对应，**实现与跑数尚未完成**。
 
 **页面大小与 TLB 优化**
 
@@ -178,306 +180,144 @@ HiSparse 的 host pool 使用 `layer_first` 或 `page_first` 布局。不同布�
 
 ---
 
-## 6. 实验设计
+## 6. 实验设计（总览）
 
-### 6.1 Part 1：Micro-benchmark
+主实验分为 **六类（§6.1–§6.6）**；**§6.7** 为与 §4 对照的简要汇总表。
 
-脱离 SGLang serving 栈，直接测量三种内存后端在 sparse KV 访问模式下的原始性能，为端到端实验提供基础数据。
+| 小节 | 主题 | 脚本 / 入口 |
+|------|------|-------------|
+| **§6.1** | KVCache Sparse 读取 latency（micro） | `test/cxl_utils/sparse_kv_bench.py` |
+| **§6.2** | End-to-End DeepSeek-V3.2（两轮；**主看 Round 2**） | `test/cxl_utils/e2e_bench_fast.py`，矩阵 `test/cxl_utils/run_all_experiments.sh` |
+| **§6.3** | Ablation-1：CXL interleave（多卡带宽） | **设计未实现** |
+| **§6.4** | RDMA expand（多网卡） | 待跑；见假设 |
+| **§6.5** | Under memory limitation | 待跑；限制本地 DRAM |
+| **§6.6** | Cost analysis | 建模 / 报表；与 §6.2 指标衔接 |
 
-#### 6.1a 离散 KV 读取延迟与带宽
+---
 
-模拟 sparse top-k 的访问模式：从大块 KV buffer 中随机读取 N 个离散条目。
+### 6.1 KVCache Sparse 读取实验（latency）
 
+**目的**：脱离 SGLang serving 栈，在 **与 DeepSeek-V3.2 MLA 一致的条目尺寸与离散读模式** 下，对比 **DRAM、CXL、RDMA** 三种后端读写 sparse attention 所用 KV 的访存 **延迟与有效带宽**，为 §6.2 提供下界/上界参照。
 
-| 变量            | 取值                                              |
-| ------------- | ----------------------------------------------- |
-| 读取条目数 (top-k) | 128, 512, 2048, 4096                            |
-| 每条目大小         | DeepSeek-V3.2 MLA KV dim × dtype_size           |
-| KV buffer 总大小 | 模拟 128K tokens 的单层 KV                           |
-| 访问模式          | 随机离散读（均匀随机选取 token 位置）                          |
-| 内存后端          | Local DRAM, CXL mmap, RDMA one-sided read（单次全量） |
-| 指标            | 总延迟 (μs)、有效带宽 (GB/s)                            |
+**脚本**：`test/cxl_utils/sparse_kv_bench.py`（GPU scatter 读、CXL mmap + `cudaHostRegister`、RDMA one-sided 等路径以脚本实现为准）。
 
+**典型扫参**（可与脚本 CLI 对齐微调）：
 
-用 CUDA kernel（GPU 发起 DMA）和 CPU memcpy 两种方式分别测量。
+| 变量 | 取值（示例） |
+|------|----------------|
+| 读取条目数 (top-k) | 128, 512, 2048, 4096 |
+| 每条目大小 | DeepSeek-V3.2 FP8 packed MLA（如 656 B / 条目，以代码为准） |
+| KV buffer 规模 | 模拟长上下文单层或多层驻留 |
+| 访问模式 | 随机离散索引（均匀），对应 sparse top-k |
+| 后端 | Local pinned DRAM；CXL；RDMA（离散读或对照性 bulk，以实现为准） |
+| 指标 | 总延迟 (μs)、有效带宽 (GB/s)、可分位延迟 |
 
-### 6.2 Part 2：端到端 Serving 实验
+可同时记录 **GPU 发起 DMA** 与 **CPU 侧** 测量方式（若脚本支持），便于区分 PCIe/CXL 与 kernel 开销。
 
-在 SGLang + HiSparse 上运行 DeepSeek-V3.2，实测三种方案的端到端推理性能。本实验**以长上下文为主**：扫描输入长度与输出长度组合，并在不同 KV host pool 介质（DRAM / CXL / RDMA）下对比。实验可采用**两轮执行**设计：第一轮冷启动（无 prefix-cache），第二轮利用第一轮产生的 KV Cache 作为 prefix-cache 热数据；两轮结果均展示，形成完整的「KV Cache 从生成到复用」全链路对比。
+---
 
-**Part 2 固定负载参数（单次 e2e 配置）**：
+### 6.2 End-to-End DeepSeek-V3.2
 
-| 参数 | 取值 | 说明 |
-|------|------|------|
-| 每轮请求数 | **512** | 由客户端脚本 `--num-requests` 决定；**SGLang 不会自动改小**总请求数 |
-| 最大并发 | **32**（推荐） | 客户端 `max_concurrency` **只限制同时 in-flight 的 HTTP 数**，不减少总请求；长上下文下 32 通常比 128 更稳（KV / DRAM 压力更低）；可调高做压力测试 |
-| 关注场景 | **长上下文** | 输入与输出长度按下方矩阵扫描，而非短 prompt |
+**目的**：在 **SGLang + HiSparse + DeepSeek-V3.2** 上，对比 **Local DRAM、CXL、RDMA（`local_ratio` = 0% 与 50%）** 的真实 serving 行为。**第一轮为 warmup**（填满各 DP rank 的 radix / prefix 相关状态；见 `e2e_bench_fast.py` 文档字符串），**论文与主表以第二轮（Round 2）为主**：此时 prefix 已热，GPU 时间更多落在 decode，**host 侧 KV 路径差异**更易暴露。
 
-**输入 / 输出长度扫描矩阵（核心自变量）**：
+**脚本**：
 
-| 维度 | 取值 |
-|------|------|
-| 输入长度（tokens） | **8K, 16K, 32K, 64K** |
-| 输出长度（tokens） | **1K, 2K, 4K** |
+- 单次跑：`test/cxl_utils/e2e_bench_fast.py`
+- 全矩阵（多 context × 多 scheme）：`test/cxl_utils/run_all_experiments.sh`
 
-完整因子组合为 **4 × 3 = 12** 组（输入 × 输出）；每一组在每种 pool 介质与 RDMA 本地比例下各跑 **一次** 端到端流程（含两轮则每轮 512 请求）。
+**与当前批跑脚本一致的默认负载**（均可通过环境变量覆盖，以脚本头部注释为准）：
 
-**KV Cache host pool 介质（方案）**：
+| 参数 | 默认值（`run_all_experiments.sh`） | 说明 |
+|------|-------------------------------------|------|
+| Round 2 总请求数 | **512**（`NUM_REQUESTS`） | `--num-requests` |
+| 客户端最大并发 | **64**（`MAX_CONCURRENCY`） | `--max-concurrency`；仅限制同时 in-flight HTTP |
+| Round 2 输出长度 | **0～1024 均匀**（`ROUND2_OUTPUT_MIN=0`, `ROUND2_OUTPUT_MAX=1024`） | 每条请求独立采样 `max_tokens`；0 在客户端钳为 1 以满足 API |
+| Round 1 输出长度 | **512**（`OUTPUT_TOKENS`） | 与 warmup 用的 synthetic 请求一致 |
+| 上下文长度扫描 | **16K / 32K / 64K / 128K**（`CONTEXT_LENGTHS`） | `--target-input-tokens` |
+| Pool / 方案 | **dram, cxl, rdma_local_0, rdma_local_50** | RDMA 两档对应 **0% / 50%** 请求级本地命中 |
+| 其它 | `NUM_UNIQUE_PROMPTS`（默认 1）、`REPEAT_MODE=interleaved` 等 | 详见脚本 |
 
-| 方案 | 介质 | 说明 |
-|------|------|------|
-| 方案 A | **Local DRAM** | HiSparse 默认 host pool，性能上限基线 |
-| 方案 C | **CXL** | Host pool 置于 CXL 扩展内存，按需 top-k 读取 |
-| 方案 B | **RDMA**（loopback 模拟分布式池） | 见下表 `local_ratio` |
+**模型与 HiSparse**：批跑脚本侧为 DeepSeek-V3.2 AWQ、TP=8、dp-size=8 等（见 `run_all_experiments.sh` 内注释）；HiSparse JSON 含 `top_k: 2048`、`device_buffer_size: 4096`，CXL/RDMA 子段按 scheme 注入。
 
-**方案 B（RDMA）请求级本地命中比例**（单次 e2e 中三档全测）：
-
-| 配置名称 | 请求本地命中率 | 需 RDMA 全量预取的请求比例 | 备注 |
-|---------|-----------------|-----------------------------|------|
-| **B-50** | 50% | 50% | 一半请求 KV 已在本地 |
-| **B-25** | 25% | 75% | |
-| **B-0** | 0% | 100% | 最差：全部视为远端 |
-
-方案 A（DRAM）与方案 C（CXL）**不**使用 `local_ratio`；仅方案 B 切换 B-50 / B-25 / B-0。
-
-**实验规模小结**：介质维度为 **DRAM + CXL + RDMA×3 = 5** 种 pool 配置；与 **12** 组（输入×输出）交叉后，完整矩阵为 **60** 次端到端实验配置（若每配置含两轮，则总推理调用数为 60 × 2 × 512 = 61440；统计时按「每配置每轮 512 请求」记录即可）。
-
-#### 6.2.0 实验总体流程
+**两轮流程（摘要）**：
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Round 1：冷启动（无 prefix-cache）                        │
-│                                                         │
-│  发送 N=512 个请求（prefix + query_i），客户端 max_concurrency=32（可调） │
-│  → 每个请求完整 prefill → KV Cache 写入内存池              │
-│  → decode 从内存池读取 sparse KV                          │
-│                                                         │
-│  测量指标：TTFT、Prefill 吞吐、Decode TBT、总吞吐          │
-│  实验结束后 KV Cache 保留在内存池中（radix cache + host     │
-│  prefix cache 双重保留）                                   │
-├─────────────────────────────────────────────────────────┤
-│  Round 2：热启动（prefix-cache 命中）                      │
-│                                                         │
-│  发送 M=512 个共享同一前缀的新请求（prefix + query_j）       │
-│  → prefix 部分命中 radix cache，跳过 prefix 的 prefill     │
-│    计算，仅对 query_j 做 extend prefill（数百 tokens）      │
-│  → staging 仅备份 extend 部分的 KV，prefix KV 从 host      │
-│    prefix cache 直接复用                                   │
-│  → decode 从内存池读取 sparse KV（与 Round 1 相同路径）      │
-│                                                         │
-│  测量指标：TTFT（应显著降低）、Decode TBT、总吞吐            │
-│  重点关注：GPU 几乎全部用于 decode，RDMA 预取开销被充分暴露   │
-└─────────────────────────────────────────────────────────┘
+Round 1 — Warmup：按 dp_size 与各 rank 需求发送唯一 prompt 副本，使 cache 在各 DP 上就绪；指标可作参考，不与 Round 2 直接比吞吐。
+Round 2 — Measurement：将同一批 unique prompt 按 repeat 模式展开为 512 条请求，在已预热 cache 上测量；输出长度按 [0,1024] 均匀（实现上 min≥1）。
 ```
 
-**为什么要两轮？**
+**核心指标**（与 `e2e_bench.py` 汇总一致）：**TTFT**、**Decode TBT**（及 P99）、**Decode / Total throughput**、可选 **DRAM 占用**。**主结论优先使用 Round 2**；Round 1 用于说明冷启动与 warmup 成本。
 
-- Round 1 展示"无 prefix cache"场景下三种方案的**全链路差异**（含 prefill + KV 写入 + decode）
-- Round 2 展示"prefix cache 命中"场景下的差异——prefix 的 prefill 计算被完全跳过（通过 SGLang radix cache），GPU 几乎 100% 用于 decode，此时 **decode 阶段的 KV 读取效率成为唯一瓶颈**，三种方案的差异被充分放大
-- 两轮结合体现了真实生产场景的完整链路：首次请求生成 KV Cache → 后续请求复用
-- 如果不跳过 prefix 的 prefill 计算，GPU 被 prefill 计算占据，RDMA 带宽不会成为瓶颈，三种方案的 decode throughput 趋于一致，无法区分
+**RDMA 全量预取数据量参考**（remote 请求进入 decode 前一次性传输；100 Gbps 量级估算，与 context 长度线性相关）：
 
-#### 6.2.1 Dataset 与请求构造
+| 输入长度 (tokens) | 全量 KV 约 (61×656B×tokens) | ~100Gbps 仅传输时间量级 |
+|-------------------|-----------------------------|-------------------------|
+| 16K | ~620 MB | ~50 ms |
+| 32K | ~1.24 GB | ~100 ms |
+| 64K | ~2.48 GB | ~200 ms |
+| 128K | ~4.96 GB | ~400 ms |
 
-长上下文 e2e **主实验**以可控长度为主，推荐 **合成 Prefix Dataset**（或等价脚本：固定长度随机文本 + 短 query），使输入 token 数精确落在 **8K / 16K / 32K / 64K**，输出 token 数精确为 **1K / 2K / 4K**。
+CXL/DRAM 路径以 **按步 top-k** 为主，有效搬运量随 sparse 比例显著小于上表「全量」列（与 §6.1 micro 对照）。
 
-| Dataset | 说明 | 在本计划中的角色 |
-|---------|------|------------------|
-| **合成 Prefix Dataset（推荐）** | 前缀填充至目标输入长度 + 短 query | **主实验**：与 §6.2 输入/输出矩阵一一对应 |
-| **LongBench-v2** | 真实长文本 QA，输入约 4K–128K | **补充**：真实分布；注意与 8K 起点不完全对齐时可单独报告 |
-| **RULER** | 合成可控长度 | **补充**：needle 等任务 |
+**预期（Round 2，定性）**：Decode TBT **DRAM ≲ CXL ≪ RDMA（尤其 local_ratio=0）**；总吞吐与尾延迟趋势与同序。若提高并发且受 **本地 DRAM 容量** 约束，CXL 可能在 **可承载并发** 上相对纯 DRAM 更有空间（需与 §6.5 联调实测）。
 
-**合成 Prefix Dataset 构造要点**（与当前输入/输出矩阵一致）：
+**可选扩展**（与主矩阵正交，另行成表）：固定 context 下 **递增并发直至 OOM**；`device_buffer_size` / `top_k` 消融；LongBench-v2、RULER 等真实或合成数据集。主矩阵 **不包含** RDMA B-25 档；若需三档 RDMA，可在 `e2e_bench_fast` 与 server 配置上单独加列。
 
-```
-prefix = [随机文本填充至目标输入 token 数: 8K / 16K / 32K / 64K]
-query_i = 短尾部（如 "Summarize the key points."），保证总输入长度仍为目标值
-请求 = prefix + query_i（总输入 = 目标输入长度）
-output = 生成目标输出长度: 1K / 2K / 4K tokens
-```
+---
 
-若沿用**两轮 prefix-cache 对比**，需保证 Round 1 / Round 2 共享同一 prefix 语义；**每轮各 512 条请求**，**客户端最大并发 32**（见 §6.2 表，`test/cxl_utils/e2e_bench.py` 默认）。
+### 6.3 Ablation-1：CXL interleave（多卡带宽）
 
-#### 6.2.2 指标定义
+**目的**：使用 **多张 CXL 内存扩展卡**，通过 **NUMA interleave**（或其它条带策略）聚合上行带宽，与 **单张 CXL 卡** 对比 sparse KV 与端到端指标是否随卡数近似扩展。
 
-| 指标 | 定义 | Round 1 含义 | Round 2 含义 |
-|------|------|-------------|-------------|
-| **TTFT** (ms) | Time To First Token | 完整 prefill 时间 | **极低**（prefix 命中 radix cache，跳过 prefix prefill，仅计算 extend 的数百 tokens） |
-| **Decode TBT** (ms) | Time Between Tokens | decode 步间延迟 | 同 Round 1（**核心对比指标**） |
-| **P99 TBT** (ms) | 第 99 百分位 TBT | 尾延迟 | 尾延迟 |
-| **Decode Throughput** (tokens/s) | decode 产生的 token 数 / decode 总时间 | **主要对比指标** | **主要对比指标** |
-| **Total Throughput** (tokens/s) | 所有 output token / 端到端总时间 | 含 prefill 开销 | prefix cache 命中后更高 |
-| **Max Concurrency** | 客户端同时 in-flight 请求数上限 | 本计划 e2e **默认 32**（脚本侧）；与「总请求数 512」独立 | 同 Round 1 |
-| **DRAM Usage** (GB) | 本地 DRAM 被 KV Cache 占用量 | — | — |
+**状态**：**设计与自动化实验尚未在仓库中落地**（§5.2 中的分配策略与此对应；实现后可复用 `run_all_experiments.sh` 的 scheme 循环，增加 `numactl --interleave=...` 或等价内存策略）。
 
-#### 6.2.3 方案 B（RDMA）的本地缓存比例设置
+**计划扫参**：卡数 1 / 2 / 4；可选与 **大页（2MB/1GB）**、`layer_first` vs `page_first` 布局（§5.2）组合。
 
-方案 B 模拟分布式内存池场景。关键变量是**多少比例的请求的 KV Cache 已在本地**，其余请求的 KV 需通过 RDMA loopback 全量取回。`local_ratio` 控制的是**请求级别**的本地命中率——同一请求的全部 KV 要么全在本地，要么全在远端。
+**指标**：§6.1 延迟/带宽；§6.2 Round 2 的 TBT、吞吐。
 
-**本实验采用的 RDMA 三档（与 §6.2 总表一致）**：
+---
 
-| 配置名称 | 请求本地命中率 | 需 RDMA 全量预取的请求比例 | 模拟场景 |
-|---------|-----------------|-----------------------------|---------|
-| **B-50** | 50% | 50% | 半数请求 KV 已在本地 |
-| **B-25** | 25% | 75% | 多数请求需预取 |
-| **B-0** | 0% | 100% | 极端：全部视为远端 |
+### 6.4 RDMA expand（多网卡）
 
-（可选对照：B-100（100% 本地）近似方案 A，一般不单独占矩阵一格，除非需与 DRAM 路径严格对照。）
+**目的**：增加参与 loopback / 预取的 **RDMA NIC 数量**（多队列、多设备并行），观察 **RDMA 全量预取** 是否随网卡数线性提升。
 
-**RDMA 预取的执行方式**：
+**假设**：**可能无明显收益或收益饱和**——预取路径上数据往往需进入 **本地 DRAM**，写侧受 **Root Complex / 内存子系统** 带宽与争用限制，NIC 数增加不一定提高「远端 → 本地 DRAM」的有效速率；需用 **Nsight / perfetto、NIC 计数器** 验证是否触顶 PCIe 或 DRAM 写带宽。
 
-请求从 staging 完成进入 decode 阶段时，若该请求被标记为 remote，则**一次性**将其全量 KV 通过 RDMA NIC loopback 从本机"远端 MR"读取到 staging buffer 并写回 host pool。之后该请求的所有 decode step 均为本地 DRAM 读取，不再涉及 RDMA。这模拟了真实 PD 分离中 decode 实例从 prefill 实例一次性拉取 KV 的行为。
+**指标**：单次全量预取延迟、Round 2 中带 remote 标记请求的 TTFT 尾部分、总吞吐；与单 NIC 基线对比。
 
-#### 6.2.4 Round 1：冷启动实验
+---
 
+### 6.5 Under memory limitation（受限本地 DRAM）
 
-| 变量            | 取值                                                  |
-| ------------- | --------------------------------------------------- |
-| 模型            | DeepSeek-V3.2 (671B MoE, 61 layers, NSA, MLA)       |
-| **输入长度**    | **8K, 16K, 32K, 64K** tokens（长上下文主扫描轴）        |
-| **输出长度**    | **1K, 2K, 4K** tokens                               |
-| **每轮请求数**   | **512**                                             |
-| **最大并发（客户端）** | **32**（默认，可调）                         |
-| top-k         | 2048（模型默认 `index_topk`，除非另有消融）                 |
-| device buffer | 2 × top_k = 4096（与默认 HiSparse 一致）                  |
-| **Pool 介质**   | **A: DRAM / C: CXL / B: RDMA（B-50, B-25, B-0）**      |
-| 指标            | TTFT, Decode TBT, P99 TBT, Decode Throughput, Total Throughput, DRAM Usage |
+**目的**：在 **限制进程可见的本地 DRAM**（如 cgroup、`membind` 仅绑小容量 node、或压低 `mem-fraction-static` / 可配置 host pool 上限）的前提下，扫描 **客户端并发**，比较 **DRAM vs CXL vs RDMA** 的 **总吞吐、P99 TBT、OOM 前最大并发**。
 
-**Round 1 预期结果**：
+**动机**：DRAM 方案在 KV 全量驻留本地时 **容量瓶颈** 先出现；CXL 将 KV 主要放在扩展内存，**相同本地 DRAM 预算** 下可能支撑 **更高并发**。RDMA 方案仍受 **全量预取 + staging** 对本地 DRAM 的冲击。
 
-- 三种方案 TTFT 基本相同（prefill 主要在 GPU，与 host pool 介质关系弱）
-- **Decode TBT：A < C < B**（**本地 DRAM 最优**；**CXL 因扩展内存延迟略高于 DRAM，但远优于 RDMA**；RDMA remote 受全量预取拖累）
-- **Total Throughput：A ≥ C >> B**（同并发下 DRAM 可能略优于 CXL；二者均远高于 RDMA）
-- **本地 DRAM 占用**：A、B（预取后）高；**C 低**（KV 主要在 CXL，**可共享、可池化扩展**，把本地 DRAM 留给权重与其它负载）
+**指标**：与 §6.2 相同，外加 **失败请求数 / OOM 事件**。
 
-#### 6.2.5 Round 2：Prefix-Cache 命中实验
+---
 
-Round 1 结束后，KV Cache 保留在内存池中。发送**新一批请求**，共享与 Round 1 相同的 prefix（若采用两轮设计）：
+### 6.6 Cost analysis（成本分析）
 
+**目的**：在可比 **SLA** 下对比 **DRAM、CXL、RDMA** 的 **单位成本 / 单位有效吞吐**（例如 **$/GB/s decode 吞吐** 或 **$/1M output tokens**），约束可包括：
 
-| 变量            | 取值                                                  |
-| ------------- | --------------------------------------------------- |
-| 输入 / 输出长度  | 与 Round 1 **同一组**（8K/16K/32K/64K × 1K/2K/4K）      |
-| 新 query       | 不同于 Round 1 的 query（确保 decode 路径不同）                |
-| **每轮请求数**   | **512**（与 Round 1 相同）                             |
-| **最大并发（客户端）** | **32**（默认，可调）                         |
-| **Pool 介质**   | 与 Round 1 **同一配置**（A / C / B-50 / B-25 / B-0）     |
-| 指标            | TTFT（应大幅降低）, Decode TBT, P99 TBT, Decode Throughput, Max Concurrency |
+- **TTFT P99**、**TBT P99**（或 mean）上限；
+- **单机 GPU 数、NIC 数、CXL 卡数与容量** 的 CAPEX + 粗略 OPEX（电力、机位）。
 
-**Round 2 预期结果**：
+**输入数据**：§6.2 Round 2 的吞吐与延迟；§6.5 在受限内存下的 **最大可持续并发**；硬件清单单价（市场或内部采购价）。
 
-- **TTFT 大幅降低**：prefix 命中 radix cache → 跳过大部分 prefix prefill，仅 extend 部分。三种方案 TTFT 均大幅降低（extend 长度相对输入仍较短时，host 介质差异仍次要）
-- **Decode TBT：A < C << B**——核心对比：
-  - GPU 几乎完全被 decode 占据时，**每步 host 侧取 KV 的延迟差**被放大
-  - **A（DRAM）**：最低 TBT；**C（CXL）**：**略慢于 A**（CXL 读延迟高于本地 DRAM），但 **仍远快于 B 的 remote 全量预取路径**
-  - **B（RDMA）**：remote 请求在 decode 前有一次性全量预取，TBT / 尾延迟显著变差
-- **容量与共享**：**CXL 池可共享、可横向扩展**，在相同**本地 DRAM 预算**下往往比「纯 DRAM 堆 KV」能承载更多上下文或租户；**单请求吞吐**仍可能 **A ≥ C**，差异小于「C vs RDMA」
-- **总吞吐**：通常 **A ≥ C >> B**；若提高并发且受 DRAM 容量限制，**C 的总吞吐/可调度请求数**可能超过 A（需实测）
+**输出**：在固定 SLA 下 **哪种方案单位吞吐成本最低**；灵敏度分析（电价、CXL 单价、RDMA 端口数）。
 
-#### 6.2.6 Round 1 + Round 2 结果展示
+---
 
-两轮结果并列展示，形成如下对比图：
+### 6.7 方案对比小结（与 §4 呼应）
 
-```
-  图 1: Decode TBT (ms) — 示例：input_len=32K, output_len=2K, max_concurrency=32
-
-        Round 1 (冷启动)            Round 2 (prefix cache hit)
-   TBT │                      TBT │
-   (ms)│  ┌──┐                (ms)│  ┌──┐
-       │  │A │ ┌──┐               │  │A │ ┌──┐
-       │  │  │ │C │               │  │  │ │C │     (A < C: CXL 略慢于 DRAM)
-       │  │  │ │  │ ┌────┐        │  │  │ │  │ ┌────┐
-       │  │  │ │  │ │ B  │        │  │  │ │  │ │ B  │  (B 远高于 A/C)
-       │  └──┘ └──┘ └────┘        │  └──┘ └──┘ └────┘
-       └──────────────────        └──────────────────
-
-  图 2: Max Concurrency — 可选扩展实验：固定长输入（如 64K）下递增并发；主矩阵默认客户端并发 32
-
-   Max  │
-   Conc │                     ┌──┐
-       │              ┌──┐   │C │  (CXL 共享池可扩展容量)
-       │  ┌──┐ ┌──┐   │B │   │  │  (视 OOM 与调度器而定)
-       │  │A │ │B │   │  │   │  │
-       │  └──┘ └──┘   └──┘   └──┘
-       └──────────────────────────
-          Round 1     Round 2
-          (DRAM 先触顶)    (C 常更易拉高可扩展并发)
-```
-
-#### 6.2.7 内存效率与可扩展性（可选扩展）
-
-主 e2e 矩阵已固定 **每轮 512 请求、客户端最大并发 32**（可调）。若需单独回答「在不 OOM 前提下系统能撑住的最大并发」，可在**固定输入/输出长度**（例如 64K / 4K）下做**递增并发**扫描（1, 2, 4, … 直到 OOM），与主矩阵区分报告。
-
-| 变量      | 取值（可选）                    |
-| ------- | -------------------------- |
-| 输入 / 输出 | 例如固定 64K / 4K              |
-| 并发       | 递增直到 OOM（主实验固定 32 不作为扫描轴） |
-| 方案      | A / B-50 / B-25 / B-0 / C   |
-| 指标      | 最大可并发请求数、总吞吐量、DRAM 占用     |
-
-
-**预期结果**（与主文档论点一致）：
-
-- A（DRAM）：单请求延迟最低，但本地 DRAM 堆 KV → **容量**受限
-- B-0 / B-25 / B-50：需 RDMA 预取的请求比例越高，带宽与 staging 压力越大，**decode 侧明显劣于 A/C**
-- C（CXL）：**单请求略慢于 A**，但 KV 在 **可共享的 CXL 池** → 相同本地 DRAM 下往往有更高**有效容量/并发**潜力
-
-#### 6.2.8 消融实验
-
-| 实验           | 变量                                              | 指标                              |
-| ------------ | ----------------------------------------------- | ------------------------------- |
-| Buffer 大小    | device_buffer_size: 512, 1024, 2048, 4096, 8192 | Buffer 命中率、CXL 实际读取量 / top-k 总量 |
-| Sparse ratio | top-k: 512, 1024, 2048, 4096                    | 各方案吞吐对比                         |
-| CXL 内存策略     | 单卡 CXL-only / 多卡 CXL interleave / 不同页面大小        | TBT、吞吐                          |
-| RDMA 本地缓存比例  | B-50 / B-25 / B-0（主矩阵已覆盖）                  | Decode TBT、RDMA 传输延迟            |
-| 层间相似性        | 记录每层 top-k indices                              | 相邻层 overlap 率、热力图               |
-| 计算与取数重叠      | 开启/关闭 overlap                                   | TBT 差异、Nsight Systems trace     |
-
-#### 6.2.9 RDMA 全量预取延迟速查表
-
-以 100Gbps IB NIC loopback 为例，RDMA 方案 remote 请求进入 decode 前需一次性全量预取的数据量与延迟（**输入长度与主实验 8K–64K 对齐**；下列为 prefill 后全量 KV 量级参考）：
-
-| 输入长度 (tokens) | 每 token 大小 | 层数 | 全量 KV 大小 | RDMA 传输延迟 (100Gbps) | 备注 |
-|------------|-------------|------|------------|---------------------|------|
-| 8K | 656B | 61 | 310 MB | ~24.8 ms | 主实验最短输入 |
-| 16K | 656B | 61 | 620 MB | ~49.6 ms | |
-| 32K | 656B | 61 | 1.24 GB | ~99.2 ms | **一次性延迟，推高 TTFT** |
-| 64K | 656B | 61 | 2.48 GB | ~198.4 ms | 主实验最长输入 |
-
-而 CXL 方案每步 decode 只需读取 top-k × layers 的数据：
-
-| top-k | 层数 | 实际读取量 | CXL 延迟 (估) | vs RDMA 全量 (32K prefix) |
-|-------|------|----------|-------------|--------------------------|
-| 2048 | 61 | 78 MB | ~3-5 ms | **20-33× 更快** |
-| 1024 | 61 | 39 MB | ~1.5-2.5 ms | **40-66× 更快** |
-| 512 | 61 | 19.5 MB | ~0.8-1.3 ms | **76-124× 更快** |
-
-#### 6.2.10 预期结果总结
-
-```
-              Decode Throughput (tokens/s) vs 并发请求数
-              示例: input_len=32K, output_len=2K, top-k=2048, Round 2, max_concurrency=32
-
-  tokens/s │
-           │       ○──○──○──○──○  A: DRAM（低 TBT，易先触顶本地 DRAM）
-           │      ╱
-           │     ╱  ●──●──●──●──●──●──●  C: CXL（略低于 A；可共享池，常更能拉高并发）
-           │    ╱  ╱
-           │   ╱  ╱
-           │  ╱  ╱    ×──×──×──×  B: RDMA（remote 全量预取，吞吐受限）
-           │ ╱  ╱    ╱
-           │╱  ╱    ╱
-           └─┬──┬──┬──┬──┬──┬──┬──→ 并发请求数
-             1  2  4  8  16 24 32
-```
-
-| 对比维度 | A: DRAM | B: RDMA 分布式池 | C: CXL |
-|---------|---------|---------------|--------|
-| 每步 decode 数据传输量 | top-k only | **全量 KV** (100%) | top-k only |
-| 本地 DRAM 占用 | 全量 KV | staging + 本地缓存 | **低**（KV 在 CXL，**可共享池化**） |
-| 最大并发 / 容量 | 受本地 DRAM 容量紧约束 | 受 staging + RDMA 带宽 | **扩展内存**缓解本地 DRAM 瓶颈（实测并发视 OOM） |
-| Decode TBT | **最低** | **远高于 A/C**（remote 全量预取） | **略高于 A**，**远低于 B** |
-| 有效带宽利用率 | 高 | **低**（预取远大于实际使用） | 高 |
-| 部署复杂度 | 最简单 | 需 RDMA NIC | 需 CXL 设备 |
+| 对比维度 | A: DRAM | B: RDMA 池（全量预取） | C: CXL |
+|---------|---------|------------------------|--------|
+| 每步 decode 有效搬运 | top-k 为主 | 预取全量；decode 仍 top-k | top-k 为主 |
+| 本地 DRAM 占用 | 高（KV 常驻） | remote：staging + 预取后高 | 低（KV 主要在 CXL） |
+| Decode TBT（Round 2） | **最低（基线）** | **remote 显著变差** | **介于其间，通常远优于 B** |
+| 有效网络/内存带宽利用 | 高 | 预取阶段 **大量无效字节** | 高（按需） |
+| 部署 | 简单 | NIC + 分布式栈 | CXL 硬件 + NUMA/DAX 配置 |
 
 
