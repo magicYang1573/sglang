@@ -999,3 +999,403 @@ bash test/cxl_utils/run_all_experiments.sh \
 ```
 
 ---
+
+## 9. 多网卡 RDMA Interleave 全量预取设计
+
+### 9.1 动机与目标
+
+现有方案 B（RDMA 分布式池）使用**单张网卡**（如 `mlx5_0`）通过 loopback 模拟全量 KV Cache 预取。单网卡带宽上限约 25 GB/s（200Gbps HDR），对于大序列长度（如 32K tokens × 61 layers × 656 bytes ≈ 1.2 GB），单次 RDMA 预取延迟约 **48 ms**——这已经足以成为 decode 首步的显著瓶颈。
+
+但在真实部署中，即使增加网卡数量聚合带宽，KV Cache 全量搬运仍然可能受限于 **PCIe Root Complex (RC) 或 PCIe Switch 的共享带宽上限**（通常 64~128 GB/s，取决于拓扑）。多网卡的 RDMA READ 最终都要写入同一台机器的 DRAM，必须经过 PCIe RC/Switch，这是一个**不可绕过的硬件瓶颈**。
+
+**本设计的目标**：
+
+1. 真实调用本机 `mlx5_0` ~ `mlx5_7` 共 8 张网卡，每张网卡负责数据的一个分段
+2. 所有网卡的 RDMA READ 结果**真实写入 DRAM**（非模拟），暴露 PCIe RC/Switch 的真实带宽瓶颈
+3. 验证即使网卡数量增多、单链路带宽充裕，全量 KV 搬运的总延迟仍然受 PCIe 拓扑瓶颈限制
+4. 按 DPA rank 对网卡做 interleave，与 CXL 多设备 interleave 策略对齐
+
+### 9.2 硬件拓扑与瓶颈分析
+
+```
+典型 8×H20 + 8×ConnectX-7 拓扑：
+
+CPU Socket 0                          CPU Socket 1
+┌─────────────────────┐              ┌─────────────────────┐
+│        RC 0         │              │        RC 1         │
+│   (PCIe Gen5 x16)   │              │   (PCIe Gen5 x16)   │
+│   ~64 GB/s 双向      │              │   ~64 GB/s 双向      │
+├──────────┬──────────┤              ├──────────┬──────────┤
+│ Switch 0 │ Switch 1 │              │ Switch 2 │ Switch 3 │
+│ ┌──┬──┐  │ ┌──┬──┐  │              │ ┌──┬──┐  │ ┌──┬──┐  │
+│ │G0│G1│  │ │G2│G3│  │              │ │G4│G5│  │ │G6│G7│  │
+│ │N0│N1│  │ │N2│N3│  │              │ │N4│N5│  │ │N6│N7│  │
+│ └──┴──┘  │ └──┴──┘  │              │ └──┴──┘  │ └──┴──┘  │
+└──────────┴──────────┘              └──────────┴──────────┘
+
+G0~G7 = GPU (H20)
+N0~N7 = NIC (mlx5_0 ~ mlx5_7)
+```
+
+**关键瓶颈点**：
+
+| 瓶颈层级 | 带宽上限 | 说明 |
+| --- | --- | --- |
+| 单网卡 PCIe x16 Gen5 | ~25 GB/s | 单张 ConnectX-7 200Gbps 线速 |
+| PCIe Switch (2 NIC 共享) | ~32 GB/s | 同一 Switch 下的两张 NIC 共享上行带宽 |
+| PCIe RC (4 NIC 共享) | ~64 GB/s | 同一 Socket 下 4 张 NIC 共享到 DRAM 的路径 |
+| 双 Socket QPI/UPI | ~128 GB/s | 跨 Socket 时还要经过 UPI 总线 |
+
+**推论**：即使 8 张网卡理论聚合带宽 200 GB/s，实际写入 DRAM 的带宽受限于 PCIe RC（~64 GB/s per socket），**全量预取延迟的下界约 1.2 GB / 128 GB/s ≈ 9.4 ms**，而非理论的 1.2 GB / 200 GB/s ≈ 6 ms。实验将量化这一瓶颈。
+
+### 9.3 按 DPA Rank 的网卡 Interleave 策略
+
+与 CXL 多设备 interleave（`cxl_hisparse_design_doc.md` 第 8 章）完全对齐，采用**按 rank 交织**策略：
+
+#### 9.3.1 Per-rank 网卡分配（DPA 模式）
+
+```
+DPA 配置: --tp 8 --dp 8 --enable-dp-attention
+每个 rank 是独立 DP group，KV Cache 互不相同
+
+网卡分配: rank % num_nics → 选择网卡组
+
+示例 (8 NIC, 8 rank, 每 rank 1 NIC):
+  rank 0 → mlx5_0    rank 4 → mlx5_4
+  rank 1 → mlx5_1    rank 5 → mlx5_5
+  rank 2 → mlx5_2    rank 6 → mlx5_6
+  rank 3 → mlx5_3    rank 7 → mlx5_7
+```
+
+#### 9.3.2 Per-rank 多网卡分段读取（带宽聚合）
+
+当显式配置每个 rank 使用多张网卡时，同一请求的 KV 数据在多张网卡间**分段**读取：
+
+```
+单个 rank 使用 K 张网卡读取一个请求的全量 KV:
+
+total_bytes = seq_len × layer_num × kv_cache_dim × dtype_size
+segment_size = total_bytes / K
+
+NIC 0: RDMA READ [0, segment_size)            → staging_buf[0:seg]
+NIC 1: RDMA READ [segment_size, 2*segment_size) → staging_buf[seg:2*seg]
+...
+NIC K-1: RDMA READ [(K-1)*seg, total)          → staging_buf[(K-1)*seg:total]
+
+所有 NIC 并行发起 → poll 所有 CQ 完成 → memcpy staging → host_pool
+```
+
+**核心设计**：每张网卡有独立的 `ibv_context` / `pd` / `cq` / `qp` / `MR`，通过**多线程并行** `ibv_post_send` + `ibv_poll_cq` 实现真正的硬件并发。所有 RDMA READ 的目标都是 **pinned DRAM**（staging buffer），数据真实经过 NIC → PCIe → DRAM 路径。
+
+#### 9.3.3 网卡分配策略总结
+
+```
+策略 1: 每 rank 1 NIC（简单模式）
+  nic_for_rank = ib_devs[rank % len(ib_devs)]
+
+策略 2: 每 rank K NIC（带宽聚合模式，本设计重点）
+  nics_for_rank = ib_devs[rank*K : (rank+1)*K]  （连续分配）
+  或
+  nics_for_rank = ib_devs[rank::num_ranks]       （交织分配）
+
+策略 3: 所有 rank 共享所有 NIC（最大聚合，实验默认）
+  每个 rank 的 prefetch 使用全部 K 张 NIC 分段读取
+  不同 rank 的 prefetch 之间会竞争网卡
+```
+
+**实验默认采用策略 3**（所有 NIC 分段读一个请求），因为目标是暴露 PCIe RC/Switch 瓶颈，而非网卡分配效率。
+
+### 9.4 多网卡 RDMA 上下文管理
+
+```python
+class MultiNICRDMAContext:
+    """管理多张 RDMA 网卡的并行 loopback 读取.
+
+    每张网卡独立持有:
+      - ibv_context, pd, cq, qp (RC loopback)
+      - remote_mr: 注册 remote_buffer 中该网卡负责的分段
+      - local_mr: 注册 staging_buffer 中该网卡负责的分段
+
+    bulk_read_parallel() 在多线程中并行发起分段 RDMA READ,
+    所有数据真实经过 NIC 硬件写入 DRAM.
+    """
+
+    def __init__(
+        self,
+        ib_devs: List[str],        # ["mlx5_0", ..., "mlx5_7"]
+        remote_buf_ptr: int,        # remote_buffer 起始地址
+        remote_buf_size: int,
+        staging_buf_ptr: int,       # staging_buffer 起始地址
+        staging_buf_size: int,
+    ):
+        self.num_nics = len(ib_devs)
+        self.contexts = []  # 每张网卡一个 RDMAContext handle
+
+        # 每张网卡负责 remote/staging buffer 的 1/num_nics 分段
+        segment_size = remote_buf_size // self.num_nics
+        for i, dev in enumerate(ib_devs):
+            offset = i * segment_size
+            h = rdma_ext.RDMAContext()
+            h.init(dev,
+                   staging_buf_ptr + offset, segment_size,
+                   remote_buf_ptr + offset, segment_size,
+                   max_wr=4096)
+            self.contexts.append(h)
+
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.num_nics)
+
+    def bulk_read_parallel(self, total_bytes: int) -> float:
+        """多网卡并行分段读取, 返回 wall-clock 延迟 (μs).
+
+        将 total_bytes 均分为 num_nics 段, 每张网卡读取一段.
+        使用 ThreadPool 并行发起, 取 max 延迟作为总延迟
+        (wall-clock = 最慢的一张网卡, 受 PCIe 拓扑瓶颈制约).
+        """
+        per_nic = min(total_bytes // self.num_nics, self.segment_size)
+        if per_nic == 0:
+            return self.contexts[0].bulk_read(total_bytes)
+
+        futures = []
+        for h in self.contexts:
+            futures.append(self._pool.submit(h.bulk_read, per_nic))
+
+        latencies = [f.result() for f in futures]
+        return max(latencies)
+
+    def destroy(self):
+        for h in self.contexts:
+            h.destroy()
+        self._pool.shutdown(wait=False)
+```
+
+**关键点**：
+- 使用 `ThreadPoolExecutor` 真正并行发起 `ibv_post_send`，而非串行调用
+- Python GIL 不阻塞：pybind11 可在 C++ 层释放 GIL（`py::call_guard<py::gil_scoped_release>()`），使多线程真正并行
+- `max(latencies)` 为 wall-clock 延迟——受最慢的 NIC 或最拥挤的 PCIe 路径限制
+
+### 9.5 C 层扩展：多实例 RDMA Context
+
+现有 `rdma_scatter_read_py.cpp` 使用**全局单例** `g_ctx`，不支持同时持有多个 RDMA context。需要扩展为**多实例**支持。
+
+#### 9.5.1 Pybind11 多实例封装
+
+```cpp
+// rdma_scatter_read_py.cpp 新增 (与现有单例 API 共存, 不破坏已有接口)
+
+class RDMAContextHandle {
+    rdma_context ctx_;
+    bool initialized_ = false;
+public:
+    void init(const std::string& ib_dev, uint64_t local_ptr, size_t local_size,
+              uint64_t remote_ptr, size_t remote_size, int max_wr) {
+        int ret = rdma_init_loopback(&ctx_, ib_dev.c_str(),
+                                     (void*)local_ptr, local_size,
+                                     (void*)remote_ptr, remote_size, max_wr);
+        if (ret != 0) throw std::runtime_error("rdma_init_loopback failed");
+        initialized_ = true;
+    }
+
+    double bulk_read(size_t total_bytes) {
+        if (!initialized_) throw std::runtime_error("not initialized");
+        double us = rdma_bulk_read(&ctx_, total_bytes);
+        if (us < 0) throw std::runtime_error("rdma_bulk_read failed");
+        return us;
+    }
+
+    double scatter_read(uint64_t indices_ptr, int top_k, int item_size) {
+        if (!initialized_) throw std::runtime_error("not initialized");
+        double us = rdma_scatter_read(&ctx_,
+                                       (const int64_t*)indices_ptr,
+                                       top_k, item_size);
+        if (us < 0) throw std::runtime_error("rdma_scatter_read failed");
+        return us;
+    }
+
+    void destroy() {
+        if (initialized_) { rdma_destroy(&ctx_); initialized_ = false; }
+    }
+
+    ~RDMAContextHandle() { destroy(); }
+};
+
+// 在 PYBIND11_MODULE 中新增:
+py::class_<RDMAContextHandle>(m, "RDMAContext")
+    .def(py::init<>())
+    .def("init", &RDMAContextHandle::init,
+         py::call_guard<py::gil_scoped_release>())     // 释放 GIL
+    .def("bulk_read", &RDMAContextHandle::bulk_read,
+         py::call_guard<py::gil_scoped_release>())     // 释放 GIL, 多线程并行
+    .def("scatter_read", &RDMAContextHandle::scatter_read,
+         py::call_guard<py::gil_scoped_release>())
+    .def("destroy", &RDMAContextHandle::destroy);
+```
+
+**改动量**：~50 行 C++，不破坏现有单例 `rdma_init` / `rdma_scatter_read` / `rdma_destroy` API。`rdma_scatter_read.c` 和 `rdma_scatter_read.h` **无需修改**——底层 C 函数已经接受任意 `struct rdma_context*` 指针。
+
+### 9.6 与 RDMAMLATokenToKVPoolHost 集成
+
+对 `rdma_memory_pool.py` 的改动较小，核心是在 `init_kv_buffer` 中根据 `ib_devs` 列表长度选择上下文类型：
+
+```python
+class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
+    def __init__(self, ..., rdma_config: dict):
+        # 多网卡配置: ib_devs 列表优先于 ib_dev 单值
+        self.ib_devs = rdma_config.get(
+            "ib_devs",
+            [rdma_config.get("ib_dev", "mlx5_0")]  # 向后兼容
+        )
+        self.multi_nic = len(self.ib_devs) > 1
+        ...
+
+    def init_kv_buffer(self):
+        buffer = super().init_kv_buffer()
+        # ... remote_buffer, staging_buffer 分配同前 ...
+
+        if self.multi_nic:
+            self._rdma_ctx = MultiNICRDMAContext(
+                ib_devs=self.ib_devs,
+                remote_buf_ptr=remote_ptr,
+                remote_buf_size=remote_size,
+                staging_buf_ptr=staging_ptr,
+                staging_buf_size=staging_size,
+            )
+            logger.info("Multi-NIC RDMA: %d NICs (%s)",
+                        len(self.ib_devs), self.ib_devs)
+        else:
+            self._rdma_ctx = RDMALoopbackContext(
+                ib_dev=self.ib_devs[0], ...
+            )
+        return buffer
+
+    def prefetch_for_decode(self, req_pool_idx, host_indices):
+        ...
+        if self.multi_nic:
+            total_bytes = num_tokens * self.token_stride_size * self.layer_num
+            rdma_us = self._rdma_ctx.bulk_read_parallel(total_bytes)
+        else:
+            rdma_us = self._rdma_ctx.bulk_read(valid_cpu, item_size)
+
+        # staging → host_pool 写回（同前）
+        for layer_id in range(self.layer_num):
+            self.kv_buffer[layer_id, valid_cpu] = \
+                self.staging_buffer[layer_id, valid_cpu]
+        ...
+```
+
+### 9.7 配置接口
+
+```json
+{
+    "rdma_pool": {
+        "enabled": true,
+        "local_ratio": 0.0,
+
+        "ib_dev": "mlx5_0",
+
+        "ib_devs": ["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3",
+                     "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_7"]
+    }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `ib_dev` | 单网卡模式（向后兼容），仅使用一张 NIC |
+| `ib_devs` | 多网卡模式，列表中的所有 NIC 并行分段读取 |
+| 优先级 | `ib_devs` 存在时忽略 `ib_dev` |
+
+**启动命令示例**：
+
+```bash
+# 方案 B-multi: 8 张网卡并行全量预取, 0% 本地缓存
+python -m sglang.launch_server \
+    --model deepseek-ai/DeepSeek-V3.2 --tp 8 \
+    --enable-hisparse \
+    --hisparse-config '{
+        "top_k": 2048,
+        "device_buffer_size": 4096,
+        "rdma_pool": {
+            "enabled": true,
+            "local_ratio": 0.0,
+            "ib_devs": ["mlx5_0","mlx5_1","mlx5_2","mlx5_3",
+                         "mlx5_4","mlx5_5","mlx5_6","mlx5_7"]
+        }
+    }'
+```
+
+### 9.8 实验矩阵设计
+
+在原有 A / B-0 / B-30 / C 四方案的基础上，新增多网卡子方案：
+
+| 方案 | 网卡数 | 预期聚合带宽 | 实际瓶颈 | 目的 |
+| --- | --- | --- | --- | --- |
+| B-0-1nic | 1 (mlx5_0) | ~25 GB/s | NIC 线速 | 单 NIC 基线 |
+| B-0-2nic | 2 (mlx5_0,1) | ~50 GB/s | PCIe Switch | 同 Switch 下是否线性扩展 |
+| B-0-4nic | 4 (mlx5_0~3) | ~100 GB/s | PCIe RC | 同 Socket 下 RC 瓶颈 |
+| B-0-8nic | 8 (mlx5_0~7) | ~200 GB/s | 双 Socket RC + UPI | 全量网卡聚合上限 |
+
+**预期结果**：
+
+```
+预取延迟 (32K seq, ~1.2 GB):
+
+  1 NIC:  ~48 ms  (线速限制)
+  2 NIC:  ~24 ms  (理论) → 实际可能 ~28 ms (PCIe Switch 竞争)
+  4 NIC:  ~12 ms  (理论) → 实际可能 ~16 ms (PCIe RC 竞争)
+  8 NIC:  ~ 6 ms  (理论) → 实际可能 ~10 ms (双 RC + UPI)
+
+结论: 增加网卡数带来的带宽收益随 NIC 数量递减 (sub-linear),
+     PCIe RC/Switch 是不可绕过的瓶颈.
+     即使 8 NIC 的最优情况 (~10 ms), 对比 CXL sparse read
+     (top-2K × 656B × 61层 ≈ 80 MB, ~2 ms) 仍有 5x 差距.
+```
+
+### 9.9 自动化实验脚本扩展
+
+`run_all_experiments.sh` 新增多网卡方案循环：
+
+```bash
+# 多网卡 RDMA 子实验
+for n_nic in 1 2 4 8; do
+    # 构造 ib_devs JSON 数组
+    ib_devs=$(python3 -c "
+import json
+devs = [f'mlx5_{i}' for i in range($n_nic)]
+print(json.dumps(devs))
+    ")
+
+    config="{\"top_k\":2048,\"device_buffer_size\":4096,\
+\"rdma_pool\":{\"enabled\":true,\"local_ratio\":0.0,\
+\"ib_devs\":${ib_devs}}}"
+
+    launch_server --hisparse-config "$config"
+    python e2e_bench.py --output results/rdma_0_${n_nic}nic.json
+    kill_server
+done
+```
+
+### 9.10 代码改动量估算
+
+| 模块 | 新增/修改 | 行数 | 说明 |
+| --- | --- | --- | --- |
+| `rdma_scatter_read_py.cpp` | 修改 | ~50 行 | 新增 `RDMAContext` 类 + GIL 释放 |
+| `rdma_memory_pool.py` | 修改 | ~80 行 | `MultiNICRDMAContext` 类 + 集成逻辑 |
+| `factory.py` / `SparseConfig` | 修改 | ~5 行 | 解析 `ib_devs` 列表 |
+| `run_all_experiments.sh` | 修改 | ~30 行 | 新增 1/2/4/8 NIC 子实验循环 |
+| **合计** | | **~165 行** | |
+
+### 9.11 与 CXL Interleave 的对比
+
+| 维度 | CXL 多设备 Interleave | RDMA 多网卡 Interleave |
+| --- | --- | --- |
+| **资源分配** | `rank % num_devices` → CXL 设备 | 每 rank 使用全部 NIC 分段读 |
+| **数据粒度** | 每 rank 整个 host pool 在一个 CXL 设备上 | 每次预取的数据在多 NIC 间按字节范围分段 |
+| **并行模型** | GPU kernel `ld.global.nc.b64` 直读 | 多线程 `ibv_post_send` 并行，CQ 汇合 |
+| **PCIe 路径** | GPU → PCIe → CXL 设备（read） | NIC → PCIe → DRAM（write），然后 GPU → PCIe → DRAM（read） |
+| **PCIe 事务次数** | 1 次（GPU 直读 CXL） | 2 次（NIC 写 DRAM + GPU 读 DRAM） |
+| **带宽瓶颈** | CXL 设备控制器 + PCIe 链路 | PCIe RC/Switch（多 NIC 写入竞争） |
+| **延迟特性** | 按需读取 top-k，数据量小 | 全量预取，数据量大但一次性 |
+| **核心论点** | sparse read 数据量少 → 低延迟 | 即使带宽充裕，全量搬运仍有 PCIe 瓶颈 |
+
+---
