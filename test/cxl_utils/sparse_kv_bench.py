@@ -161,6 +161,50 @@ def build_cxl_extension():
 import mmap as _mmap_mod
 
 
+def _load_cudart():
+    """Load libcudart via ctypes and set up function signatures."""
+    import ctypes.util
+    path = ctypes.util.find_library("cudart")
+    if path is None:
+        cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+        for candidate in [
+            os.path.join(cuda_home, "lib64", "libcudart.so"),
+            os.path.join(cuda_home, "lib", "libcudart.so"),
+        ]:
+            if os.path.isfile(candidate):
+                path = candidate
+                break
+    if path is None:
+        raise RuntimeError("Cannot find libcudart.so")
+    lib = ctypes.CDLL(path)
+
+    # cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags)
+    lib.cudaHostRegister.restype = ctypes.c_int
+    lib.cudaHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+
+    # cudaError_t cudaHostUnregister(void *ptr)
+    lib.cudaHostUnregister.restype = ctypes.c_int
+    lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
+
+    # cudaError_t cudaHostGetDevicePointer(void **pDevice, void *pHost, unsigned int flags)
+    lib.cudaHostGetDevicePointer.restype = ctypes.c_int
+    lib.cudaHostGetDevicePointer.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint,
+    ]
+
+    return lib
+
+
+_cudart_lib = None
+
+
+def _get_cudart():
+    global _cudart_lib
+    if _cudart_lib is None:
+        _cudart_lib = _load_cudart()
+    return _cudart_lib
+
+
 class CXLDeviceRegion:
     """Manages a single CXL DAX device: mmap + cudaHostRegister."""
 
@@ -169,28 +213,34 @@ class CXLDeviceRegion:
         self.map_bytes = map_bytes
         self.fd = os.open(dev_path, os.O_RDWR)
         self.mm = _mmap_mod.mmap(
-            self.fd, map_bytes, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_READ | _mmap_mod.PROT_WRITE,
+            self.fd, map_bytes, _mmap_mod.MAP_SHARED,
+            _mmap_mod.PROT_READ | _mmap_mod.PROT_WRITE,
         )
         self.base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self.mm))
 
+        cudart = _get_cudart()
         prev_dev = torch.cuda.current_device()
         torch.cuda.set_device(gpu_id)
+
         # cudaHostRegisterMapped = 0x02
-        ret = torch.cuda.cudart().cudaHostRegister(
-            ctypes.c_void_p(self.base_ptr), map_bytes, 2
-        )
-        # cudaHostGetDevicePointer
+        err = cudart.cudaHostRegister(self.base_ptr, map_bytes, 0x02)
+        if err != 0:
+            self.close()
+            raise RuntimeError(
+                f"cudaHostRegister failed for {dev_path} (err={err})"
+            )
+
         dev_ptr = ctypes.c_void_p()
-        torch.cuda.cudart().cudaHostGetDevicePointer(
-            ctypes.byref(dev_ptr), ctypes.c_void_p(self.base_ptr), 0
+        err = cudart.cudaHostGetDevicePointer(
+            ctypes.byref(dev_ptr), self.base_ptr, 0
         )
         self.device_ptr = dev_ptr.value or 0
         torch.cuda.set_device(prev_dev)
 
-        if self.device_ptr == 0:
+        if err != 0 or self.device_ptr == 0:
             self.close()
             raise RuntimeError(
-                f"cudaHostGetDevicePointer returned null for {dev_path}"
+                f"cudaHostGetDevicePointer failed for {dev_path} (err={err})"
             )
 
     def write_random_data(self, nbytes: int):
@@ -205,7 +255,7 @@ class CXLDeviceRegion:
 
     def close(self):
         try:
-            torch.cuda.cudart().cudaHostUnregister(ctypes.c_void_p(self.base_ptr))
+            _get_cudart().cudaHostUnregister(self.base_ptr)
         except Exception:
             pass
         try:
