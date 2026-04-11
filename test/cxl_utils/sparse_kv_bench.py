@@ -3,10 +3,11 @@
 Single-Layer Sparse KV Cache Read Latency Micro-Benchmark
 ==========================================================
 
-Compares GPU scatter-read latency from three memory backends:
-  - DRAM  (CPU pinned memory, cudaHostRegister)
-  - CXL   (CXL type-3 device mmap, cudaHostRegister, GPU direct read)
-  - RDMA  (discrete per-token RDMA READs via NIC loopback, then GPU copy)
+Compares GPU scatter-read latency from multiple memory backends:
+  - DRAM           (CPU pinned memory, cudaHostRegister)
+  - CXL            (single CXL device mmap, cudaHostRegister, GPU direct read)
+  - CXL-interleave (multiple CXL devices, tokens round-robin across devices)
+  - RDMA           (discrete per-token RDMA READs via NIC loopback, then GPU copy)
 
 Uses DeepSeek-V3.2 FP8 packed MLA parameters:
   item_size = 656 bytes, store_dtype = uint8
@@ -30,54 +31,13 @@ from torch.utils.cpp_extension import load
 ROOT = Path(__file__).parent.resolve()
 
 # ---------------------------------------------------------------------------
-#  JIT compile the GPU scatter read kernel
+#  JIT compile the GPU scatter read kernel (single-source + interleave)
 # ---------------------------------------------------------------------------
-
-_scatter_module = None
-
-
-def get_scatter_module():
-    global _scatter_module
-    if _scatter_module is not None:
-        return _scatter_module
-
-    build_dir = ROOT / "build" / "scatter_kernel"
-    build_dir.mkdir(parents=True, exist_ok=True)
-
-    _scatter_module = load(
-        name="sparse_kv_scatter_ext",
-        sources=[str(ROOT / "sparse_kv_kernel.cu")],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
-        build_directory=str(build_dir),
-        verbose=False,
-        with_cuda=True,
-    )
-    return _scatter_module
-
-
-def launch_scatter_kernel(
-    src_ptr: int,
-    dst_ptr: int,
-    indices_ptr: int,
-    item_size: int,
-    top_k: int,
-    stream: Optional[int] = None,
-):
-    """Launch the scatter_read_kernel via raw CUDA driver API."""
-    # We use the torch custom op path: the .cu is compiled as a plain CUDA
-    # file with extern "C", so we call it through ctypes / cuLaunchKernel.
-    # However, for simplicity we wrap it with a small inline extension.
-    raise NotImplementedError("Use _launch_scatter_kernel_torch instead")
-
-
-# Torch-friendly wrapper that calls the CUDA kernel via a thin C++ shim
-# compiled at the same time as the .cu file.  We compile a combined module.
 
 _scatter_torch_module = None
 
 
 def _build_scatter_torch_module():
-    """Build a combined .cu + wrapper that exposes a torch-callable function."""
     global _scatter_torch_module
     if _scatter_torch_module is not None:
         return _scatter_torch_module
@@ -98,10 +58,17 @@ extern "C" __global__ void scatter_read_kernel(
     const int64_t* __restrict__ indices,
     int64_t item_size_bytes);
 
+extern "C" __global__ void scatter_read_interleave_kernel(
+    const uint64_t* __restrict__ src_ptrs,
+    uint8_t* __restrict__ dst,
+    const int64_t* __restrict__ indices,
+    const int32_t* __restrict__ device_map,
+    int64_t item_size_bytes);
+
 void launch_scatter(int64_t src_ptr, torch::Tensor dst, torch::Tensor indices,
                     int64_t item_size) {
-    int top_k = indices.size(0);
-    dim3 grid(top_k);
+    int num_tokens = indices.size(0);
+    dim3 grid(num_tokens);
     dim3 block(256);
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     scatter_read_kernel<<<grid, block, 0, stream>>>(
@@ -111,9 +78,26 @@ void launch_scatter(int64_t src_ptr, torch::Tensor dst, torch::Tensor indices,
         item_size);
 }
 
+void launch_scatter_interleave(torch::Tensor src_ptrs, torch::Tensor dst,
+                               torch::Tensor indices, torch::Tensor device_map,
+                               int64_t item_size) {
+    int num_tokens = indices.size(0);
+    dim3 grid(num_tokens);
+    dim3 block(256);
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    scatter_read_interleave_kernel<<<grid, block, 0, stream>>>(
+        reinterpret_cast<const uint64_t*>(src_ptrs.data_ptr<int64_t>()),
+        dst.data_ptr<uint8_t>(),
+        indices.data_ptr<int64_t>(),
+        device_map.data_ptr<int32_t>(),
+        item_size);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("launch_scatter", &launch_scatter,
-          "Launch scatter read kernel: src_ptr(int64), dst(Tensor), indices(Tensor), item_size(int64)");
+          "Single-source scatter read");
+    m.def("launch_scatter_interleave", &launch_scatter_interleave,
+          "Multi-source interleave scatter read");
 }
 """)
 
@@ -167,6 +151,42 @@ def build_cxl_extension():
     return _cxl_ext
 
 
+# Build per-device CXL extensions (each needs its own global state).
+# cxl_mem_ext uses a global singleton, so for multi-device we compile
+# separate copies with distinct module names.
+
+_cxl_ext_cache: Dict[int, object] = {}
+
+
+def build_cxl_extension_for_device(dev_idx: int):
+    if dev_idx in _cxl_ext_cache:
+        return _cxl_ext_cache[dev_idx]
+
+    cxl_root = ROOT.parent.parent / "sgl-kernel" / "cxl_utils"
+    if not (cxl_root / "cxl_mem.cpp").exists():
+        return None
+
+    build_dir = ROOT / "build" / f"cxl_ext_dev{dev_idx}"
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    ext = load(
+        name=f"cxl_mem_ext_dev{dev_idx}",
+        sources=[
+            str(cxl_root / "cxl_mem.cpp"),
+            str(cxl_root / "cxl_mem_cuda.cu"),
+            str(cxl_root / "cxl_mem_pybind.cpp"),
+        ],
+        extra_cflags=["-O3", "-std=c++17", "-mclflushopt", "-mclwb", "-msse4.1", "-fopenmp"],
+        extra_cuda_cflags=["-O3", "-std=c++17"],
+        extra_ldflags=["-lgomp"],
+        build_directory=str(build_dir),
+        verbose=False,
+        with_cuda=True,
+    )
+    _cxl_ext_cache[dev_idx] = ext
+    return ext
+
+
 # ---------------------------------------------------------------------------
 #  RDMA extension
 # ---------------------------------------------------------------------------
@@ -198,9 +218,16 @@ def load_rdma_extension():
 #  Statistics helpers
 # ---------------------------------------------------------------------------
 
-def compute_stats(latencies: List[float], top_k: int, item_size: int) -> Dict:
+HUGE_PAGE_SIZE = 2 * 1024 * 1024
+
+
+def align_to_2mb(size: int) -> int:
+    return ((size + HUGE_PAGE_SIZE - 1) // HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE
+
+
+def compute_stats(latencies: List[float], num_tokens: int, item_size: int) -> Dict:
     arr = np.array(latencies)
-    data_bytes = top_k * item_size
+    data_bytes = num_tokens * item_size
     mean_us = float(np.mean(arr))
     bw_gbs = (data_bytes / 1e9) / (mean_us / 1e6) if mean_us > 0 else 0.0
     return {
@@ -216,7 +243,7 @@ def compute_stats(latencies: List[float], top_k: int, item_size: int) -> Dict:
 
 def fmt_stats_row(name: str, s: Dict) -> str:
     return (
-        f"{name:<16s}| {s['mean_us']:>9.2f} | {s['std_us']:>8.2f} | "
+        f"{name:<20s}| {s['mean_us']:>9.2f} | {s['std_us']:>8.2f} | "
         f"{s['p50_us']:>9.2f} | {s['p99_us']:>9.2f} | {s['eff_bw_gbs']:>13.2f}"
     )
 
@@ -242,35 +269,35 @@ def bench_dram(
     scatter_mod,
     host_buf: torch.Tensor,
     item_size: int,
-    top_k: int,
+    num_tokens: int,
     warmup: int,
     iters: int,
 ) -> List[float]:
     seq_len = host_buf.shape[0]
     src_ptr = host_buf.data_ptr()
-    device_buf = torch.empty(top_k, item_size, dtype=torch.uint8, device="cuda")
+    device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device="cuda")
 
     for _ in range(warmup):
-        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64, device="cuda")
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device="cuda")
         scatter_mod.launch_scatter(src_ptr, device_buf, indices, item_size)
         torch.cuda.synchronize()
 
     latencies = []
     for _ in range(iters):
-        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64, device="cuda")
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device="cuda")
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
         scatter_mod.launch_scatter(src_ptr, device_buf, indices, item_size)
         end.record()
         torch.cuda.synchronize()
-        latencies.append(start.elapsed_time(end) * 1000.0)  # ms → μs
+        latencies.append(start.elapsed_time(end) * 1000.0)
 
     return latencies
 
 
 # ---------------------------------------------------------------------------
-#  CXL backend
+#  CXL backend (single device)
 # ---------------------------------------------------------------------------
 
 def bench_cxl(
@@ -279,15 +306,13 @@ def bench_cxl(
     cxl_dev: str,
     seq_len: int,
     item_size: int,
-    top_k: int,
+    num_tokens: int,
     gpu_id: int,
     warmup: int,
     iters: int,
 ) -> List[float]:
     total_bytes = seq_len * item_size
-    # DAX devices require mmap size aligned to huge page boundary (2MB)
-    HUGE_PAGE_SIZE = 2 * 1024 * 1024
-    map_bytes = ((total_bytes + HUGE_PAGE_SIZE - 1) // HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE
+    map_bytes = align_to_2mb(total_bytes)
     ok = cxl_ext.cxl_init(
         dev_path=cxl_dev,
         map_bytes=map_bytes,
@@ -297,28 +322,24 @@ def bench_cxl(
     if not ok:
         raise RuntimeError(f"cxl_init failed for {cxl_dev}")
 
-    # Write random KV data into CXL mmap region
     src_data = torch.randint(0, 256, (seq_len, item_size), dtype=torch.uint8)
     cxl_ext.tensor_to_cxl(src_data.view(-1), offset=0)
 
-    # Get the CUDA-accessible device pointer for the CXL mmap region.
-    # After cudaHostRegister + cudaHostGetDevicePointer, this pointer can be
-    # used directly by GPU kernels with ld.global.nc — identical to DRAM path.
     cxl_device_ptr = cxl_ext.get_cxl_device_ptr()
     if cxl_device_ptr == 0:
         cxl_ext.cxl_close()
         raise RuntimeError("CXL device_ptr is null; ensure register_cuda=True")
 
-    device_buf = torch.empty(top_k, item_size, dtype=torch.uint8, device="cuda")
+    device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device="cuda")
 
     for _ in range(warmup):
-        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64, device="cuda")
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device="cuda")
         scatter_mod.launch_scatter(cxl_device_ptr, device_buf, indices, item_size)
         torch.cuda.synchronize()
 
     latencies = []
     for _ in range(iters):
-        indices = torch.randint(0, seq_len, (top_k,), dtype=torch.int64, device="cuda")
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device="cuda")
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -332,6 +353,89 @@ def bench_cxl(
 
 
 # ---------------------------------------------------------------------------
+#  CXL interleave backend (N devices)
+# ---------------------------------------------------------------------------
+
+def bench_cxl_interleave(
+    scatter_mod,
+    cxl_devs: List[str],
+    seq_len: int,
+    item_size: int,
+    num_tokens: int,
+    gpu_id: int,
+    warmup: int,
+    iters: int,
+) -> List[float]:
+    """Benchmark scatter read with tokens distributed across multiple CXL devices.
+
+    Each CXL device holds a full seq_len pool. Tokens are round-robin assigned
+    to devices, simulating the interleave pattern where different DP ranks'
+    KV caches reside on different CXL devices and are accessed concurrently.
+    """
+    num_devs = len(cxl_devs)
+    exts = []
+    device_ptrs = []
+
+    for i, dev_path in enumerate(cxl_devs):
+        ext = build_cxl_extension_for_device(i)
+        if ext is None:
+            raise RuntimeError(f"Failed to build CXL extension for device {i}")
+
+        total_bytes = seq_len * item_size
+        map_bytes = align_to_2mb(total_bytes)
+        ok = ext.cxl_init(
+            dev_path=dev_path,
+            map_bytes=map_bytes,
+            register_cuda=True,
+            gpu_id=gpu_id,
+        )
+        if not ok:
+            raise RuntimeError(f"cxl_init failed for {dev_path}")
+
+        src_data = torch.randint(0, 256, (seq_len, item_size), dtype=torch.uint8)
+        ext.tensor_to_cxl(src_data.view(-1), offset=0)
+
+        ptr = ext.get_cxl_device_ptr()
+        if ptr == 0:
+            ext.cxl_close()
+            raise RuntimeError(f"CXL device_ptr is null for {dev_path}")
+
+        exts.append(ext)
+        device_ptrs.append(ptr)
+
+    # GPU tensors: source pointer array, per-token device assignment
+    src_ptrs_gpu = torch.tensor(device_ptrs, dtype=torch.int64, device="cuda")
+    device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device="cuda")
+
+    for _ in range(warmup):
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device="cuda")
+        device_map = torch.randint(0, num_devs, (num_tokens,), dtype=torch.int32, device="cuda")
+        scatter_mod.launch_scatter_interleave(
+            src_ptrs_gpu, device_buf, indices, device_map, item_size,
+        )
+        torch.cuda.synchronize()
+
+    latencies = []
+    for _ in range(iters):
+        indices = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64, device="cuda")
+        device_map = torch.randint(0, num_devs, (num_tokens,), dtype=torch.int32, device="cuda")
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        scatter_mod.launch_scatter_interleave(
+            src_ptrs_gpu, device_buf, indices, device_map, item_size,
+        )
+        end.record()
+        torch.cuda.synchronize()
+        latencies.append(start.elapsed_time(end) * 1000.0)
+
+    for ext in exts:
+        ext.cxl_close()
+
+    return latencies
+
+
+# ---------------------------------------------------------------------------
 #  RDMA backend
 # ---------------------------------------------------------------------------
 
@@ -341,22 +445,21 @@ def bench_rdma(
     ib_dev: str,
     seq_len: int,
     item_size: int,
-    top_k: int,
+    num_tokens: int,
     warmup: int,
     iters: int,
 ) -> Tuple[List[float], List[float], List[float]]:
     """Returns (rdma_latencies, gpu_latencies, total_latencies) in μs."""
 
     remote_size = seq_len * item_size
-    local_size = top_k * item_size
+    local_size = num_tokens * item_size
 
     remote_buf = torch.randint(0, 256, (seq_len, item_size), dtype=torch.uint8)
     remote_buf = remote_buf.contiguous()
 
-    staging_buf = torch.zeros(top_k, item_size, dtype=torch.uint8)
+    staging_buf = torch.zeros(num_tokens, item_size, dtype=torch.uint8)
     staging_buf = staging_buf.contiguous()
 
-    # Pin both buffers
     torch.cuda.cudart().cudaHostRegister(
         remote_buf.data_ptr(), remote_buf.numel(), 0
     )
@@ -364,32 +467,29 @@ def bench_rdma(
         staging_buf.data_ptr(), staging_buf.numel(), 0
     )
 
-    # Initialise RDMA loopback
     rdma_ext.rdma_init(
         ib_dev,
         staging_buf.data_ptr(),
         local_size,
         remote_buf.data_ptr(),
         remote_size,
-        top_k,
+        num_tokens,
     )
 
-    device_buf = torch.empty(top_k, item_size, dtype=torch.uint8, device="cuda")
-    contiguous_indices = torch.arange(top_k, dtype=torch.int64, device="cuda")
+    device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device="cuda")
+    contiguous_indices = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
 
     rdma_latencies = []
     gpu_latencies = []
     total_latencies = []
 
     for it in range(-warmup, iters):
-        indices_cpu = torch.randint(0, seq_len, (top_k,), dtype=torch.int64)
+        indices_cpu = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64)
 
-        # Phase 1: RDMA discrete reads (remote → local staging)
         rdma_us = rdma_ext.rdma_scatter_read(
-            indices_cpu.data_ptr(), top_k, item_size
+            indices_cpu.data_ptr(), num_tokens, item_size
         )
 
-        # Phase 2: GPU scatter read (staging → GPU)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -416,15 +516,15 @@ def bench_rdma(
 #  Printing
 # ---------------------------------------------------------------------------
 
-def print_header(seq_len: int, top_k: int, item_size: int):
-    data_kb = top_k * item_size / 1024
+def print_header(seq_len: int, num_tokens: int, item_size: int):
+    data_kb = num_tokens * item_size / 1024
     unit = "KB" if data_kb < 1024 else "MB"
     data_val = data_kb if data_kb < 1024 else data_kb / 1024
-    print(f"\n[Config: seq_len={seq_len}, top_k={top_k}, "
+    print(f"\n[Config: seq_len={seq_len}, num_tokens={num_tokens}, "
           f"data={data_val:.2f}{unit}]")
     print()
     hdr = (
-        f"{'Backend':<16s}| {'Mean (μs)':>9s} | {'Std (μs)':>8s} | "
+        f"{'Backend':<20s}| {'Mean (μs)':>9s} | {'Std (μs)':>8s} | "
         f"{'P50 (μs)':>9s} | {'P99 (μs)':>9s} | {'Eff.BW (GB/s)':>13s}"
     )
     print(hdr)
@@ -432,18 +532,18 @@ def print_header(seq_len: int, top_k: int, item_size: int):
 
 
 def print_comparison(results: Dict[str, Dict]):
-    names = list(results.keys())
     if "dram" in results and "cxl" in results:
         overhead = (results["cxl"]["mean_us"] / results["dram"]["mean_us"] - 1) * 100
         print(f"  CXL vs DRAM overhead:  +{overhead:.1f}%")
+    if "cxl" in results and "cxl_x2" in results:
+        speedup = results["cxl"]["mean_us"] / results["cxl_x2"]["mean_us"]
+        print(f"  CXL-x2 vs CXL-x1 speedup:  {speedup:.2f}x")
     if "cxl" in results and "rdma_total" in results:
         ratio = results["rdma_total"]["mean_us"] / results["cxl"]["mean_us"]
-        overhead = (ratio - 1) * 100
-        print(f"  RDMA vs CXL overhead:  +{overhead:.1f}%  ({ratio:.1f}x slower)")
+        print(f"  RDMA vs CXL overhead:  +{(ratio - 1) * 100:.1f}%  ({ratio:.1f}x slower)")
     if "dram" in results and "rdma_total" in results:
         ratio = results["rdma_total"]["mean_us"] / results["dram"]["mean_us"]
-        overhead = (ratio - 1) * 100
-        print(f"  RDMA vs DRAM overhead: +{overhead:.1f}%  ({ratio:.1f}x slower)")
+        print(f"  RDMA vs DRAM overhead: +{(ratio - 1) * 100:.1f}%  ({ratio:.1f}x slower)")
     print()
 
 
@@ -451,34 +551,51 @@ def print_sweep_table(
     sweep_results: Dict[int, Dict[str, Dict]],
     backends: List[str],
 ):
-    print("\n[Sweep: varying top-k]\n")
+    has_cxl = "cxl" in backends
+    has_cxl_x2 = "cxl_x2" in backends
     has_rdma = "rdma" in backends
+
+    print("\n[Sweep: varying num_tokens]\n")
+
+    cols = ["num_tokens", "DRAM (μs)"]
+    if has_cxl:
+        cols.append("CXL-x1 (μs)")
+    if has_cxl_x2:
+        cols.append("CXL-x2 (μs)")
     if has_rdma:
-        hdr = "top-k |  DRAM (μs) |   CXL (μs) |  RDMA (μs) | CXL/DRAM | RDMA/CXL"
-        sep = "------|------------|------------|------------|----------|----------"
-    else:
-        hdr = "top-k |  DRAM (μs) |   CXL (μs) | CXL/DRAM"
-        sep = "------|------------|------------|----------"
+        cols.append("RDMA (μs)")
+    if has_cxl:
+        cols.append("CXL/DRAM")
+    if has_cxl_x2 and has_cxl:
+        cols.append("x2/x1")
+
+    hdr = " | ".join(f"{c:>12s}" for c in cols)
     print(hdr)
-    print(sep)
+    print("-" * len(hdr))
 
-    for tk in sorted(sweep_results.keys()):
-        r = sweep_results[tk]
+    for nt in sorted(sweep_results.keys()):
+        r = sweep_results[nt]
         dram_us = r.get("dram", {}).get("mean_us", float("nan"))
-        cxl_us = r.get("cxl", {}).get("mean_us", float("nan"))
-        cxl_ratio = cxl_us / dram_us if dram_us > 0 else float("nan")
-
+        vals = [f"{nt:>12d}", f"{dram_us:>12.2f}"]
+        cxl_us = float("nan")
+        cxl_x2_us = float("nan")
+        if has_cxl:
+            cxl_us = r.get("cxl", {}).get("mean_us", float("nan"))
+            vals.append(f"{cxl_us:>12.2f}")
+        if has_cxl_x2:
+            cxl_x2_us = r.get("cxl_x2", {}).get("mean_us", float("nan"))
+            vals.append(f"{cxl_x2_us:>12.2f}")
         if has_rdma:
             rdma_us = r.get("rdma_total", {}).get("mean_us", float("nan"))
-            rdma_ratio = rdma_us / cxl_us if cxl_us > 0 else float("nan")
-            print(
-                f"{tk:>5d} | {dram_us:>10.2f} | {cxl_us:>10.2f} | "
-                f"{rdma_us:>10.2f} | {cxl_ratio:>7.2f}x | {rdma_ratio:>8.1f}x"
-            )
-        else:
-            print(
-                f"{tk:>5d} | {dram_us:>10.2f} | {cxl_us:>10.2f} | {cxl_ratio:>7.2f}x"
-            )
+            vals.append(f"{rdma_us:>12.2f}")
+        if has_cxl:
+            ratio = cxl_us / dram_us if dram_us > 0 else float("nan")
+            vals.append(f"{ratio:>11.2f}x")
+        if has_cxl_x2 and has_cxl:
+            speedup = cxl_us / cxl_x2_us if cxl_x2_us > 0 else float("nan")
+            vals.append(f"{speedup:>11.2f}x")
+
+        print(" | ".join(vals))
 
 
 # ---------------------------------------------------------------------------
@@ -491,46 +608,56 @@ def run_single_config(
     cxl_ext,
     rdma_ext,
     seq_len: int,
-    top_k: int,
+    num_tokens: int,
     item_size: int,
     cxl_dev: str,
+    cxl_devs_x2: List[str],
     ib_dev: str,
     gpu_id: int,
     warmup: int,
     iters: int,
 ) -> Dict[str, Dict]:
-    """Run benchmarks for one (seq_len, top_k) configuration."""
     results = {}
 
     # --- DRAM ---
     if "dram" in backends:
         host_buf = init_dram_pool(seq_len, item_size)
-        lats = bench_dram(scatter_mod, host_buf, item_size, top_k, warmup, iters)
-        stats = compute_stats(lats, top_k, item_size)
+        lats = bench_dram(scatter_mod, host_buf, item_size, num_tokens, warmup, iters)
+        stats = compute_stats(lats, num_tokens, item_size)
         results["dram"] = stats
         print(fmt_stats_row("DRAM", stats))
         cleanup_dram_pool(host_buf)
         del host_buf
 
-    # --- CXL ---
+    # --- CXL (single device) ---
     if "cxl" in backends:
         lats = bench_cxl(
-            scatter_mod, cxl_ext, cxl_dev, seq_len, item_size, top_k,
+            scatter_mod, cxl_ext, cxl_dev, seq_len, item_size, num_tokens,
             gpu_id, warmup, iters,
         )
-        stats = compute_stats(lats, top_k, item_size)
+        stats = compute_stats(lats, num_tokens, item_size)
         results["cxl"] = stats
-        print(fmt_stats_row("CXL", stats))
+        print(fmt_stats_row("CXL (x1)", stats))
+
+    # --- CXL interleave (2 devices) ---
+    if "cxl_x2" in backends:
+        lats = bench_cxl_interleave(
+            scatter_mod, cxl_devs_x2, seq_len, item_size, num_tokens,
+            gpu_id, warmup, iters,
+        )
+        stats = compute_stats(lats, num_tokens, item_size)
+        results["cxl_x2"] = stats
+        print(fmt_stats_row("CXL-interleave (x2)", stats))
 
     # --- RDMA ---
     if "rdma" in backends:
         rdma_lats, gpu_lats, total_lats = bench_rdma(
-            scatter_mod, rdma_ext, ib_dev, seq_len, item_size, top_k,
+            scatter_mod, rdma_ext, ib_dev, seq_len, item_size, num_tokens,
             warmup, iters,
         )
-        stats_total = compute_stats(total_lats, top_k, item_size)
-        stats_rdma = compute_stats(rdma_lats, top_k, item_size)
-        stats_gpu = compute_stats(gpu_lats, top_k, item_size)
+        stats_total = compute_stats(total_lats, num_tokens, item_size)
+        stats_rdma = compute_stats(rdma_lats, num_tokens, item_size)
+        stats_gpu = compute_stats(gpu_lats, num_tokens, item_size)
         results["rdma_total"] = stats_total
         results["rdma_read"] = stats_rdma
         results["rdma_gpu"] = stats_gpu
@@ -546,10 +673,15 @@ def main():
         description="Single-layer sparse KV cache read latency benchmark"
     )
     parser.add_argument(
-        "--backends", type=str, default="dram,cxl,rdma",
-        help="Comma-separated list of backends to test (dram,cxl,rdma)",
+        "--backends", type=str, default="dram,cxl,cxl_x2,rdma",
+        help="Comma-separated backends: dram, cxl, cxl_x2, rdma",
     )
-    parser.add_argument("--cxl-dev", type=str, default="/dev/dax0.0")
+    parser.add_argument("--cxl-dev", type=str, default="/dev/dax0.0",
+                        help="CXL DAX device for single-device tests")
+    parser.add_argument(
+        "--cxl-devs", type=str, default="/dev/dax0.0,/dev/dax1.0",
+        help="Comma-separated CXL DAX devices for interleave (cxl_x2)",
+    )
     parser.add_argument("--ib-dev", type=str, default="mlx5_0")
     parser.add_argument("--rdma-mode", type=str, default="loopback",
                         choices=["loopback"])
@@ -558,11 +690,12 @@ def main():
         help="Comma-separated sequence lengths",
     )
     parser.add_argument(
-        "--top-ks", type=str, default="64,128,256,512,1024,2048",
-        help="Comma-separated top-k values",
+        "--num-tokens", type=str,
+        default="64,128,256,512,1024,2048,4096,8192,16384",
+        help="Comma-separated num_tokens values (discrete KV entries to read)",
     )
     parser.add_argument("--item-size", type=int, default=656,
-                        help="Per-token KV entry size in bytes")
+                        help="Per-token KV entry size in bytes (MLA latent dim)")
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--gpu-id", type=int, default=0)
@@ -573,21 +706,25 @@ def main():
 
     backends = [b.strip().lower() for b in args.backends.split(",")]
     seq_lens = [int(s) for s in args.seq_lens.split(",")]
-    top_ks = [int(k) for k in args.top_ks.split(",")]
+    num_tokens_list = [int(k) for k in args.num_tokens.split(",")]
+    cxl_devs_x2 = [d.strip() for d in args.cxl_devs.split(",")]
 
     torch.cuda.set_device(args.gpu_id)
 
-    print("=" * 60)
+    print("=" * 70)
     print("Single-Layer Sparse KV Read Latency Benchmark")
-    print("=" * 60)
-    print(f"Model: DeepSeek-V3.2 (MLA FP8, item_size={args.item_size}B, "
-          f"store_dtype=uint8)")
-    print(f"Backends: {backends}")
-    print(f"Seq lens: {seq_lens}")
-    print(f"Top-k:    {top_ks}")
-    print(f"Warmup:   {args.warmup}, Iters: {args.iters}")
+    print("=" * 70)
+    print(f"Model params: DeepSeek-V3.2 (MLA FP8, item_size={args.item_size}B)")
+    print(f"Backends:     {backends}")
+    print(f"Seq lens:     {seq_lens}")
+    print(f"Num tokens:   {num_tokens_list}")
+    if "cxl" in backends:
+        print(f"CXL (x1):     {args.cxl_dev}")
+    if "cxl_x2" in backends:
+        print(f"CXL (x2):     {cxl_devs_x2}")
     if "rdma" in backends:
-        print(f"RDMA:     {args.rdma_mode} mode, device={args.ib_dev}")
+        print(f"RDMA:         {args.rdma_mode} mode, device={args.ib_dev}")
+    print(f"Warmup: {args.warmup}, Iters: {args.iters}")
 
     # Build extensions
     print("\nBuilding GPU scatter kernel...")
@@ -601,6 +738,17 @@ def main():
             print("[WARN] CXL extension build failed; removing 'cxl' from backends.")
             backends.remove("cxl")
 
+    if "cxl_x2" in backends:
+        print(f"Building CXL extensions for interleave ({len(cxl_devs_x2)} devices)...")
+        try:
+            for i in range(len(cxl_devs_x2)):
+                ext = build_cxl_extension_for_device(i)
+                if ext is None:
+                    raise RuntimeError(f"Build failed for CXL device {i}")
+        except Exception as e:
+            print(f"[WARN] CXL interleave extension build failed: {e}")
+            backends.remove("cxl_x2")
+
     rdma_ext = None
     if "rdma" in backends:
         print("Loading RDMA extension...")
@@ -612,34 +760,35 @@ def main():
     all_results = {}
 
     for seq_len in seq_lens:
-        print(f"\n{'='*60}")
+        print(f"\n{'='*70}")
         print(f"  seq_len = {seq_len} ({seq_len // 1024}K)")
-        print(f"{'='*60}")
+        print(f"{'='*70}")
 
         sweep_results = {}
 
-        for top_k in top_ks:
-            if top_k > seq_len:
-                print(f"\n  [SKIP] top_k={top_k} > seq_len={seq_len}")
+        for num_tokens in num_tokens_list:
+            if num_tokens > seq_len:
+                print(f"\n  [SKIP] num_tokens={num_tokens} > seq_len={seq_len}")
                 continue
 
-            print_header(seq_len, top_k, args.item_size)
+            print_header(seq_len, num_tokens, args.item_size)
             results = run_single_config(
                 backends=backends,
                 scatter_mod=scatter_mod,
                 cxl_ext=cxl_ext,
                 rdma_ext=rdma_ext,
                 seq_len=seq_len,
-                top_k=top_k,
+                num_tokens=num_tokens,
                 item_size=args.item_size,
                 cxl_dev=args.cxl_dev,
+                cxl_devs_x2=cxl_devs_x2,
                 ib_dev=args.ib_dev,
                 gpu_id=args.gpu_id,
                 warmup=args.warmup,
                 iters=args.iters,
             )
             print_comparison(results)
-            sweep_results[top_k] = results
+            sweep_results[num_tokens] = results
 
         if len(sweep_results) > 1:
             print_sweep_table(sweep_results, backends)
@@ -655,8 +804,8 @@ def main():
         serializable = {}
         for sl, sr in all_results.items():
             serializable[str(sl)] = {}
-            for tk, res in sr.items():
-                serializable[str(sl)][str(tk)] = res
+            for nt, res in sr.items():
+                serializable[str(sl)][str(nt)] = res
         with open(out_path, "w") as f:
             json.dump(
                 {
@@ -664,9 +813,11 @@ def main():
                         "backends": backends,
                         "item_size": args.item_size,
                         "seq_lens": seq_lens,
-                        "top_ks": top_ks,
+                        "num_tokens": num_tokens_list,
                         "warmup": args.warmup,
                         "iters": args.iters,
+                        "cxl_dev": args.cxl_dev,
+                        "cxl_devs_x2": cxl_devs_x2 if "cxl_x2" in backends else None,
                         "rdma_mode": args.rdma_mode if "rdma" in backends else None,
                     },
                     "results": serializable,
