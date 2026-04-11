@@ -111,6 +111,21 @@ def _parse_sparse_config(server_args) -> SparseConfig:
                     "'map_bytes' when 'dev_paths' has multiple devices"
                 )
 
+    # Validate RDMA multi-NIC interleave config
+    if rdma_config and rdma_config.get("enabled"):
+        ib_devs = rdma_config.get("ib_devs")
+        if ib_devs is not None:
+            if not isinstance(ib_devs, list) or len(ib_devs) == 0:
+                raise ValueError(
+                    "rdma_pool.ib_devs must be a non-empty list of IB device "
+                    "names (e.g. [\"mlx5_0\", \"mlx5_1\"])"
+                )
+            logger.info(
+                "RDMA multi-NIC interleave: %d NICs configured (%s)",
+                len(ib_devs),
+                ib_devs,
+            )
+
     return SparseConfig(
         top_k=top_k,
         device_buffer_size=device_buffer_size,

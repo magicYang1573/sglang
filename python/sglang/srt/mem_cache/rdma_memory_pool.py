@@ -13,6 +13,11 @@ Uses real RDMA NIC loopback -- the "remote" data is stored in a local DRAM
 region registered as an RDMA MR, and fetched through the NIC hardware
 (ibv_post_send RDMA READ -> ibv_poll_cq).  This produces real hardware
 latency, which is a lower bound of cross-machine RDMA latency.
+
+Multi-NIC interleave: when ``ib_devs`` is provided in rdma_config, each
+TP rank is assigned a NIC via ``tp_rank % len(ib_devs)``.  This uses the
+per-instance ``RDMAContext`` class so that each rank holds an independent
+RDMA context on its assigned NIC.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from __future__ import annotations
 import logging
 import random
 import time
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import torch
 
@@ -30,35 +35,99 @@ logger = logging.getLogger(__name__)
 
 
 def _try_load_rdma_ext():
-    """Try to load the pre-built RDMA pybind11 extension."""
-    import importlib.util
+    """Load the RDMA pybind11 extension, JIT-compiling if necessary.
+
+    Strategy (in order):
+      1. If a pre-built ``rdma_scatter_ext*.so`` already exists in
+         ``test/cxl_utils/``, import it directly (fast path).
+      2. Otherwise JIT-compile from source using
+         ``torch.utils.cpp_extension.load()``.  The compiled .so is cached
+         in ``test/cxl_utils/build/rdma_ext/`` so subsequent runs skip
+         recompilation.
+      3. If sources are missing or compilation fails, return ``None`` and
+         let the caller fall back to simulation mode.
+    """
     import sys
     from pathlib import Path
 
-    # Look for the .so in test/cxl_utils/
+    from torch.utils.cpp_extension import load
+
     sglang_root = Path(__file__).resolve().parents[4]
     cxl_utils = sglang_root / "test" / "cxl_utils"
 
+    # Fast path: pre-built .so already present
     so_files = list(cxl_utils.glob("rdma_scatter_ext*.so"))
-    if not so_files:
+    if so_files:
+        sys.path.insert(0, str(cxl_utils))
+        try:
+            import rdma_scatter_ext
+
+            return rdma_scatter_ext
+        except ImportError as e:
+            logger.warning(
+                "Pre-built rdma_scatter_ext found but failed to import: %s", e
+            )
+
+    # JIT compile from source
+    src_c = cxl_utils / "rdma_scatter_read.c"
+    src_cpp = cxl_utils / "rdma_scatter_read_py.cpp"
+    src_h = cxl_utils / "rdma_scatter_read.h"
+
+    if not (src_c.exists() and src_cpp.exists() and src_h.exists()):
+        logger.warning(
+            "RDMA sources not found in %s. "
+            "RDMA backend unavailable.",
+            cxl_utils,
+        )
         return None
 
-    sys.path.insert(0, str(cxl_utils))
+    build_dir = cxl_utils / "build" / "rdma_ext"
+    build_dir.mkdir(parents=True, exist_ok=True)
+
     try:
-        import rdma_scatter_ext
-
-        return rdma_scatter_ext
-    except ImportError as e:
-        logger.warning("Failed to import rdma_scatter_ext: %s", e)
+        logger.info(
+            "JIT-compiling rdma_scatter_ext (first run only, cached in %s)...",
+            build_dir,
+        )
+        ext = load(
+            name="rdma_scatter_ext",
+            sources=[str(src_c), str(src_cpp)],
+            extra_cflags=["-O3", "-Wall", "-fPIC"],
+            extra_cxx_flags=["-O3", "-Wall", "-fPIC", "-std=c++17"],
+            extra_ldflags=["-libverbs"],
+            build_directory=str(build_dir),
+            verbose=False,
+            with_cuda=False,
+        )
+        logger.info("rdma_scatter_ext compiled successfully.")
+        return ext
+    except Exception as e:
+        logger.warning(
+            "Failed to JIT-compile rdma_scatter_ext: %s. "
+            "Is libibverbs-dev installed?",
+            e,
+        )
         return None
+
+
+def _resolve_ib_dev(rdma_config: dict, tp_rank: int) -> str:
+    """Pick the IB device for this rank from config.
+
+    If ``ib_devs`` (list) is present, select via ``tp_rank % len(ib_devs)``.
+    Otherwise fall back to the scalar ``ib_dev`` field.
+    """
+    ib_devs: Optional[List[str]] = rdma_config.get("ib_devs")
+    if ib_devs and len(ib_devs) > 0:
+        return ib_devs[tp_rank % len(ib_devs)]
+    return rdma_config.get("ib_dev", "mlx5_0")
 
 
 class RDMALoopbackContext:
     """Manages RDMA resources for loopback bulk-read simulation.
 
-    Wraps the rdma_scatter_ext pybind11 module to perform bulk RDMA READs
-    (contiguous reads split into max-message-size chunks) rather than
-    per-token discrete reads.
+    Uses the per-instance ``RDMAContext`` class from rdma_scatter_ext so
+    that multiple ranks can each hold an independent context on different
+    IB devices (multi-NIC interleave).
     """
 
     def __init__(
@@ -83,27 +152,43 @@ class RDMALoopbackContext:
         self.staging_buf_ptr = staging_buf_ptr
         self.staging_buf_size = staging_buf_size
 
-        self.rdma_ext.rdma_init(
-            ib_dev,
-            staging_buf_ptr,
-            staging_buf_size,
-            remote_buf_ptr,
-            remote_buf_size,
-            max_wr,
-        )
+        # Use per-instance RDMAContext (supports multi-NIC interleave)
+        if hasattr(self.rdma_ext, "RDMAContext"):
+            self._handle = self.rdma_ext.RDMAContext()
+            self._handle.init(
+                ib_dev,
+                staging_buf_ptr,
+                staging_buf_size,
+                remote_buf_ptr,
+                remote_buf_size,
+                max_wr,
+            )
+            self._use_handle = True
+        else:
+            # Fallback to legacy global-singleton API
+            self.rdma_ext.rdma_init(
+                ib_dev,
+                staging_buf_ptr,
+                staging_buf_size,
+                remote_buf_ptr,
+                remote_buf_size,
+                max_wr,
+            )
+            self._handle = None
+            self._use_handle = False
+
         self._initialized = True
         logger.info(
-            "RDMA loopback initialized: ib_dev=%s, remote=%.2f GB, staging=%.2f GB",
+            "RDMA loopback initialized: ib_dev=%s, remote=%.2f GB, "
+            "staging=%.2f GB, multi_instance=%s",
             ib_dev,
             remote_buf_size / 1e9,
             staging_buf_size / 1e9,
+            self._use_handle,
         )
 
     def bulk_read(self, indices: torch.Tensor, item_size: int) -> float:
         """Execute RDMA READs for the given token indices.
-
-        Uses per-token discrete RDMA READs (the existing scatter_read path)
-        to faithfully simulate the real per-request RDMA overhead.
 
         Returns elapsed time in microseconds.
         """
@@ -115,14 +200,22 @@ class RDMALoopbackContext:
             return 0.0
 
         indices_cpu = indices.cpu().contiguous()
-        elapsed_us = self.rdma_ext.rdma_scatter_read(
-            indices_cpu.data_ptr(), top_k, item_size
-        )
+        if self._use_handle:
+            elapsed_us = self._handle.scatter_read(
+                indices_cpu.data_ptr(), top_k, item_size
+            )
+        else:
+            elapsed_us = self.rdma_ext.rdma_scatter_read(
+                indices_cpu.data_ptr(), top_k, item_size
+            )
         return elapsed_us
 
     def destroy(self):
         if self._initialized:
-            self.rdma_ext.rdma_destroy()
+            if self._use_handle and self._handle is not None:
+                self._handle.destroy()
+            else:
+                self.rdma_ext.rdma_destroy()
             self._initialized = False
 
 
@@ -133,6 +226,10 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
       - local requests: X% of requests, KV in pinned DRAM, directly accessible
       - remote requests: (1-X)% of requests, KV must be fetched via RDMA
 
+    Multi-NIC interleave: each TP rank is assigned a NIC via
+    ``tp_rank % len(ib_devs)`` so that different ranks use different
+    NICs for their RDMA loopback, distributing PCIe traffic.
+
     Lifecycle:
       1. Prefill/staging: KV written to host pool (pinned DRAM) as normal.
          If the request is marked "remote", KV is copied to remote_buffer
@@ -141,9 +238,6 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
          per remote request.  RDMA READs fetch remote_buffer -> staging_buffer,
          then staging is copied back to host_pool.
       3. All decode steps: HiSparse reads from unified host_pool view.
-
-    This models PD-disaggregation: decode instance fetches full KV from remote
-    prefill instance once before decoding.
     """
 
     def __init__(
@@ -154,10 +248,12 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         page_size: int,
         layout: str,
         rdma_config: dict,
+        tp_rank: int = 0,
         override_kv_cache_dim: Optional[int] = None,
     ):
         self.local_ratio = rdma_config.get("local_ratio", 0.0)
-        self.ib_dev = rdma_config.get("ib_dev", "mlx5_0")
+        self.ib_dev = _resolve_ib_dev(rdma_config, tp_rank)
+        self.tp_rank = tp_rank
         self._rdma_ctx: Optional[RDMALoopbackContext] = None
         self._remote_reqs: Set[int] = set()
         self._rdma_stats: Dict[str, float] = {
@@ -179,17 +275,11 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
 
     def init_kv_buffer(self):
         """Allocate host pool + shadow remote buffer + staging buffer."""
-        # Call parent to get the normal host pool buffer
         buffer = super().init_kv_buffer()
 
-        # remote_buffer: regular DRAM, registered as RDMA MR.
-        # Same shape as host_pool, stores "remote" requests' KV copies.
         self.remote_buffer = torch.empty_like(buffer, pin_memory=True)
-
-        # staging_buffer: pinned DRAM, RDMA READ target.
         self.staging_buffer = torch.empty_like(buffer, pin_memory=True)
 
-        # Register RDMA MRs and create loopback context
         remote_ptr = self.remote_buffer.data_ptr()
         remote_size = self.remote_buffer.numel() * self.remote_buffer.element_size()
         staging_ptr = self.staging_buffer.data_ptr()
@@ -211,8 +301,10 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             self._rdma_ctx = None
 
         logger.info(
-            "RDMA host pool: local_ratio=%.2f, remote_buffer=%.2f GB, "
-            "staging_buffer=%.2f GB, rdma_available=%s",
+            "RDMA host pool: tp_rank=%d, ib_dev=%s, local_ratio=%.2f, "
+            "remote_buffer=%.2f GB, staging_buffer=%.2f GB, rdma_available=%s",
+            self.tp_rank,
+            self.ib_dev,
             self.local_ratio,
             remote_size / 1e9,
             staging_size / 1e9,
@@ -227,7 +319,6 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         Returns True if the request is remote (needs RDMA prefetch).
         """
         if random.random() < self.local_ratio:
-            # Local request: KV already in host pool, no RDMA needed
             self._remote_reqs.discard(req_pool_idx)
             return False
         else:
@@ -237,11 +328,7 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
     def simulate_remote_write(
         self, req_pool_idx: int, host_indices: torch.Tensor
     ) -> None:
-        """Copy a remote request's KV from host_pool to remote_buffer.
-
-        Simulates "KV stored on remote node" -- after prefill, the decode
-        node would not have this data locally.
-        """
+        """Copy a remote request's KV from host_pool to remote_buffer."""
         if req_pool_idx not in self._remote_reqs:
             return
 
@@ -277,10 +364,8 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         item_size = self.token_stride_size
 
         if self._rdma_ctx is not None:
-            # Use real RDMA READ through NIC loopback
             rdma_us = self._rdma_ctx.bulk_read(valid_cpu, item_size)
         else:
-            # Simulation mode: measure memcpy time as approximation
             t0 = time.monotonic()
             for layer_id in range(self.layer_num):
                 self.staging_buffer[layer_id, valid_cpu] = self.remote_buffer[
@@ -288,7 +373,6 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
                 ]
             rdma_us = (time.monotonic() - t0) * 1e6
 
-        # Copy staging -> host_pool (simulates "RDMA READ completed, data in local")
         for layer_id in range(self.layer_num):
             self.kv_buffer[layer_id, valid_cpu] = self.staging_buffer[
                 layer_id, valid_cpu
@@ -298,9 +382,11 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         self._rdma_stats["prefetch_count"] += 1
 
         logger.debug(
-            "RDMA prefetch: req_pool_idx=%d, tokens=%d, %.1f us (%.2f MB)",
+            "RDMA prefetch: req_pool_idx=%d, tokens=%d, ib_dev=%s, "
+            "%.1f us (%.2f MB)",
             req_pool_idx,
             num_tokens,
+            self.ib_dev,
             rdma_us,
             num_tokens * item_size * self.layer_num / 1e6,
         )

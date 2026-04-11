@@ -88,7 +88,7 @@ class HiSparseCoordinator:
         self._cxl_region = None
         if rdma_config is not None and rdma_config.get("enabled", False):
             self.mem_pool_host = self._init_rdma_host_pool(
-                rdma_config, host_to_device_ratio
+                rdma_config, host_to_device_ratio, tp_rank
             )
         elif cxl_config is not None and cxl_config.get("enabled", False):
             self.mem_pool_host = self._init_cxl_host_pool(
@@ -516,13 +516,21 @@ class HiSparseCoordinator:
         self,
         rdma_config: Dict,
         host_to_device_ratio: int,
+        tp_rank: int,
     ) -> "RDMAMLATokenToKVPoolHost":
-        from sglang.srt.mem_cache.rdma_memory_pool import RDMAMLATokenToKVPoolHost
+        from sglang.srt.mem_cache.rdma_memory_pool import (
+            RDMAMLATokenToKVPoolHost,
+            _resolve_ib_dev,
+        )
 
+        ib_dev = _resolve_ib_dev(rdma_config, tp_rank)
         logger.info(
-            "HiSparse: initializing RDMA host pool with local_ratio=%.2f, ib_dev=%s",
+            "HiSparse: initializing RDMA host pool: tp_rank=%d, ib_dev=%s, "
+            "local_ratio=%.2f, ib_devs=%s",
+            tp_rank,
+            ib_dev,
             rdma_config.get("local_ratio", 0.0),
-            rdma_config.get("ib_dev", "mlx5_0"),
+            rdma_config.get("ib_devs", [rdma_config.get("ib_dev", "mlx5_0")]),
         )
         return RDMAMLATokenToKVPoolHost(
             device_pool=self.mem_pool_device,
@@ -531,6 +539,7 @@ class HiSparseCoordinator:
             page_size=1,
             layout="layer_first",
             rdma_config=rdma_config,
+            tp_rank=tp_rank,
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
         )
 
