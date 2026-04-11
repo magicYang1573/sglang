@@ -151,40 +151,71 @@ def build_cxl_extension():
     return _cxl_ext
 
 
-# Build per-device CXL extensions (each needs its own global state).
-# cxl_mem_ext uses a global singleton, so for multi-device we compile
-# separate copies with distinct module names.
+# ---------------------------------------------------------------------------
+#  Direct mmap + cudaHostRegister for multi-device CXL interleave.
+#  The cxl_mem_ext pybind module uses a global singleton (g_cxl), so we cannot
+#  hold multiple devices open simultaneously. Instead we mmap each DAX device
+#  directly from Python and register with CUDA ourselves.
+# ---------------------------------------------------------------------------
 
-_cxl_ext_cache: Dict[int, object] = {}
+import mmap as _mmap_mod
 
 
-def build_cxl_extension_for_device(dev_idx: int):
-    if dev_idx in _cxl_ext_cache:
-        return _cxl_ext_cache[dev_idx]
+class CXLDeviceRegion:
+    """Manages a single CXL DAX device: mmap + cudaHostRegister."""
 
-    cxl_root = ROOT.parent.parent / "sgl-kernel" / "cxl_utils"
-    if not (cxl_root / "cxl_mem.cpp").exists():
-        return None
+    def __init__(self, dev_path: str, map_bytes: int, gpu_id: int):
+        self.dev_path = dev_path
+        self.map_bytes = map_bytes
+        self.fd = os.open(dev_path, os.O_RDWR)
+        self.mm = _mmap_mod.mmap(
+            self.fd, map_bytes, _mmap_mod.MAP_SHARED, _mmap_mod.PROT_READ | _mmap_mod.PROT_WRITE,
+        )
+        self.base_ptr = ctypes.addressof(ctypes.c_char.from_buffer(self.mm))
 
-    build_dir = ROOT / "build" / f"cxl_ext_dev{dev_idx}"
-    build_dir.mkdir(parents=True, exist_ok=True)
+        prev_dev = torch.cuda.current_device()
+        torch.cuda.set_device(gpu_id)
+        # cudaHostRegisterMapped = 0x02
+        ret = torch.cuda.cudart().cudaHostRegister(
+            ctypes.c_void_p(self.base_ptr), map_bytes, 2
+        )
+        # cudaHostGetDevicePointer
+        dev_ptr = ctypes.c_void_p()
+        torch.cuda.cudart().cudaHostGetDevicePointer(
+            ctypes.byref(dev_ptr), ctypes.c_void_p(self.base_ptr), 0
+        )
+        self.device_ptr = dev_ptr.value or 0
+        torch.cuda.set_device(prev_dev)
 
-    ext = load(
-        name=f"cxl_mem_ext_dev{dev_idx}",
-        sources=[
-            str(cxl_root / "cxl_mem.cpp"),
-            str(cxl_root / "cxl_mem_cuda.cu"),
-            str(cxl_root / "cxl_mem_pybind.cpp"),
-        ],
-        extra_cflags=["-O3", "-std=c++17", "-mclflushopt", "-mclwb", "-msse4.1", "-fopenmp"],
-        extra_cuda_cflags=["-O3", "-std=c++17"],
-        extra_ldflags=["-lgomp"],
-        build_directory=str(build_dir),
-        verbose=False,
-        with_cuda=True,
-    )
-    _cxl_ext_cache[dev_idx] = ext
-    return ext
+        if self.device_ptr == 0:
+            self.close()
+            raise RuntimeError(
+                f"cudaHostGetDevicePointer returned null for {dev_path}"
+            )
+
+    def write_random_data(self, nbytes: int):
+        """Write random bytes into the mmap region for benchmarking."""
+        chunk = 64 * 1024 * 1024
+        offset = 0
+        while offset < nbytes:
+            n = min(chunk, nbytes - offset)
+            data = np.random.randint(0, 256, n, dtype=np.uint8).tobytes()
+            self.mm[offset:offset + n] = data
+            offset += n
+
+    def close(self):
+        try:
+            torch.cuda.cudart().cudaHostUnregister(ctypes.c_void_p(self.base_ptr))
+        except Exception:
+            pass
+        try:
+            self.mm.close()
+        except Exception:
+            pass
+        try:
+            os.close(self.fd)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -373,37 +404,18 @@ def bench_cxl_interleave(
     KV caches reside on different CXL devices and are accessed concurrently.
     """
     num_devs = len(cxl_devs)
-    exts = []
-    device_ptrs = []
+    regions: List[CXLDeviceRegion] = []
+    device_ptrs: List[int] = []
 
-    for i, dev_path in enumerate(cxl_devs):
-        ext = build_cxl_extension_for_device(i)
-        if ext is None:
-            raise RuntimeError(f"Failed to build CXL extension for device {i}")
+    total_bytes = seq_len * item_size
+    map_bytes = align_to_2mb(total_bytes)
 
-        total_bytes = seq_len * item_size
-        map_bytes = align_to_2mb(total_bytes)
-        ok = ext.cxl_init(
-            dev_path=dev_path,
-            map_bytes=map_bytes,
-            register_cuda=True,
-            gpu_id=gpu_id,
-        )
-        if not ok:
-            raise RuntimeError(f"cxl_init failed for {dev_path}")
+    for dev_path in cxl_devs:
+        region = CXLDeviceRegion(dev_path, map_bytes, gpu_id)
+        region.write_random_data(total_bytes)
+        regions.append(region)
+        device_ptrs.append(region.device_ptr)
 
-        src_data = torch.randint(0, 256, (seq_len, item_size), dtype=torch.uint8)
-        ext.tensor_to_cxl(src_data.view(-1), offset=0)
-
-        ptr = ext.get_cxl_device_ptr()
-        if ptr == 0:
-            ext.cxl_close()
-            raise RuntimeError(f"CXL device_ptr is null for {dev_path}")
-
-        exts.append(ext)
-        device_ptrs.append(ptr)
-
-    # GPU tensors: source pointer array, per-token device assignment
     src_ptrs_gpu = torch.tensor(device_ptrs, dtype=torch.int64, device="cuda")
     device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device="cuda")
 
@@ -429,8 +441,8 @@ def bench_cxl_interleave(
         torch.cuda.synchronize()
         latencies.append(start.elapsed_time(end) * 1000.0)
 
-    for ext in exts:
-        ext.cxl_close()
+    for region in regions:
+        region.close()
 
     return latencies
 
@@ -438,6 +450,9 @@ def bench_cxl_interleave(
 # ---------------------------------------------------------------------------
 #  RDMA backend
 # ---------------------------------------------------------------------------
+
+RDMA_MAX_BATCH = 2048
+
 
 def bench_rdma(
     scatter_mod,
@@ -449,15 +464,24 @@ def bench_rdma(
     warmup: int,
     iters: int,
 ) -> Tuple[List[float], List[float], List[float]]:
-    """Returns (rdma_latencies, gpu_latencies, total_latencies) in μs."""
+    """Returns (rdma_latencies, gpu_latencies, total_latencies) in μs.
 
+    When num_tokens > RDMA_MAX_BATCH, the RDMA scatter reads are split into
+    batches of RDMA_MAX_BATCH to stay within QP/CQ hardware limits.  The
+    staging buffer is sized for one batch; after each RDMA batch completes,
+    its data is GPU-copied into the correct slice of device_buf, then the
+    staging buffer is reused for the next batch.
+    """
+
+    batch_size = min(num_tokens, RDMA_MAX_BATCH)
+    num_batches = (num_tokens + batch_size - 1) // batch_size
     remote_size = seq_len * item_size
-    local_size = num_tokens * item_size
+    staging_size = batch_size * item_size
 
     remote_buf = torch.randint(0, 256, (seq_len, item_size), dtype=torch.uint8)
     remote_buf = remote_buf.contiguous()
 
-    staging_buf = torch.zeros(num_tokens, item_size, dtype=torch.uint8)
+    staging_buf = torch.zeros(batch_size, item_size, dtype=torch.uint8)
     staging_buf = staging_buf.contiguous()
 
     torch.cuda.cudart().cudaHostRegister(
@@ -470,14 +494,18 @@ def bench_rdma(
     rdma_ext.rdma_init(
         ib_dev,
         staging_buf.data_ptr(),
-        local_size,
+        staging_size,
         remote_buf.data_ptr(),
         remote_size,
-        num_tokens,
+        batch_size,
     )
 
     device_buf = torch.empty(num_tokens, item_size, dtype=torch.uint8, device="cuda")
-    contiguous_indices = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    # Contiguous indices [0..batch_size) for GPU copy from staging → device slice
+    batch_indices_gpu = torch.arange(batch_size, dtype=torch.int64, device="cuda")
+
+    if num_batches > 1:
+        print(f"  (RDMA: {num_batches} batches x {batch_size} tokens)")
 
     rdma_latencies = []
     gpu_latencies = []
@@ -486,24 +514,39 @@ def bench_rdma(
     for it in range(-warmup, iters):
         indices_cpu = torch.randint(0, seq_len, (num_tokens,), dtype=torch.int64)
 
-        rdma_us = rdma_ext.rdma_scatter_read(
-            indices_cpu.data_ptr(), num_tokens, item_size
-        )
+        rdma_us_total = 0.0
+        gpu_us_total = 0.0
+        offset = 0
 
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        scatter_mod.launch_scatter(
-            staging_buf.data_ptr(), device_buf, contiguous_indices, item_size
-        )
-        end.record()
-        torch.cuda.synchronize()
-        gpu_us = start.elapsed_time(end) * 1000.0
+        for b in range(num_batches):
+            chunk = min(batch_size, num_tokens - offset)
+            batch_idx = indices_cpu[offset:offset + chunk].contiguous()
+
+            # RDMA phase: scatter read into staging_buf[0:chunk]
+            rdma_us = rdma_ext.rdma_scatter_read(
+                batch_idx.data_ptr(), chunk, item_size
+            )
+            rdma_us_total += rdma_us
+
+            # GPU phase: copy staging_buf → device_buf[offset:offset+chunk]
+            dst_slice = device_buf[offset:offset + chunk]
+            idx_slice = batch_indices_gpu[:chunk]
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            scatter_mod.launch_scatter(
+                staging_buf.data_ptr(), dst_slice, idx_slice, item_size
+            )
+            end.record()
+            torch.cuda.synchronize()
+            gpu_us_total += start.elapsed_time(end) * 1000.0
+
+            offset += chunk
 
         if it >= 0:
-            rdma_latencies.append(rdma_us)
-            gpu_latencies.append(gpu_us)
-            total_latencies.append(rdma_us + gpu_us)
+            rdma_latencies.append(rdma_us_total)
+            gpu_latencies.append(gpu_us_total)
+            total_latencies.append(rdma_us_total + gpu_us_total)
 
     rdma_ext.rdma_destroy()
     torch.cuda.cudart().cudaHostUnregister(remote_buf.data_ptr())
@@ -739,15 +782,12 @@ def main():
             backends.remove("cxl")
 
     if "cxl_x2" in backends:
-        print(f"Building CXL extensions for interleave ({len(cxl_devs_x2)} devices)...")
-        try:
-            for i in range(len(cxl_devs_x2)):
-                ext = build_cxl_extension_for_device(i)
-                if ext is None:
-                    raise RuntimeError(f"Build failed for CXL device {i}")
-        except Exception as e:
-            print(f"[WARN] CXL interleave extension build failed: {e}")
-            backends.remove("cxl_x2")
+        print(f"CXL interleave: will use direct mmap for {len(cxl_devs_x2)} devices: {cxl_devs_x2}")
+        for dp in cxl_devs_x2:
+            if not os.path.exists(dp):
+                print(f"[WARN] CXL device {dp} not found; removing 'cxl_x2' from backends.")
+                backends.remove("cxl_x2")
+                break
 
     rdma_ext = None
     if "rdma" in backends:
