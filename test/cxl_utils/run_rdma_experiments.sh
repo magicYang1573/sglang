@@ -12,7 +12,7 @@
 #     rdma_4nic_local0   — 4 NICs, local_ratio=0.0  (all remote)
 #     rdma_8nic_local0   — 8 NICs, local_ratio=0.0  (all remote)
 #
-# Per-scheme: 256 requests (NUM_REQUESTS, overridable), max-concurrency 64.
+# Per-scheme: 128 requests (NUM_REQUESTS, overridable), max-concurrency 64.
 #
 # Lifecycle: For each (scheme × context length): start server → wait /health →
 #   one e2e_bench_fast run → stop server.  No shared KV between cases.
@@ -30,7 +30,7 @@
 # Optional env overrides (same as run_cxl_rdma_nic_experiments.sh):
 #   MODEL_CLIENT, PORT, TP, DP_SIZE, MEM_FRACTION_STATIC, MAX_TOTAL_TOKENS
 #   IB_DEVICES (comma-separated, default: mlx5_0,...,mlx5_7)
-#   NUM_REQUESTS (default 256), NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS
+#   NUM_REQUESTS (default 128), NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS
 #   ROUND2_OUTPUT_MIN (default 0), ROUND2_OUTPUT_MAX (default 1024)
 #   MAX_CONCURRENCY (default 64), REPEAT_MODE, REQUEST_RATE
 #   HF_ENDPOINT, RESULTS_DIR, SERVER_STARTUP_WAIT
@@ -53,7 +53,7 @@ MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-200000}"
 IB_DEVICES="${IB_DEVICES:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7}"
 IFS=',' read -ra ALL_IB_DEVS <<< "${IB_DEVICES}"
 
-NUM_REQUESTS="${NUM_REQUESTS:-256}"
+NUM_REQUESTS="${NUM_REQUESTS:-128}"
 NUM_UNIQUE_PROMPTS="${NUM_UNIQUE_PROMPTS:-1}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-512}"
 ROUND2_OUTPUT_MIN="${ROUND2_OUTPUT_MIN:-0}"
