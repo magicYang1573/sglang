@@ -316,7 +316,7 @@ async def send_request_streaming(
     try:
         async with session.post(
             f"{url}/v1/completions", json=payload,
-            timeout=aiohttp.ClientTimeout(total=600),
+            timeout=aiohttp.ClientTimeout(total=3600),
         ) as resp:
             if resp.status != 200:
                 result.error = f"HTTP {resp.status}: {await resp.text()}"
