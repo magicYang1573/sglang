@@ -70,7 +70,22 @@
 
 方案 B 模拟"分布式内存池中，X% 的请求 KV 在本地、其余在远端"的场景。`local_ratio` 控制的是**请求级别**的本地命中率——同一请求的全部 KV 要么全在本地，要么全在远端。
 
-**传输模式**仿照 SGLang 主线 Mooncake PD disaggregation 的做法：KV cache 的 host pool 存储格式（layer-first token-slot pool）保持不变，**传输前先将离散 slot 的 KV gather 到一块连续的 staging buffer，经 NIC loopback 做一次 bulk RDMA 传输，到达后再 scatter 回 host pool 的原始 slot 位置**。这确保 RDMA 链路上看到的是大块连续 I/O，真实反映生产环境中 RDMA 全量预取的性能特征。
+#### 远端与本地的存储布局差异
+
+真实分布式 KV 内存池（如 Mooncake、NIXL）中，KV 数据在远端通常以 **page-first（token-major）** 方式组织——同一个 token 的所有层 KV 紧邻存放，便于按 page 粒度做连续大块传输。而 HiSparse 本地 host pool 使用 **layer-first（layer-major）** 布局——同一层的所有 token slot 连续存放，便于 swap-in kernel 按层做 DMA。
+
+因此方案 B 在模拟中显式区分这两种布局：
+
+- **`remote_buffer`（模拟远端）**：**page-first** 布局，形态 `[num_tokens, layer_num, 1, kv_cache_dim]`。同一 token 的全部层 KV 在内存中连续，与真实远端内存池一致。
+- **`kv_buffer`（本地 host pool）**：**layer-first** 布局，形态 `[layer_num, num_tokens, 1, kv_cache_dim]`。HiSparse swap-in / backup 等路径不变。
+
+#### 传输模式：bulk RDMA + 布局转换
+
+传输流程为：**remote_buffer（page-first）整块 bulk RDMA 到 landing staging → landing staging 布局转换写入 kv_buffer（layer-first）**。这比旧方案更贴近生产环境：
+
+1. **RDMA 链路上** 搬的是 **远端原生布局的连续大块**，不需要在远端做任何 gather/repack。
+2. **本地落盘时** 做 page-first → layer-first 的转换（transpose + scatter），这正是真实 decode 节点收到 KV 后需要做的工作——**该开销是真实系统中不可避免的**。
+3. staging buffer 只需 **一块** landing staging（不再需要 gather staging），大小 = 单请求最大 KV 字节数。
 
 ```
 本机 DRAM 布局（方案 B）:
@@ -78,34 +93,39 @@
 ┌─────────────────────────────┐
 │  模型权重 + 其他                │
 ├─────────────────────────────┤
-│  Host Pool (pinned DRAM)     │  ← HiSparse 统一视图，layer-first token-slot pool
+│  Host Pool (pinned DRAM)     │  ← HiSparse 统一视图，layer-first
+│  kv_buffer                   │    形态: [layer_num, num_tokens, 1, kv_cache_dim]
 │  (staging DMA 写入 + decode  │    所有请求的 KV（离散 slot 存储）
-│   swap-in 读取)              │    local 请求直接可用
-│                              │    remote 请求 bulk RDMA 预取后可用
+│   swap-in 读取)              │    local 请求直接可用；remote 请求预取后可用
 ├─────────────────────────────┤
-│  Remote Buffer (RDMA MR)     │  ← 与 host pool 等大，同样 layer-first slot 布局
-│  (ibv_reg_mr, 模拟远端节点)    │    remote 请求的 KV 副本存放于此
+│  Remote Buffer (RDMA MR)     │  ← page-first 布局（模拟远端节点存储）
+│  remote_buffer               │    形态: [num_tokens, layer_num, 1, kv_cache_dim]
+│  (ibv_reg_mr, 模拟远端节点)    │    同一 token 的全部层 KV 连续存放
 ├─────────────────────────────┤
-│  Gather Staging (pinned)     │  ← 小型连续缓冲区（按需分配，非等大于 host pool）
-│  (gather 后作为 RDMA READ src │    用于将离散 slot KV gather 成连续块
-│   或 RDMA READ 落点)          │    大小 = 单请求最大 KV 字节数
-├─────────────────────────────┤
-│  Landing Staging (pinned)    │  ← 与 Gather Staging 等大
-│  (RDMA READ 目标)             │    bulk READ 落地后 scatter 回 host pool
+│  Landing Staging (pinned)    │  ← 小型连续缓冲区，page-first 布局
+│  landing_staging             │    bulk RDMA READ 的落点
+│  (RDMA READ 目标)             │    大小 = max_seq_len × layer_num × kv_dim × dtype
+│                              │    转换后写入 kv_buffer
 └─────────────────────────────┘
 
 请求进入 Decode 前（按请求粒度）:
   local  请求 → 无操作，KV 已在 host pool
-  remote 请求 → 1. gather: remote_buffer 离散 slots → gather_staging（连续）
-                2. RDMA READ: gather_staging → NIC loopback → landing_staging
-                3. scatter: landing_staging（连续）→ host_pool 离散 slots
+  remote 请求 → 1. bulk RDMA READ: remote_buffer[token_slots]（page-first, 连续）
+                   → NIC loopback → landing_staging
+                2. transpose + scatter: landing_staging（page-first）
+                   → kv_buffer（layer-first）对应 slot 位置
                 （一次性，之后与 local 请求行为一致）
 
 Decode 每步（local/remote 一致）:
   HiSparse swap-in: host pool → GPU (仅 top-k miss)
 ```
 
-**与旧方案的关键区别**：旧方案 `remote_buffer` 和 `staging_buffer` 都与 host pool 等大（每个都是完整的 layer-first token-slot pool 副本），RDMA 在离散地址间逐 token 发 WR。新方案改为：(1) `remote_buffer` 仍等大于 host pool（存放远端 KV 的 slot 镜像），(2) staging 改为**两块小型连续缓冲区**（gather staging + landing staging），大小仅需容纳单请求的最大 KV 数据量，(3) RDMA 链路传输的是**gather 后的连续数据块**，传输效率大幅提升。
+#### 为什么 page-first 远端 + layer-first 本地是合理的模拟
+
+1. **RDMA 传输效率**：远端 page-first 布局意味着同一请求的所有 token 可以按地址连续（或大块连续）做 bulk RDMA READ，NIC 看到少量大 WR，充分利用带宽。不需要在远端做 gather——远端数据本身就是连续的。
+2. **本地转换开销真实**：收到 page-first 数据后转成 layer-first 写入 host pool，这个 transpose/scatter 是真实系统中不可避免的代价。旧方案远端也用 layer-first + gather/scatter 两遍，反而**多做了一遍 CPU 拷贝**（先从 layer-first remote 逐层 gather 到 staging），不如 page-first 直传更贴近现实。
+3. **GPU swap-in 不受影响**：host pool 始终是 layer-first，HiSparse 按层 swap-in 的 kernel 和索引逻辑完全不变。
+4. **staging 减半**：不再需要 gather staging（远端已是连续的），只需 landing staging 一块。
 
 ---
 
@@ -474,33 +494,69 @@ Radix cache eviction（`RadixCache.evict()`）只释放 GPU 侧资源：调用 `
 
 **新文件**：`python/sglang/srt/mem_cache/rdma_memory_pool.py`
 
-方案 B 的核心：继承 `MLATokenToKVPoolHost`，在 **KV 存储布局不变**（layer-first token-slot pool）的前提下，用本机 **NIC loopback + MR** 模拟「部分请求 KV 在远端」。远端请求在进入 decode 前 **只做一次** 全量预取；之后与本地请求一样，HiSparse 只从统一的 `kv_buffer` 做 swap-in。
+方案 B 的核心：继承 `MLATokenToKVPoolHost`，用本机 **NIC loopback + MR** 模拟「部分请求 KV 在远端」。**远端使用 page-first 布局，本地 host pool 保持 layer-first 布局**，RDMA 传输后做布局转换写入 host pool。远端请求在进入 decode 前 **只做一次** 全量预取；之后与本地请求一样，HiSparse 只从统一的 `kv_buffer`（layer-first）做 swap-in。
 
-**数据路径**（对齐 Mooncake 类 PD 流程：离散 slot → 连续 staging → bulk 传输 → 写回 slot）：
+**数据路径**分为两种场景：**Cold（首次 prefill，无 prefix cache）** 和 **Warm（prefix cache 命中）**。
 
-1. Prefill / staging 阶段照常把 KV 写入 `kv_buffer`；对被判为 remote 的请求，再把有效 token 对应的 slot **镜像**到与 host pool 同布局的 `remote_buffer`（注册为 MR），表示「远端已持有该请求的 KV」。
-2. Staging 结束、即将进入 decode 时：**gather**（`remote_buffer` 离散 slot → `gather_staging` 连续区）→ **bulk RDMA READ**（`gather_staging` → loopback → `landing_staging`）→ **scatter**（`landing_staging` → `kv_buffer` 对应 slot）。NIC 上只见连续大块 READ，而非按 token 逐条离散 WR。
-3. `gather_staging` / `landing_staging` 只需覆盖 **单请求最大 KV 字节数**（由 `max_seq_len` 等上界约束），不必与 host pool 等大。
+#### Cold 路径（Round 1 / 无 prefix cache）
+
+1. Prefill / staging 阶段照常把 KV 写入 `kv_buffer`（layer-first）。
+2. Staging 完成后，对被判为 remote 的请求，调用 **`simulate_remote_write`**：把 `kv_buffer` 中有效 token 的 KV **转换为 page-first 布局后写入 `remote_buffer`**（注册为 MR），模拟「远端 prefill 节点产生了 KV 并存入分布式内存池」。
+3. 进入 decode 时调用 **`prefetch_for_decode`**：**bulk RDMA READ**（`remote_buffer` 连续 page-first → loopback → `landing_staging`）→ **transpose + scatter**（page-first → `kv_buffer` layer-first slot）。
+4. 此后 decode 全部从本地 `kv_buffer` 读取。
+
+#### Warm 路径（Round 2 / prefix cache 命中）
+
+prefix cache 命中时，**prefix 部分的 KV 在 `remote_buffer` 中已经存在**（Round 1 的 `simulate_remote_write` 写入的），**不需要再次 `simulate_remote_write`**。这更贴近真实分布式场景：decode 节点发现本地 radix cache 命中了某个 prefix，但 KV 不在本地 DRAM，需要从远端内存池拉取。
+
+1. Coordinator 检测 prefix cache hit → prefix 部分的 host indices 来自 `prefix_host_cache` entry。
+2. **跳过** prefix 部分的 `simulate_remote_write`（远端已有）。
+3. 对 prefix 部分直接调用 **`prefetch_for_decode`**：从 `remote_buffer`（Round 1 已写入）做 **bulk RDMA READ → transpose + scatter** 到 `kv_buffer`。
+4. 对 extend 部分（新 token）走正常 staging DMA 路径。
+5. 此后 decode 全部从本地 `kv_buffer` 读取。
+
+```
+Round 1 (Cold, remote 请求):
+  GPU prefill → kv_buffer (layer-first)
+             → simulate_remote_write → remote_buffer (page-first)  ✓ 写入远端
+             → prefetch_for_decode → RDMA → kv_buffer              ✓ 拉回本地
+             → decode...
+
+Round 2 (Warm, prefix cache hit, remote 请求):
+  Radix cache hit → prefix KV 已在 remote_buffer (Round 1 写入)
+                  → 【跳过 simulate_remote_write】                    ✗ 不再重复写
+                  → prefetch_for_decode → RDMA → kv_buffer           ✓ 直接从远端拉
+                  → extend 部分正常 staging
+                  → decode...
+```
 
 **与 SGLang / HiSparse 的接口契约**（对上层透明，仅 pool + coordinator 约定）：
 
 | 入口 | 调用时机 | 作用 |
 | --- | --- | --- |
-| `init_kv_buffer()` | Model runner 建 pool | 分配 `kv_buffer`（返回值）、`remote_buffer`、staging，并完成 RDMA 资源与 MR 注册 |
-| `mark_request_locality(req_pool_idx)` | 某请求 staging 完成、即将标为 decode-ready | 按 `local_ratio` **请求级** 决定 local / remote（同一请求全本地或全远端） |
-| `simulate_remote_write(req_pool_idx, host_indices)` | 紧接上一行之后 | 对 remote 请求把 `kv_buffer` 中该请求有效 slot 拷到 `remote_buffer` |
-| `prefetch_for_decode(req_pool_idx, host_indices)` | `simulate_remote_write` 之后、`alloc_device_buffer` 之前 | 对 remote 请求执行一次 gather → bulk read → scatter；local 请求 no-op，可记录 RDMA 耗时供日志 |
+| `init_kv_buffer()` | Model runner 建 pool | 分配 `kv_buffer`（layer-first，返回值）、`remote_buffer`（page-first）、`landing_staging`，并完成 RDMA MR 注册 |
+| `mark_request_locality(req_pool_idx)` | 某请求 staging 完成、即将标为 decode-ready | 按 `local_ratio` **请求级** 决定 local / remote |
+| `simulate_remote_write(req_pool_idx, host_indices)` | Cold 路径：staging 完成后 | 仅在 **首次 prefill（无 prefix cache hit）** 时调用；将 `kv_buffer`（layer-first）中有效 slot 的 KV **转换为 page-first** 写入 `remote_buffer` |
+| `prefetch_for_decode(req_pool_idx, host_indices)` | Cold 和 Warm 路径均调用 | bulk RDMA READ（`remote_buffer` → `landing_staging`）+ transpose + scatter → `kv_buffer`；local 请求 no-op |
 
-实现上可复用 `test/cxl_utils/sparse_kv_bench.py` 侧的 libibverbs/pybind 封装，C 侧以 **`rdma_bulk_read(total_bytes)`** 对连续缓冲区做 READ（见 §6）。
+**设计要点**：
+- **远端 page-first / 本地 layer-first**：`remote_buffer` 形态 `[num_tokens, layer_num, 1, kv_dim]`，`kv_buffer` 形态 `[layer_num, num_tokens, 1, kv_dim]`。
+- **Cold 写一次、Warm 直接拉**：`simulate_remote_write` 仅在 Cold 路径调用一次，将 KV 写入远端。Warm 路径（prefix cache hit）时，prefix KV 已在 `remote_buffer` 中（Round 1 写入的 host indices 保留在 `prefix_host_cache` 中），`prefetch_for_decode` 用同一组 host indices 直接从 `remote_buffer` RDMA 拉取，**不重复 simulate_remote_write**。
+- **RDMA 传输无需 gather**：远端同一请求的 token 在 `remote_buffer` 中按连续地址排列（page-first），NIC 直接做大块连续 READ。
+- **布局转换是真实开销**：page-first → layer-first 的 transpose/scatter 反映了真实 decode 节点接收到 KV 后重组的代价。
+- 请求级 `local_ratio`；HiSparse decode 路径不区分 local/remote；staging 大小由 `max_seq_len` 等配置封顶；`local_ratio=1.0` 时行为等同纯 DRAM 方案 A。
 
-**设计要点**：请求级 `local_ratio`；HiSparse decode 路径不区分 local/remote；staging 大小由 `max_seq_len` 等配置封顶；`local_ratio=1.0` 时行为等同纯 DRAM 方案 A。
-
-### 5.3 模块 2：Coordinator 适配（~40 行）
+### 5.3 模块 2：Coordinator 适配（~60 行）
 
 **修改文件**：`python/sglang/srt/managers/hisparse_coordinator.py`
 
 - **`__init__`**：`hisparse_config["rdma_pool"]` 存在且启用时构造 `RDMAMLATokenToKVPoolHost`（并传入 `rdma_config`；多网卡时另传 `tp_rank`，见 §9），否则保持现有 DRAM / CXL 分支。
-- **`collect_ready_reqs`（或等价的「staging 完成 → decode」衔接点）**：对每个新就绪请求，若 `mem_pool_host` 提供上述 RDMA 接口，则按顺序调用 `mark_request_locality` → `simulate_remote_write` → `prefetch_for_decode`，参数为 **`req_pool_idx`** 与 **`host_indices`（或等价索引张量，覆盖本请求在 host pool 中的 token slot）**，再进入原有的 `alloc_device_buffer` 等逻辑。Decode 循环内不再触发 RDMA。
+
+- **`admit_request_into_staging`（Cold 路径）**：在 staging DMA 完成后、请求加入 `ack_staging_queue` 之前，若请求被判为 remote 且 **不是** prefix cache hit（即走的是 Cold-start 分支），调用 `simulate_remote_write` 将 KV 写入 `remote_buffer`。**Prefix-hit 路径不调用 `simulate_remote_write`**——prefix 部分的 KV 已在 Round 1 的 cold-start 时写入了 `remote_buffer`。
+
+- **`collect_ready_reqs`（Cold 和 Warm 路径均适用）**：对每个新就绪请求，若该请求是 remote，调用 `prefetch_for_decode`（bulk RDMA READ → transpose + scatter 到 `kv_buffer`）。无论是 Cold 还是 Warm 请求，**进入 decode 前都通过 RDMA 从 `remote_buffer` 拉取 KV**。Decode 循环内不再触发 RDMA。
+
+- **`request_finished` / `clear_request_locality`**：请求结束后清理 locality 状态。注意 `remote_buffer` 中该请求写入的 KV **不需要主动清除**——其 slot 由 host pool allocator 管理，后续 alloc 覆写即可；prefix cache 引用计数归零后 slot 自然可复用。
 
 ### 5.4 模块 3：端到端 Benchmark 脚本（~350 行）
 
@@ -595,24 +651,57 @@ done
 
 ### 6.1 基础设施与 bulk 路径
 
-复用 `test/cxl_utils/sparse_kv_bench.py` 中的 loopback 与 pybind 封装；C 侧在 `rdma_scatter_read.c` 中提供 **`rdma_bulk_read(rctx, total_bytes)`**：将 `total_bytes` 按固定上限（如 1MB）拆成若干 **RDMA READ** WR，`local`/`remote` MR 分别对应 **landing / gather** staging 的注册地址，完成后 poll CQ 并返回耗时（微秒）。旧版按 token 离散地址调用的 `rdma_scatter_read` 不再作为方案 B 的主路径；bulk 路径下 WR 数量随 **总字节数 / chunk**，而非 token 数。
+复用 `test/cxl_utils/sparse_kv_bench.py` 中的 loopback 与 pybind 封装；C 侧在 `rdma_scatter_read.c` 中提供 **`rdma_bulk_read(rctx, total_bytes)`**：将 `total_bytes` 按固定上限（如 1MB）拆成若干 **RDMA READ** WR，完成后 poll CQ 并返回耗时（微秒）。WR 数量随 **总字节数 / chunk**，而非 token 数。
 
-### 6.2 数据流（与 §5.2 一致）
-
-仅第二步走 NIC；布局约定：staging 内按 **layer  major**，层内 token 顺序与 **`host_indices`** 一致。
+### 6.2 数据流（page-first 远端 → bulk RDMA → layer-first 本地）
 
 ```
-remote_buffer (离散 slot)  --gather-->  gather_staging
-       |                                      |
-       |         bulk RDMA READ (loopback)     |
-       v                                      v
-kv_buffer (离散 slot)  <--scatter--  landing_staging
+remote_buffer (page-first, 连续)  ---bulk RDMA READ (loopback)--->  landing_staging (page-first)
+                                                                          |
+                                                                   transpose + scatter
+                                                                          |
+                                                                          v
+                                                                   kv_buffer (layer-first, 离散 slot)
 ```
 
-### 6.3 `local_ratio` 与触发时机
+**Step 1 — `simulate_remote_write`**（prefill 完成后、进入 decode 前）：
+- 从 `kv_buffer`（layer-first）中读取该请求有效 token 的 KV
+- 转换为 **page-first** 布局后连续写入 `remote_buffer` 中该请求对应的 token 区域
+- 模拟「远端节点以 page-first 存储 KV」
+
+**Step 2 — `prefetch_for_decode`**（一次性 RDMA 预取）：
+- **bulk RDMA READ**：从 `remote_buffer` 该请求的连续 page-first 区域经 NIC loopback 读到 `landing_staging`
+- **transpose + scatter**：将 `landing_staging` 中 page-first 数据（`[num_tokens, layer_num, 1, kv_dim]`）转换为 layer-first 后写回 `kv_buffer`（`[layer_num, token_slots, 1, kv_dim]`）
+
+**关键区别**：不需要 gather staging。远端 page-first 布局意味着同一请求的 KV 本身已连续，NIC 直接做大块 READ。
+
+### 6.3 布局转换的实现
+
+`simulate_remote_write` 中 layer-first → page-first 转换：
+- 遍历有效 token，对每个 token 把所有层的 KV 拼成连续块写入 `remote_buffer[token_idx]`
+- 等价于 `remote_buffer[token_idx, :, :, :] = kv_buffer[:, slot_idx, :, :]`（维度 transpose）
+
+`prefetch_for_decode` 中 page-first → layer-first 转换：
+- 从 `landing_staging` 按 token 遍历，将每个 token 的各层 KV 分别写回 `kv_buffer[layer, slot]`
+- 等价于 `kv_buffer[:, slot_idx, :, :] = landing_staging[token_idx, :, :, :]`（反向 transpose）
+
+这两个转换都是 **CPU 内存操作**（pinned DRAM 间拷贝），延迟主要由 **总字节数 / DRAM 带宽** 决定。对于 32K tokens × 61 layers × 656B ≈ 1.2 GB 数据量，预期耗时约 **几毫秒到十几毫秒**，通常小于 RDMA 传输本身。
+
+### 6.4 `local_ratio` 与触发时机
 
 - **请求级** `local_ratio`：见 §5.2；典型实验点：0.0 / 0.3 / 1.0（等同 DRAM 上界）。
-- **`prefetch_for_decode`**：仅在 **staging 完成 → 进入 decode** 时调用 **一次**；后续 decode 步仅访问 `kv_buffer`，无 RDMA。代价集中在 **请求级首段**（gather + NIC + scatter），用于解释 Round 2 中相对 CXL 的 TTFT / 首步 decode 差异。
+- **`prefetch_for_decode`**：仅在 **staging 完成 → 进入 decode** 时调用 **一次**；后续 decode 步仅访问 `kv_buffer`，无 RDMA。代价集中在 **请求级首段**（NIC 传输 + 布局转换），用于解释 Round 2 中相对 CXL 的 TTFT / 首步 decode 差异。
+
+### 6.5 相比旧方案（双向 gather/scatter + layer-first 远端）的改进
+
+| 维度 | 旧方案 | 新方案（page-first 远端） |
+| --- | --- | --- |
+| 远端存储布局 | layer-first（与本地相同） | **page-first**（同一 token 全层连续） |
+| RDMA 前 CPU 工作 | **gather**: 逐层从 remote 离散 slot → gather_staging | **无**：远端本身连续 |
+| RDMA 传输 | gather_staging → landing_staging | remote_buffer → landing_staging |
+| RDMA 后 CPU 工作 | **scatter**: landing_staging → kv_buffer 逐层离散 slot | **transpose + scatter**: page→layer 写回 |
+| staging 数量 | 2 块（gather + landing） | **1 块**（仅 landing） |
+| 真实性 | 远端与本地同布局，需额外 gather/scatter | **远端 page-first 更贴近生产分布式池** |
 
 ---
 
