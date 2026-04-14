@@ -926,8 +926,8 @@ class HiSparseCoordinator:
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
 
-            # RDMA prefetch: if the host pool is RDMA-backed, simulate
-            # remote KV and one-time prefetch before decode starts.
+            # RDMA prefetch: if the host pool is RDMA-backed, decide
+            # local/remote and fetch KV from remote_buffer via RDMA.
             if hasattr(self.mem_pool_host, "mark_request_locality"):
                 seq_len = len(req.fill_ids)
                 host_indices = self.req_to_host_pool[
@@ -937,15 +937,26 @@ class HiSparseCoordinator:
                     req.req_pool_idx
                 )
                 if is_remote:
-                    self.mem_pool_host.simulate_remote_write(
-                        req.req_pool_idx, host_indices
+                    # Cold path: KV was just prefilled locally; transpose
+                    # kv_buffer (layer-first) → remote_buffer (page-first)
+                    # to simulate "remote node stored this KV".
+                    # Warm path (prefix-hit): prefix KV already in
+                    # remote_buffer from a previous cold-start round;
+                    # skip simulate_remote_write.
+                    is_prefix_hit = (
+                        req.req_pool_idx in self.req_prefix_info
+                        and self.req_prefix_info[req.req_pool_idx].prefix_len > 0
                     )
+                    if not is_prefix_hit:
+                        self.mem_pool_host.simulate_remote_write(
+                            req.req_pool_idx, host_indices
+                        )
                     rdma_us = self.mem_pool_host.prefetch_for_decode(
                         req.req_pool_idx, host_indices
                     )
                     logger.debug(
-                        "RDMA prefetch for req %s: %.1f us",
-                        req.rid, rdma_us,
+                        "RDMA prefetch for req %s: %.1f us (prefix_hit=%s)",
+                        req.rid, rdma_us, is_prefix_hit,
                     )
 
             # prepare device buffer and update req

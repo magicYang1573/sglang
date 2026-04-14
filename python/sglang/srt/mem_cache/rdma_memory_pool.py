@@ -4,23 +4,34 @@ Simulates a distributed KV Cache pool where only a fraction of requests
 have their KV data cached locally in DRAM.  The rest reside on a "remote"
 node and must be fetched via RDMA before decode can start.
 
-Transfer model — gather → bulk RDMA READ → scatter:
+Layout model — page-first remote, layer-first local:
 
-  KV cache storage format (layer-first token-slot pool) is unchanged.
-  Before RDMA transfer, scattered KV slots are gathered into a small
-  contiguous staging buffer, transferred as a single bulk RDMA READ
-  (1 MB chunks), then scattered back to the host pool's original slot
-  positions.  This matches how production systems (e.g. Mooncake PD
-  disaggregation) handle RDMA KV cache transfer.
+  The remote buffer (``remote_buffer``) uses **page-first** layout:
+    shape = [num_tokens, layer_num, 1, kv_cache_dim]
+  so that all layers of one token are contiguous in memory, matching how
+  real distributed KV pools (Mooncake, NIXL) organise data for bulk
+  transfer.
 
-  The gather/landing staging buffers are sized to hold ONE request's
-  maximum KV data (max_seq_len × layer_num × kv_cache_dim × dtype_size),
-  NOT a full copy of the host pool.
+  The local host pool (``kv_buffer``) keeps the standard **layer-first**
+  layout:
+    shape = [layer_num, num_tokens, 1, kv_cache_dim]
+  used by HiSparse swap-in kernels.
+
+Transfer model — bulk RDMA READ + transpose:
+
+  Cold path (Round 1):
+    ``simulate_remote_write`` transposes kv_buffer (layer-first) into
+    remote_buffer (page-first) once after the first prefill.
+
+  Warm path (Round 2, prefix cache hit):
+    Prefix KV already exists in remote_buffer from Round 1.
+    ``prefetch_for_decode`` does a bulk RDMA READ from remote_buffer
+    into landing_staging, then transposes page-first → layer-first
+    back into kv_buffer.  No simulate_remote_write needed.
 
 Uses real RDMA NIC loopback — the "remote" data is stored in a local
 DRAM region registered as an RDMA MR, and fetched through the NIC
-hardware (ibv_post_send RDMA READ → ibv_poll_cq).  This produces real
-hardware latency, which is a lower bound of cross-machine RDMA latency.
+hardware (ibv_post_send RDMA READ → ibv_poll_cq).
 
 Multi-NIC interleave: when ``ib_devs`` is provided in rdma_config, each
 TP rank is assigned a NIC via ``tp_rank % len(ib_devs)``.
@@ -113,17 +124,16 @@ def _resolve_ib_dev(rdma_config: dict, tp_rank: int) -> str:
 class RDMALoopbackContext:
     """Manages RDMA resources for loopback bulk-read simulation.
 
-    Registers gather_staging as the RDMA remote MR (READ source, simulates
-    the remote-side contiguous buffer) and landing_staging as the RDMA
-    local MR (READ destination).  ``bulk_read(total_bytes)`` issues a
-    single contiguous RDMA READ from gather → landing.
+    Registers remote_buffer region as the RDMA remote MR (READ source)
+    and landing_staging as the RDMA local MR (READ destination).
+    ``bulk_read(total_bytes)`` issues a contiguous RDMA READ.
     """
 
     def __init__(
         self,
         ib_dev: str,
-        gather_buf_ptr: int,
-        gather_buf_size: int,
+        remote_buf_ptr: int,
+        remote_buf_size: int,
         landing_buf_ptr: int,
         landing_buf_size: int,
         max_wr: int = 4096,
@@ -141,10 +151,10 @@ class RDMALoopbackContext:
             self._handle = self.rdma_ext.RDMAContext()
             self._handle.init(
                 ib_dev,
-                landing_buf_ptr,    # local MR  = landing staging (READ dst)
+                landing_buf_ptr,     # local MR  = landing staging (READ dst)
                 landing_buf_size,
-                gather_buf_ptr,     # remote MR = gather staging  (READ src)
-                gather_buf_size,
+                remote_buf_ptr,      # remote MR = remote_buffer   (READ src)
+                remote_buf_size,
                 max_wr,
             )
             self._use_handle = True
@@ -153,8 +163,8 @@ class RDMALoopbackContext:
                 ib_dev,
                 landing_buf_ptr,
                 landing_buf_size,
-                gather_buf_ptr,
-                gather_buf_size,
+                remote_buf_ptr,
+                remote_buf_size,
                 max_wr,
             )
             self._handle = None
@@ -162,10 +172,10 @@ class RDMALoopbackContext:
 
         self._initialized = True
         logger.info(
-            "RDMA loopback initialized: ib_dev=%s, gather=%.2f GB, "
+            "RDMA loopback initialized: ib_dev=%s, remote=%.2f GB, "
             "landing=%.2f GB, multi_instance=%s",
             ib_dev,
-            gather_buf_size / 1e9,
+            remote_buf_size / 1e9,
             landing_buf_size / 1e9,
             self._use_handle,
         )
@@ -173,7 +183,7 @@ class RDMALoopbackContext:
     def bulk_read(self, total_bytes: int) -> float:
         """Execute a contiguous bulk RDMA READ of total_bytes.
 
-        Reads from gather_staging (remote MR) → landing_staging (local MR).
+        Reads from remote_buffer (remote MR) → landing_staging (local MR).
         Returns elapsed time in microseconds.
         """
         if not self._initialized:
@@ -198,18 +208,19 @@ class RDMALoopbackContext:
 class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
     """MLA KV Cache host pool with RDMA distributed pool simulation.
 
-    KV data is split into two categories at the request level:
-      - local requests: X% of requests, KV in pinned DRAM, directly accessible
-      - remote requests: (1-X)% of requests, KV must be fetched via RDMA
+    remote_buffer: page-first [num_tokens, layer_num, 1, kv_cache_dim]
+    kv_buffer:     layer-first [layer_num, num_tokens, 1, kv_cache_dim]
 
-    Transfer uses gather → bulk RDMA → scatter pipeline:
-      1. Prefill/staging: KV written to host pool (pinned DRAM) as normal.
-         If remote, KV is also copied to remote_buffer (RDMA MR).
-      2. Staging→Decode transition: ``prefetch_for_decode()`` called ONCE:
-         a. gather: remote_buffer scattered slots → gather_staging (contiguous)
-         b. bulk RDMA READ: gather_staging → NIC loopback → landing_staging
-         c. scatter: landing_staging (contiguous) → kv_buffer scattered slots
-      3. All decode steps: HiSparse reads from unified kv_buffer view.
+    Cold path (Round 1):
+      1. Prefill writes KV into kv_buffer (layer-first) as normal.
+      2. simulate_remote_write: transpose kv_buffer → remote_buffer (page-first).
+      3. prefetch_for_decode: bulk RDMA READ remote_buffer → landing_staging,
+         then transpose+scatter page-first → layer-first back to kv_buffer.
+
+    Warm path (Round 2, prefix cache hit):
+      1. Prefix KV already in remote_buffer (from Round 1).
+      2. Skip simulate_remote_write.
+      3. prefetch_for_decode: same RDMA + transpose as cold path.
     """
 
     def __init__(
@@ -231,8 +242,7 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         self._remote_reqs: Set[int] = set()
         self._rdma_stats: Dict[str, float] = {
             "total_prefetch_us": 0.0,
-            "total_gather_us": 0.0,
-            "total_scatter_us": 0.0,
+            "total_transpose_us": 0.0,
             "prefetch_count": 0,
         }
 
@@ -249,35 +259,39 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
 
     def init_kv_buffer(self):
-        """Allocate host pool + remote buffer + gather/landing staging."""
+        """Allocate host pool (layer-first) + remote buffer (page-first) + landing staging."""
         buffer = super().init_kv_buffer()
+        # buffer (kv_buffer) shape: [layer_num, num_tokens, 1, kv_cache_dim]
 
-        # remote_buffer: same shape as kv_buffer, stores "remote node" KV
-        self.remote_buffer = torch.empty_like(buffer, pin_memory=True)
+        # remote_buffer: page-first layout [num_tokens, layer_num, 1, kv_cache_dim]
+        self.remote_buffer = torch.empty(
+            (self.size, self.layer_num, 1, self.kv_cache_dim),
+            dtype=self.dtype,
+            pin_memory=True,
+        )
 
-        # Staging buffers: small contiguous, sized for one request's max KV
-        # Layout in staging: [layer_0_all_tokens, layer_1_all_tokens, ...]
-        bytes_per_token_per_layer = self.kv_cache_dim * self.dtype.itemsize
-        staging_bytes = (
-            self.max_seq_len * self.layer_num * bytes_per_token_per_layer
-        )
-        self.gather_staging = torch.empty(
-            staging_bytes, dtype=torch.uint8, pin_memory=True
-        )
+        # landing_staging: page-first, sized for one request's max KV
+        # shape: [max_seq_len, layer_num, 1, kv_cache_dim]
+        bytes_per_token = self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+        staging_bytes = self.max_seq_len * bytes_per_token
         self.landing_staging = torch.empty(
-            staging_bytes, dtype=torch.uint8, pin_memory=True
+            (self.max_seq_len, self.layer_num, 1, self.kv_cache_dim),
+            dtype=self.dtype,
+            pin_memory=True,
         )
 
-        gather_ptr = self.gather_staging.data_ptr()
+        remote_ptr = self.remote_buffer.data_ptr()
+        remote_size = self.remote_buffer.numel() * self.remote_buffer.element_size()
         landing_ptr = self.landing_staging.data_ptr()
+        landing_size = self.landing_staging.numel() * self.landing_staging.element_size()
 
         try:
             self._rdma_ctx = RDMALoopbackContext(
                 ib_dev=self.ib_dev,
-                gather_buf_ptr=gather_ptr,
-                gather_buf_size=staging_bytes,
+                remote_buf_ptr=remote_ptr,
+                remote_buf_size=remote_size,
                 landing_buf_ptr=landing_ptr,
-                landing_buf_size=staging_bytes,
+                landing_buf_size=landing_size,
             )
         except RuntimeError as e:
             logger.warning(
@@ -287,14 +301,14 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             self._rdma_ctx = None
 
         logger.info(
-            "RDMA host pool (bulk mode): tp_rank=%d, ib_dev=%s, "
-            "local_ratio=%.2f, remote_buffer=%.2f GB, "
-            "staging=%.2f GB each, rdma_available=%s",
+            "RDMA host pool (page-first remote): tp_rank=%d, ib_dev=%s, "
+            "local_ratio=%.2f, remote_buffer=%.2f GB (page-first), "
+            "landing_staging=%.2f GB, rdma_available=%s",
             self.tp_rank,
             self.ib_dev,
             self.local_ratio,
-            self.remote_buffer.numel() * self.remote_buffer.element_size() / 1e9,
-            staging_bytes / 1e9,
+            remote_size / 1e9,
+            landing_size / 1e9,
             self._rdma_ctx is not None,
         )
         return buffer
@@ -302,7 +316,6 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
     def mark_request_locality(self, req_pool_idx: int) -> bool:
         """Determine if a request is local or remote based on local_ratio.
 
-        Called after staging completes for a request.
         Returns True if the request is remote (needs RDMA prefetch).
         """
         if random.random() < self.local_ratio:
@@ -315,7 +328,12 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
     def simulate_remote_write(
         self, req_pool_idx: int, host_indices: torch.Tensor
     ) -> None:
-        """Copy a remote request's KV from host_pool to remote_buffer."""
+        """Transpose KV from kv_buffer (layer-first) into remote_buffer (page-first).
+
+        Called ONLY on cold-start path (no prefix cache hit).
+        For each valid token slot, copies all layers from kv_buffer[:, slot]
+        into remote_buffer[slot, :] — a dimension transpose.
+        """
         if req_pool_idx not in self._remote_reqs:
             return
 
@@ -324,62 +342,21 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             return
 
         valid_cpu = valid.cpu()
-        for layer_id in range(self.layer_num):
-            self.remote_buffer[layer_id, valid_cpu] = self.kv_buffer[
-                layer_id, valid_cpu
-            ]
-
-    def _gather_to_staging(self, host_indices: torch.Tensor) -> int:
-        """Gather scattered slots from remote_buffer into contiguous gather_staging.
-
-        Packs data as [layer_0_all_tokens, layer_1_all_tokens, ...] into
-        gather_staging.  Returns total bytes gathered.
-        """
-        valid = host_indices[host_indices >= 0].cpu()
-        num_tokens = valid.numel()
-        if num_tokens == 0:
-            return 0
-
-        bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
-        staging_view = self.gather_staging.view(torch.uint8)
-        offset = 0
-        for layer_id in range(self.layer_num):
-            layer_data = self.remote_buffer[layer_id, valid].contiguous()
-            layer_bytes = num_tokens * bytes_per_token
-            staging_view[offset : offset + layer_bytes].copy_(
-                layer_data.view(torch.uint8).reshape(-1)
-            )
-            offset += layer_bytes
-        return offset
-
-    def _scatter_from_staging(
-        self, host_indices: torch.Tensor, total_bytes: int
-    ) -> None:
-        """Scatter contiguous landing_staging back into kv_buffer's scattered slots."""
-        valid = host_indices[host_indices >= 0].cpu()
-        num_tokens = valid.numel()
-        if num_tokens == 0:
-            return
-
-        bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
-        staging_view = self.landing_staging.view(torch.uint8)
-        offset = 0
-        for layer_id in range(self.layer_num):
-            layer_bytes = num_tokens * bytes_per_token
-            src = (
-                staging_view[offset : offset + layer_bytes]
-                .view(self.dtype)
-                .reshape(num_tokens, 1, self.kv_cache_dim)
-            )
-            self.kv_buffer[layer_id, valid] = src
-            offset += layer_bytes
+        # kv_buffer[layer, slot, 1, dim] → remote_buffer[slot, layer, 1, dim]
+        # This is a transpose: for each slot, gather all layers.
+        # kv_buffer[:, valid_cpu] has shape [layer_num, N, 1, kv_dim]
+        # .permute(1,0,2,3) → [N, layer_num, 1, kv_dim] = page-first
+        src = self.kv_buffer[:, valid_cpu].permute(1, 0, 2, 3).contiguous()
+        self.remote_buffer[valid_cpu] = src
 
     def prefetch_for_decode(
         self, req_pool_idx: int, host_indices: torch.Tensor
     ) -> float:
-        """One-time gather → bulk RDMA READ → scatter for a remote request.
+        """Bulk RDMA READ from remote_buffer (page-first) → transpose+scatter to kv_buffer (layer-first).
 
-        Called ONCE per request when transitioning to decode.
+        Called ONCE per remote request when transitioning to decode.
+        Works for both cold path (after simulate_remote_write) and warm path
+        (prefix KV already in remote_buffer from a previous round).
         Local requests skip entirely.  Returns RDMA transfer time in µs.
         """
         if req_pool_idx not in self._remote_reqs:
@@ -389,45 +366,49 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         if valid.numel() == 0:
             return 0.0
 
-        # Step 1: gather remote_buffer scattered → gather_staging contiguous
-        t_gather_start = time.monotonic()
-        total_bytes = self._gather_to_staging(host_indices)
-        t_gather_end = time.monotonic()
-        gather_us = (t_gather_end - t_gather_start) * 1e6
+        valid_cpu = valid.cpu()
+        num_tokens = valid_cpu.numel()
+        bytes_per_token = self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+        total_bytes = num_tokens * bytes_per_token
 
-        # Step 2: bulk RDMA READ (gather_staging → landing_staging)
+        # Step 1: Copy remote_buffer[valid slots] → landing_staging[:num_tokens]
+        #         (contiguous page-first block ready for RDMA)
+        #         In a real system, this data is already contiguous at the remote
+        #         side; here we just ensure the staging region is packed.
+        self.landing_staging[:num_tokens] = self.remote_buffer[valid_cpu]
+
+        # Step 2: Bulk RDMA READ (landing_staging as both src and dst via loopback,
+        #         simulating the NIC transfer latency for total_bytes)
         if self._rdma_ctx is not None:
             rdma_us = self._rdma_ctx.bulk_read(total_bytes)
         else:
             t0 = time.monotonic()
-            self.landing_staging[:total_bytes].copy_(
-                self.gather_staging[:total_bytes]
-            )
+            # Simulation: data is already in landing_staging, just measure time
+            torch.cuda.synchronize() if torch.cuda.is_available() else None
             rdma_us = (time.monotonic() - t0) * 1e6
 
-        # Step 3: scatter landing_staging contiguous → kv_buffer scattered
-        t_scatter_start = time.monotonic()
-        self._scatter_from_staging(host_indices, total_bytes)
-        t_scatter_end = time.monotonic()
-        scatter_us = (t_scatter_end - t_scatter_start) * 1e6
+        # Step 3: Transpose + scatter: landing_staging (page-first) → kv_buffer (layer-first)
+        # landing_staging[:num_tokens] shape: [num_tokens, layer_num, 1, kv_dim]
+        # → permute to [layer_num, num_tokens, 1, kv_dim] → scatter into kv_buffer slots
+        t_transpose_start = time.monotonic()
+        src = self.landing_staging[:num_tokens].permute(1, 0, 2, 3).contiguous()
+        self.kv_buffer[:, valid_cpu] = src
+        t_transpose_end = time.monotonic()
+        transpose_us = (t_transpose_end - t_transpose_start) * 1e6
 
         self._rdma_stats["total_prefetch_us"] += rdma_us
-        self._rdma_stats["total_gather_us"] += gather_us
-        self._rdma_stats["total_scatter_us"] += scatter_us
+        self._rdma_stats["total_transpose_us"] += transpose_us
         self._rdma_stats["prefetch_count"] += 1
 
-        num_tokens = valid.numel()
         logger.debug(
-            "RDMA prefetch (bulk): req=%d, tokens=%d, ib_dev=%s, "
-            "gather=%.1f us, rdma=%.1f us, scatter=%.1f us, "
-            "total=%.1f us (%.2f MB)",
+            "RDMA prefetch (bulk+transpose): req=%d, tokens=%d, ib_dev=%s, "
+            "rdma=%.1f us, transpose=%.1f us, total=%.1f us (%.2f MB)",
             req_pool_idx,
             num_tokens,
             self.ib_dev,
-            gather_us,
             rdma_us,
-            scatter_us,
-            gather_us + rdma_us + scatter_us,
+            transpose_us,
+            rdma_us + transpose_us,
             total_bytes / 1e6,
         )
         return rdma_us
@@ -443,11 +424,8 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             stats["avg_prefetch_us"] = (
                 stats["total_prefetch_us"] / stats["prefetch_count"]
             )
-            stats["avg_gather_us"] = (
-                stats["total_gather_us"] / stats["prefetch_count"]
-            )
-            stats["avg_scatter_us"] = (
-                stats["total_scatter_us"] / stats["prefetch_count"]
+            stats["avg_transpose_us"] = (
+                stats["total_transpose_us"] / stats["prefetch_count"]
             )
         return stats
 
