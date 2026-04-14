@@ -68,7 +68,9 @@
 
 ### 方案 B 的内存布局详解
 
-方案 B 模拟"分布式内存池中，X% 的请求 KV 在本地、其余在远端"的场景。`local_ratio` 控制的是**请求级别**的本地命中率——同一请求的全部 KV 要么全在本地，要么全在远端：
+方案 B 模拟"分布式内存池中，X% 的请求 KV 在本地、其余在远端"的场景。`local_ratio` 控制的是**请求级别**的本地命中率——同一请求的全部 KV 要么全在本地，要么全在远端。
+
+**传输模式**仿照 SGLang 主线 Mooncake PD disaggregation 的做法：KV cache 的 host pool 存储格式（layer-first token-slot pool）保持不变，**传输前先将离散 slot 的 KV gather 到一块连续的 staging buffer，经 NIC loopback 做一次 bulk RDMA 传输，到达后再 scatter 回 host pool 的原始 slot 位置**。这确保 RDMA 链路上看到的是大块连续 I/O，真实反映生产环境中 RDMA 全量预取的性能特征。
 
 ```
 本机 DRAM 布局（方案 B）:
@@ -76,26 +78,34 @@
 ┌─────────────────────────────┐
 │  模型权重 + 其他                │
 ├─────────────────────────────┤
-│  Host Pool (pinned DRAM)     │  ← HiSparse 统一视图，所有请求的 KV
-│  (staging DMA 写入 + decode  │    local 请求直接可用
-│   swap-in 读取)              │    remote 请求 RDMA 预取后可用
+│  Host Pool (pinned DRAM)     │  ← HiSparse 统一视图，layer-first token-slot pool
+│  (staging DMA 写入 + decode  │    所有请求的 KV（离散 slot 存储）
+│   swap-in 读取)              │    local 请求直接可用
+│                              │    remote 请求 bulk RDMA 预取后可用
 ├─────────────────────────────┤
-│  Remote Buffer (RDMA MR)     │  ← 与 host pool 等大
+│  Remote Buffer (RDMA MR)     │  ← 与 host pool 等大，同样 layer-first slot 布局
 │  (ibv_reg_mr, 模拟远端节点)    │    remote 请求的 KV 副本存放于此
 ├─────────────────────────────┤
-│  Staging Buffer (pinned)     │  ← RDMA READ 目标
-│  (一次性预取写入)              │    与 host pool 等大
+│  Gather Staging (pinned)     │  ← 小型连续缓冲区（按需分配，非等大于 host pool）
+│  (gather 后作为 RDMA READ src │    用于将离散 slot KV gather 成连续块
+│   或 RDMA READ 落点)          │    大小 = 单请求最大 KV 字节数
+├─────────────────────────────┤
+│  Landing Staging (pinned)    │  ← 与 Gather Staging 等大
+│  (RDMA READ 目标)             │    bulk READ 落地后 scatter 回 host pool
 └─────────────────────────────┘
 
 请求进入 Decode 前（按请求粒度）:
   local  请求 → 无操作，KV 已在 host pool
-  remote 请求 → RDMA READ: remote MR → NIC loopback → staging
-                staging → 写回 host pool
+  remote 请求 → 1. gather: remote_buffer 离散 slots → gather_staging（连续）
+                2. RDMA READ: gather_staging → NIC loopback → landing_staging
+                3. scatter: landing_staging（连续）→ host_pool 离散 slots
                 （一次性，之后与 local 请求行为一致）
 
 Decode 每步（local/remote 一致）:
   HiSparse swap-in: host pool → GPU (仅 top-k miss)
 ```
+
+**与旧方案的关键区别**：旧方案 `remote_buffer` 和 `staging_buffer` 都与 host pool 等大（每个都是完整的 layer-first token-slot pool 副本），RDMA 在离散地址间逐 token 发 WR。新方案改为：(1) `remote_buffer` 仍等大于 host pool（存放远端 KV 的 slot 镜像），(2) staging 改为**两块小型连续缓冲区**（gather staging + landing staging），大小仅需容纳单请求的最大 KV 数据量，(3) RDMA 链路传输的是**gather 后的连续数据块**，传输效率大幅提升。
 
 ---
 
@@ -120,8 +130,8 @@ Phase 2: CXL 后端集成                                       ← Week 2 前�
   └─ 验证 CXL host pool + prefix cache 端到端正确性
      ↓
 Phase 3: RDMA 后端 + Benchmark 脚本                         ← Week 2-3
-  ├─ rdma_memory_pool.py（新增）
-  ├─ rdma_scatter_read.c bulk read 扩展
+  ├─ rdma_memory_pool.py（新增，gather→bulk RDMA→scatter 模式）
+  ├─ rdma_scatter_read.c/.h/_py.cpp bulk read + 多实例扩展
   ├─ coordinator 后端选择逻辑
   └─ e2e_bench.py 两轮实验自动化
      ↓
@@ -165,14 +175,14 @@ CXL host pool（`cxl_memory_pool.py`）已实现且与 HiSparse 集成完毕。P
 
 | 文件                              | 改动量        | 说明                                       |
 | ------------------------------- | ---------- | ---------------------------------------- |
-| `rdma_memory_pool.py`（新增）       | ~260 行     | RDMA loopback host pool（local/remote/staging 分层） |
+| `rdma_memory_pool.py`（新增）       | ~300 行     | RDMA host pool（gather→bulk RDMA→scatter + local/remote 分层） |
 | `hisparse_coordinator.py`       | ~40 行      | 后端选择 + decode prefetch + cleanup           |
 | `factory.py` + `SparseConfig`   | ~15 行      | rdma_pool JSON 解析 + 互斥校验                   |
 | `model_runner.py`               | ~2 行       | 传递 rdma_config                            |
-| `rdma_scatter_read.c/.h/_py.cpp` | ~60 行      | bulk read 扩展                               |
+| `rdma_scatter_read.c/.h/_py.cpp` | ~60 行      | bulk read + 多实例 RDMAContext 扩展              |
 | `e2e_bench.py`（新增）              | ~350 行     | 两轮实验自动化，ShareGPT 多样化请求，TTFT/TBT/TPOT      |
 | `run_all_experiments.sh`（新增）    | ~150 行     | 四方案 × 多 prefix 实验矩阵自动化                    |
-| **Phase 3 合计**                  | **~880 行** |                                          |
+| **Phase 3 合计**                  | **~920 行** |                                          |
 
 
 ### 3.5 代码总量
@@ -182,8 +192,8 @@ CXL host pool（`cxl_memory_pool.py`）已实现且与 HiSparse 集成完毕。P
 | ----------- | ---------- | ------- | ----------------------------------------------- |
 | **Phase 1** | **~150 行** | ~150 行  | HiSparse + radix cache 兼容，prefix-hit 跳过 prefill |
 | Phase 2     | ~0 行       | ~150 行  | CXL 端到端验证                                       |
-| Phase 3     | ~880 行     | ~1030 行 | RDMA 后端 + 多样化 e2e benchmark + 实验自动化              |
-| Phase 4     | ~0 行       | ~1030 行 | 完整实验数据                                          |
+| Phase 3     | ~920 行     | ~1070 行 | RDMA 后端（gather→bulk→scatter）+ 多样化 e2e benchmark + 实验自动化 |
+| Phase 4     | ~0 行       | ~1070 行 | 完整实验数据                                          |
 
 
 ---
@@ -450,198 +460,47 @@ Radix cache eviction（`RadixCache.evict()`）只释放 GPU 侧资源：调用 `
 
 | 模块                 | 新代码量       | 修改/新增                           | 说明                                       |
 | ------------------ | ---------- | ------------------------------- | ---------------------------------------- |
-| **RDMA Host Pool** | ~260 行     | 新增 `rdma_memory_pool.py`        | 方案 B 的核心：RDMA loopback + 本地缓存分层          |
+| **RDMA Host Pool** | ~300 行     | 新增 `rdma_memory_pool.py`        | 方案 B 核心：gather→bulk RDMA→scatter + 本地缓存分层 |
 | **Coordinator 适配** | ~40 行      | 修改 `hisparse_coordinator.py`    | 根据配置选择 A/B/C 后端 + decode prefetch + cleanup |
 | **Config 扩展**      | ~15 行      | 修改 `factory.py` + `SparseConfig` | rdma_pool JSON 解析 + 互斥校验                   |
 | **ModelRunner**     | ~2 行       | 修改 `model_runner.py`           | 传递 rdma_config                            |
-| **RDMA C 扩展**      | ~60 行      | 修改 `.c` + `.h` + `_py.cpp`     | rdma_bulk_read 接口                         |
+| **RDMA C 扩展**      | ~60 行      | 修改 `.c` + `.h` + `_py.cpp`     | bulk read + 多实例 RDMAContext                |
 | **Benchmark 脚本**   | ~350 行     | 新增 `e2e_bench.py`              | 两轮实验自动化，ShareGPT 多样化请求，TTFT/TBT/TPOT      |
 | **自动化脚本**         | ~150 行     | 新增 `run_all_experiments.sh`     | 四方案 × 多 prefix 完整实验矩阵                    |
-| **合计**             | **~880 行** | 3 新增 + 5 修改                    |                                          |
+| **合计**             | **~920 行** | 3 新增 + 5 修改                    |                                          |
 
 
-### 5.2 模块 1：RDMAMLATokenToKVPoolHost（~200 行）
+### 5.2 模块 1：RDMAMLATokenToKVPoolHost（~300 行）
 
 **新文件**：`python/sglang/srt/mem_cache/rdma_memory_pool.py`
 
-这是方案 B 的核心组件。继承 `MLATokenToKVPoolHost`，将 host pool 分为"本地缓存"+"远端 MR"两部分。在请求进入 decode 阶段之前，**一次性**通过 RDMA loopback 将该请求的远端 KV cache 全量预取到本地 staging buffer。
+方案 B 的核心：继承 `MLATokenToKVPoolHost`，在 **KV 存储布局不变**（layer-first token-slot pool）的前提下，用本机 **NIC loopback + MR** 模拟「部分请求 KV 在远端」。远端请求在进入 decode 前 **只做一次** 全量预取；之后与本地请求一样，HiSparse 只从统一的 `kv_buffer` 做 swap-in。
 
-```python
-"""RDMA distributed memory pool simulation for HiSparse KV Cache.
+**数据路径**（对齐 Mooncake 类 PD 流程：离散 slot → 连续 staging → bulk 传输 → 写回 slot）：
 
-Simulates a distributed KV Cache pool where only a fraction of
-KV data is cached locally in DRAM, and the rest resides on a
-"remote" node and must be fetched via RDMA.
+1. Prefill / staging 阶段照常把 KV 写入 `kv_buffer`；对被判为 remote 的请求，再把有效 token 对应的 slot **镜像**到与 host pool 同布局的 `remote_buffer`（注册为 MR），表示「远端已持有该请求的 KV」。
+2. Staging 结束、即将进入 decode 时：**gather**（`remote_buffer` 离散 slot → `gather_staging` 连续区）→ **bulk RDMA READ**（`gather_staging` → loopback → `landing_staging`）→ **scatter**（`landing_staging` → `kv_buffer` 对应 slot）。NIC 上只见连续大块 READ，而非按 token 逐条离散 WR。
+3. `gather_staging` / `landing_staging` 只需覆盖 **单请求最大 KV 字节数**（由 `max_seq_len` 等上界约束），不必与 host pool 等大。
 
-When a request transitions from prefill/staging to decode,
-`prefetch_for_decode()` is called ONCE to bulk-transfer all
-remote KV data into local staging buffer. After this one-time
-prefetch, all subsequent decode steps read from local memory
-(local_cache + staging_buffer) without further RDMA operations.
+**与 SGLang / HiSparse 的接口契约**（对上层透明，仅 pool + coordinator 约定）：
 
-Uses real RDMA NIC loopback — the "remote" data is stored in a
-local DRAM region registered as an RDMA MR, and fetched through
-the NIC hardware (ibv_post_send RDMA READ → ibv_poll_cq).
-This produces real hardware latency, which is a lower bound of
-cross-machine RDMA latency.
-"""
+| 入口 | 调用时机 | 作用 |
+| --- | --- | --- |
+| `init_kv_buffer()` | Model runner 建 pool | 分配 `kv_buffer`（返回值）、`remote_buffer`、staging，并完成 RDMA 资源与 MR 注册 |
+| `mark_request_locality(req_pool_idx)` | 某请求 staging 完成、即将标为 decode-ready | 按 `local_ratio` **请求级** 决定 local / remote（同一请求全本地或全远端） |
+| `simulate_remote_write(req_pool_idx, host_indices)` | 紧接上一行之后 | 对 remote 请求把 `kv_buffer` 中该请求有效 slot 拷到 `remote_buffer` |
+| `prefetch_for_decode(req_pool_idx, host_indices)` | `simulate_remote_write` 之后、`alloc_device_buffer` 之前 | 对 remote 请求执行一次 gather → bulk read → scatter；local 请求 no-op，可记录 RDMA 耗时供日志 |
 
-class RDMALoopbackContext:
-    """Manages RDMA resources for loopback simulation.
+实现上可复用 `test/cxl_utils/sparse_kv_bench.py` 侧的 libibverbs/pybind 封装，C 侧以 **`rdma_bulk_read(total_bytes)`** 对连续缓冲区做 READ（见 §6）。
 
-    Creates:
-      - ibv_context, pd, cq, qp (RC, connected to self)
-      - remote_mr: registers the "remote" portion of KV Cache
-      - staging_mr: the staging buffer for RDMA READ results
+**设计要点**：请求级 `local_ratio`；HiSparse decode 路径不区分 local/remote；staging 大小由 `max_seq_len` 等配置封顶；`local_ratio=1.0` 时行为等同纯 DRAM 方案 A。
 
-    Uses the same libibverbs pybind11 wrapper from
-    test/cxl_utils/sparse_kv_bench.py (rdma_ext).
-    """
-
-    def __init__(self, ib_dev: str, remote_buf_ptr: int,
-                 remote_buf_size: int, staging_buf_ptr: int):
-        ...
-
-    def bulk_read(self, size: int) -> float:
-        """Execute RDMA READ of `size` bytes from remote_mr to staging_mr.
-
-        Posts a single RDMA READ WR (or a few large ones if size > max_msg),
-        polls CQ for completion. Returns elapsed time in microseconds.
-        """
-        ...
-
-
-class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
-    """MLA KV Cache host pool with RDMA distributed pool simulation.
-
-    KV data is split into two regions:
-      - local_cache: X% of tokens, pinned DRAM, directly accessible
-      - remote_region: (1-X)% of tokens, RDMA MR, simulates remote node
-
-    Lifecycle:
-      1. Prefill: KV written to local_cache + remote_buffer
-         (remote_buffer simulates "KV stored on remote node")
-      2. Staging→Decode transition: `prefetch_for_decode()` called ONCE
-         per request, bulk RDMA READ remote_buffer → staging_buffer
-      3. All decode steps: HiSparse reads from unified local view
-         = [local_cache | staging_buffer], no further RDMA operations
-
-    This models the real PD-disaggregation scenario: decode instance
-    fetches full KV from remote prefill instance once before decoding.
-    """
-
-    def __init__(
-        self,
-        device_pool,
-        host_to_device_ratio: float,
-        host_size: int,
-        page_size: int,
-        layout: str,
-        rdma_config: dict,     # {"ib_dev": "mlx5_0", "local_ratio": 0.3}
-        override_kv_cache_dim=None,
-    ):
-        self.local_ratio = rdma_config.get("local_ratio", 0.0)
-        self.ib_dev = rdma_config.get("ib_dev", "mlx5_0")
-        # ... init buffers, RDMA context ...
-        super().__init__(...)
-
-    def init_kv_buffer(self):
-        """Allocate host pool + shadow remote buffer + staging buffer."""
-        # host_pool: pinned DRAM, HiSparse 的统一视图
-        self.kv_buffer = torch.empty(
-            (self.layer_num, self.size, 1, self.kv_cache_dim),
-            dtype=self.dtype, pin_memory=True)
-
-        # remote_buffer: regular DRAM, registered as RDMA MR
-        # 与 host_pool 等大，用于存放"远端请求"的 KV 副本
-        self.remote_buffer = torch.empty_like(self.kv_buffer)
-        # Register remote_buffer with RDMA NIC ...
-
-        # staging_buffer: pinned DRAM, RDMA READ 目标
-        self.staging_buffer = torch.empty_like(self.kv_buffer,
-                                                pin_memory=True)
-
-        # 跟踪哪些请求被标记为"远端"
-        self._remote_reqs = set()
-        return self.kv_buffer
-
-    def mark_request_locality(self, req_pool_idx: int):
-        """Staging 完成时调用，按 local_ratio 概率决定请求是 local 还是 remote."""
-        if random.random() >= self.local_ratio:
-            self._remote_reqs.add(req_pool_idx)
-
-    def simulate_remote_write(self, req_pool_idx: int, seq_len: int):
-        """将 remote 请求的 KV 从 host_pool 拷贝到 remote_buffer（模拟 KV 写入远端）."""
-        if req_pool_idx not in self._remote_reqs:
-            return
-        host_indices = self.req_to_host_pool[req_pool_idx, :seq_len]
-        # kv_buffer[:, host_indices] → remote_buffer[:, host_indices]
-        self.remote_buffer[:, host_indices] = self.kv_buffer[:, host_indices]
-
-    def prefetch_for_decode(self, req_pool_idx: int, seq_len: int):
-        """One-time RDMA READ: fetch remote request's full KV into local.
-
-        Called ONCE per request when transitioning to decode.
-        Local requests skip this entirely (no RDMA overhead).
-        Returns: RDMA transfer time in microseconds (for logging).
-        """
-        if req_pool_idx not in self._remote_reqs:
-            return 0.0  # local request, no RDMA needed
-        host_indices = self.req_to_host_pool[req_pool_idx, :seq_len]
-        num_tokens = len(host_indices)
-        remote_bytes = (num_tokens * self.layer_num
-                        * self.kv_cache_dim * self.dtype_size)
-        rdma_us = self.rdma_ctx.bulk_read(remote_bytes)
-        # RDMA READ: remote_buffer → staging_buffer, then copy back
-        self.kv_buffer[:, host_indices] = self.staging_buffer[:, host_indices]
-        return rdma_us
-```
-
-**设计要点**：
-
-1. **按请求划分 local/remote**：`local_ratio` 控制的是**请求级别**的本地命中率——每个请求的全部 KV 要么全在本地，要么全在远端。`mark_request_locality()` 在 staging 完成时以 `local_ratio` 概率将请求标记为 local，其余标记为 remote。这符合真实分布式场景：同一请求的 KV 在同一个节点上
-2. **HiSparse 视角统一**：`init_kv_buffer()` 返回统一的 pinned DRAM host pool，HiSparse 的 staging DMA 和 decode swap-in 正常工作，无需感知 local/remote 区分
-3. **Remote 模拟**：remote 请求的 KV 在 staging 完成后拷贝到 `remote_buffer`（RDMA MR），模拟"KV 存储在远端节点"
-4. **一次性 RDMA 预取**：remote 请求进入 decode 前，`prefetch_for_decode()` 调用**一次**，RDMA READ 全量 KV 回本地。Local 请求直接跳过，零 RDMA 开销
-5. **本地比例可配**：`local_ratio=0.0`（全部远端，每个请求都需 RDMA）→ `local_ratio=1.0`（全部本地，等同方案 A）
-
-### 5.3 模块 2：Coordinator 适配（~20 行）
+### 5.3 模块 2：Coordinator 适配（~40 行）
 
 **修改文件**：`python/sglang/srt/managers/hisparse_coordinator.py`
 
-在 Coordinator 的初始化中根据配置选择 host pool 后端，并在请求进入 decode 之前一次性 RDMA 预取：
-
-```python
-# __init__ 中：
-if hisparse_config.get("rdma_pool"):
-    from sglang.srt.mem_cache.rdma_memory_pool import RDMAMLATokenToKVPoolHost
-    self.mem_pool_host = RDMAMLATokenToKVPoolHost(
-        device_pool=self.mem_pool_device,
-        rdma_config=hisparse_config["rdma_pool"],
-        ...
-    )
-elif hisparse_config.get("cxl", {}).get("enabled"):
-    # 现有 CXL 路径
-    ...
-else:
-    # 现有 DRAM 路径
-    ...
-
-# collect_ready_reqs 中，staging 完成、进入 decode 之前：
-def collect_ready_reqs(self) -> List[Req]:
-    # ... (原有 staging 完成检查) ...
-    for req in newly_ready:
-        seq_len = len(req.fill_ids)
-        if hasattr(self.mem_pool_host, 'mark_request_locality'):
-            # 1. 按 local_ratio 概率标记请求为 local/remote
-            self.mem_pool_host.mark_request_locality(req.req_pool_idx)
-            # 2. remote 请求：将 host_pool KV 拷贝到 remote_buffer
-            self.mem_pool_host.simulate_remote_write(req.req_pool_idx, seq_len)
-            # 3. remote 请求：一次性 RDMA READ 拉回本地
-            self.mem_pool_host.prefetch_for_decode(req.req_pool_idx, seq_len)
-        self.alloc_device_buffer(req)
-        # ...
-```
+- **`__init__`**：`hisparse_config["rdma_pool"]` 存在且启用时构造 `RDMAMLATokenToKVPoolHost`（并传入 `rdma_config`；多网卡时另传 `tp_rank`，见 §9），否则保持现有 DRAM / CXL 分支。
+- **`collect_ready_reqs`（或等价的「staging 完成 → decode」衔接点）**：对每个新就绪请求，若 `mem_pool_host` 提供上述 RDMA 接口，则按顺序调用 `mark_request_locality` → `simulate_remote_write` → `prefetch_for_decode`，参数为 **`req_pool_idx`** 与 **`host_indices`（或等价索引张量，覆盖本请求在 host pool 中的 token slot）**，再进入原有的 `alloc_device_buffer` 等逻辑。Decode 循环内不再触发 RDMA。
 
 ### 5.4 模块 3：端到端 Benchmark 脚本（~350 行）
 
@@ -732,121 +591,28 @@ done
 
 ---
 
-## 6. RDMA Loopback 实现细节
+## 6. RDMA Loopback 实现要点
 
-### 6.1 复用已有 RDMA 基础设施
+### 6.1 基础设施与 bulk 路径
 
-`test/cxl_utils/sparse_kv_bench.py` 中已有 RDMA loopback 的 pybind11 模块（`rdma_ext`）。`RDMAMLATokenToKVPoolHost` 复用同一套 libibverbs 封装，仅扩展为支持"bulk read"（大块连续读取，而非逐条目离散读取）。
+复用 `test/cxl_utils/sparse_kv_bench.py` 中的 loopback 与 pybind 封装；C 侧在 `rdma_scatter_read.c` 中提供 **`rdma_bulk_read(rctx, total_bytes)`**：将 `total_bytes` 按固定上限（如 1MB）拆成若干 **RDMA READ** WR，`local`/`remote` MR 分别对应 **landing / gather** staging 的注册地址，完成后 poll CQ 并返回耗时（微秒）。旧版按 token 离散地址调用的 `rdma_scatter_read` 不再作为方案 B 的主路径；bulk 路径下 WR 数量随 **总字节数 / chunk**，而非 token 数。
 
-需要扩展的接口：
+### 6.2 数据流（与 §5.2 一致）
 
-```c
-// rdma_scatter_read.c 新增
-double rdma_bulk_read(struct rdma_context *rctx, size_t total_bytes) {
-    // 将 total_bytes 拆分为多个 max_msg_size 的 WR
-    // 批量 ibv_post_send → poll CQ → 返回总延迟
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
-    size_t offset = 0;
-    int wr_count = 0;
-    while (offset < total_bytes) {
-        size_t chunk = (total_bytes - offset > MAX_MSG_SIZE)
-                       ? MAX_MSG_SIZE : (total_bytes - offset);
-        struct ibv_sge sge = {
-            .addr = (uint64_t)rctx->local_mr->addr + offset,
-            .length = chunk,
-            .lkey = rctx->local_mr->lkey,
-        };
-        struct ibv_send_wr wr = {
-            .sg_list = &sge,
-            .num_sge = 1,
-            .opcode = IBV_WR_RDMA_READ,
-            .send_flags = 0,
-            .wr.rdma = {
-                .remote_addr = rctx->remote_addr + offset,
-                .rkey = rctx->remote_rkey,
-            },
-        };
-        offset += chunk;
-        wr_count++;
-        // Signal last WR
-        if (offset >= total_bytes)
-            wr.send_flags = IBV_SEND_SIGNALED;
-        struct ibv_send_wr *bad_wr;
-        ibv_post_send(rctx->qp, &wr, &bad_wr);
-    }
-
-    // Poll for completion
-    struct ibv_wc wc;
-    while (ibv_poll_cq(rctx->cq, 1, &wc) == 0) {}
-
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    return (t1.tv_sec - t0.tv_sec) * 1e6 + (t1.tv_nsec - t0.tv_nsec) / 1e3;
-}
-```
-
-### 6.2 本地缓存比例的实现方式
-
-`local_ratio` 控制的是**请求级别**的本地命中率，而非 token 级别的内存划分。同一个请求的全部 KV 要么全在本地 DRAM，要么全在远端——这符合真实分布式内存池的语义（同一请求的 KV 存储在同一个节点上）。
+仅第二步走 NIC；布局约定：staging 内按 **layer  major**，层内 token 顺序与 **`host_indices`** 一致。
 
 ```
-请求到达，staging 完成时：
-  以 local_ratio 概率 → 标记为 local（KV 已在本地 DRAM，无需 RDMA）
-  以 (1-local_ratio) 概率 → 标记为 remote
-
-Local 请求:
-  staging → host_pool                      （直接可用）
-  decode: swap-in 从 host_pool 读取         （本地 DRAM 访问）
-
-Remote 请求:
-  staging → host_pool → 拷贝到 remote_buffer （模拟"KV 写入远端"）
-  进入 decode 前（一次性）:
-    RDMA READ: remote_buffer → staging_buffer → 写回 host_pool
-  decode: swap-in 从 host_pool 读取          （已拉回本地）
+remote_buffer (离散 slot)  --gather-->  gather_staging
+       |                                      |
+       |         bulk RDMA READ (loopback)     |
+       v                                      v
+kv_buffer (离散 slot)  <--scatter--  landing_staging
 ```
 
-**实验中的配置**：
-- `local_ratio=0.0`（B-0）：所有请求都需 RDMA 预取，最大化暴露 RDMA 开销
-- `local_ratio=0.3`（B-30）：30% 请求本地命中，70% 需 RDMA，模拟部分缓存命中
-- `local_ratio=1.0`（B-100）：等同方案 A（全部本地），作为 RDMA 方案的上界基线
+### 6.3 `local_ratio` 与触发时机
 
-### 6.3 RDMA 预取的触发时机
-
-`prefetch_for_decode()` 在请求从 staging 完成进入 decode 阶段时**调用一次**，而非每步 decode 重复调用：
-
-```python
-# hisparse_coordinator.py — collect_ready_reqs（简化）:
-
-def collect_ready_reqs(self) -> List[Req]:
-    ready_reqs = []
-    for req in staging_completed_reqs:
-        seq_len = len(req.fill_ids)
-        if hasattr(self.mem_pool_host, 'mark_request_locality'):
-            # ★ 按 local_ratio 标记 local/remote
-            self.mem_pool_host.mark_request_locality(req.req_pool_idx)
-            # ★ remote 请求：host_pool → remote_buffer（模拟远端写入）
-            self.mem_pool_host.simulate_remote_write(req.req_pool_idx, seq_len)
-            # ★ remote 请求：RDMA READ remote → local（一次性预取）
-            #   local 请求：直接跳过，零开销
-            self.mem_pool_host.prefetch_for_decode(req.req_pool_idx, seq_len)
-
-        self.alloc_device_buffer(req)
-        ready_reqs.append(req)
-    return ready_reqs
-
-# 之后的每步 decode（不涉及 RDMA，local/remote 请求行为一致）:
-def _process_decode_step(self, batch):
-    self._eager_backup_previous_token(batch)
-    for layer_id in range(self.num_layers):
-        self.swap_in_selected_pages(layer_id, ...)
-        # swap-in 从 host_pool 读取，全部是本地 DRAM 操作
-```
-
-**关键**：
-- **按请求划分**：同一请求的全部 KV 要么全在本地、要么全需 RDMA，符合真实分布式语义
-- **一次性开销**：remote 请求的 RDMA READ 在进入 decode 前完成一次，之后所有 decode step 都是本地内存操作
-- **开销体现**：RDMA 的代价是**请求级的一次性延迟**（影响该请求的首步 decode / TTFT），local 请求无任何额外开销
+- **请求级** `local_ratio`：见 §5.2；典型实验点：0.0 / 0.3 / 1.0（等同 DRAM 上界）。
+- **`prefetch_for_decode`**：仅在 **staging 完成 → 进入 decode** 时调用 **一次**；后续 decode 步仅访问 `kv_buffer`，无 RDMA。代价集中在 **请求级首段**（gather + NIC + scatter），用于解释 Round 2 中相对 CXL 的 TTFT / 首步 decode 差异。
 
 ---
 
@@ -1066,99 +832,21 @@ DPA 配置: --tp 8 --dp 8 --enable-dp-attention
 
 **每个 rank 使用且仅使用一张网卡**，通过 `ib_devs` 列表长度手动控制实际参与的网卡数量。网卡数越多，各 rank 间的带宽竞争越少，但同时多张 NIC 同时向 DRAM 写入也会加剧 PCIe RC 竞争。
 
-### 9.4 C 层扩展：多实例 RDMA Context
+### 9.4 C / pybind 层：多实例 RDMA Context
 
-现有 `rdma_scatter_read_py.cpp` 使用**全局单例** `g_ctx`，多个 rank 并发时无法各自持有独立的 RDMA context。需扩展为**多实例**支持。
-
-底层 C 函数（`rdma_init_loopback` / `rdma_bulk_read` / `rdma_destroy`）已接受任意 `struct rdma_context*` 指针，**无需修改 `.c` / `.h`**。只需在 pybind11 层新增可实例化的 `RDMAContextHandle` 类：
-
-```cpp
-// rdma_scatter_read_py.cpp 新增 (~50 行, 与现有单例 API 共存)
-
-class RDMAContextHandle {
-    rdma_context ctx_;
-    bool initialized_ = false;
-public:
-    void init(const std::string& ib_dev,
-              uint64_t local_ptr, size_t local_size,
-              uint64_t remote_ptr, size_t remote_size, int max_wr) {
-        int ret = rdma_init_loopback(&ctx_, ib_dev.c_str(),
-                                     (void*)local_ptr, local_size,
-                                     (void*)remote_ptr, remote_size, max_wr);
-        if (ret != 0) throw std::runtime_error("rdma_init_loopback failed");
-        initialized_ = true;
-    }
-    double bulk_read(size_t total_bytes) {
-        return rdma_bulk_read(&ctx_, total_bytes);  // 释放 GIL 后调用
-    }
-    void destroy() {
-        if (initialized_) { rdma_destroy(&ctx_); initialized_ = false; }
-    }
-    ~RDMAContextHandle() { destroy(); }
-};
-
-// PYBIND11_MODULE 中追加:
-py::class_<RDMAContextHandle>(m, "RDMAContext")
-    .def(py::init<>())
-    .def("init",       &RDMAContextHandle::init)
-    .def("bulk_read",  &RDMAContextHandle::bulk_read,
-         py::call_guard<py::gil_scoped_release>())  // 不阻塞 GIL
-    .def("destroy",    &RDMAContextHandle::destroy);
-```
+现有 `rdma_scatter_read_py.cpp` 若仍为**全局单例** `g_ctx`，多 rank（DPA）并发时各 rank 需独立 **QP/MR**。底层 C 已有 **`rdma_init_loopback` / `rdma_bulk_read` / `rdma_destroy`** 且以 `struct rdma_context*` 为句柄时，**.c/.h 可不改**，仅在 pybind 侧增加**可实例化**的上下文类（如 `RDMAContext`）：`init(ib_dev, local_ptr, local_size, remote_ptr, remote_size)` 对应 landing/gather 两块 staging 的注册地址，`bulk_read` 内释放 GIL 调用 `rdma_bulk_read`，析构时 `rdma_destroy`。与现有单例导出 API **并存**即可。
 
 ### 9.5 Python 层集成
 
-#### 9.5.1 `rdma_memory_pool.py` 的改动
+#### 9.5.1 `rdma_memory_pool.py`
 
-`RDMAMLATokenToKVPoolHost.__init__` 接收 `tp_rank` 和 `ib_devs` 列表，按 `tp_rank % len(ib_devs)` 选出本 rank 使用的网卡；`init_kv_buffer` 中为该网卡创建独立的 `RDMAContextHandle` 实例：
+- 从 `rdma_config` 读取 **`ib_devs`**（列表）或回退 **`ib_dev`**（单卡）；若存在 `ib_devs`，则 **`self.ib_dev = ib_devs[tp_rank % len(ib_devs)]`**，与 CXL 多设备 interleave 对齐。
+- 每个 **TP/DP rank** 在 `init_kv_buffer` 里为 **本 rank 选中的网卡** 创建 **独立** pybind 上下文，并注册 **gather_staging / landing_staging**（逻辑同 §5.2，仍为小块连续缓冲）。
+- `prefetch_for_decode` 流程不变：gather → 本 rank 的 `bulk_read` → scatter。
 
-```python
-class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
-    def __init__(self, ..., rdma_config: dict, tp_rank: int = 0):
-        ib_devs = rdma_config.get("ib_devs", None)
-        if ib_devs:
-            # 多网卡模式: 按 rank 分配, 向后兼容单值 ib_dev
-            self.ib_dev = ib_devs[tp_rank % len(ib_devs)]
-        else:
-            self.ib_dev = rdma_config.get("ib_dev", "mlx5_0")
-        ...
+#### 9.5.2 Coordinator
 
-    def init_kv_buffer(self):
-        buffer = super().init_kv_buffer()
-        # remote_buffer / staging_buffer 分配同前（等大于 host_pool）
-
-        # 每个 rank 使用独立的 RDMAContextHandle 实例
-        self._rdma_handle = rdma_ext.RDMAContext()
-        self._rdma_handle.init(
-            self.ib_dev,
-            staging_buf_ptr, staging_size,
-            remote_buf_ptr,  remote_size,
-            max_wr=4096,
-        )
-        logger.info("RDMA: rank uses ib_dev=%s", self.ib_dev)
-        return buffer
-
-    def prefetch_for_decode(self, req_pool_idx, host_indices):
-        if req_pool_idx not in self._remote_reqs:
-            return 0.0
-        total_bytes = num_tokens * self.token_stride_size * self.layer_num
-        rdma_us = self._rdma_handle.bulk_read(total_bytes)
-        # staging → host_pool 写回（同前）
-        ...
-        return rdma_us
-```
-
-#### 9.5.2 Coordinator 适配
-
-`HiSparseCoordinator.__init__` 初始化 `RDMAMLATokenToKVPoolHost` 时传入 `tp_rank`：
-
-```python
-self.mem_pool_host = RDMAMLATokenToKVPoolHost(
-    ...,
-    rdma_config=hisparse_config["rdma_pool"],
-    tp_rank=self.tp_rank,   # 新增参数
-)
-```
+构造 `RDMAMLATokenToKVPoolHost` 时传入当前 rank 的 **`tp_rank`**（或等价 rank id），以便 pool 内选择 `ib_devs[i]`；其余 coordinator 钩子与 §5.3 相同。
 
 ### 9.6 配置接口
 
