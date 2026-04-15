@@ -23,6 +23,9 @@
 #   HF_ENDPOINT, RESULTS_DIR, SERVER_STARTUP_WAIT, SKIP_SERVER
 #   SGLANG_ENV_SCRIPT, PYTHON_BIN
 #
+# Resume: if the target JSON for a case already exists under RESULTS_DIR, that
+#   case is skipped (no server, no client).  FORCE_RERUN=1 disables this.
+#
 # =============================================================================
 
 set -euo pipefail
@@ -234,6 +237,14 @@ for tin in "${CONTEXT_LENGTHS[@]}"; do
     base="${SCHEME}_ctx${tag}_conc${conc}"
     out_file="${RESULTS_DIR}/${base}.json"
     srv_log="${RESULTS_DIR}/server_${base}.log"
+
+    if [[ "${FORCE_RERUN:-0}" != "1" ]] && [[ -f "${out_file}" ]]; then
+      echo ""
+      echo "################################################################"
+      echo "  SKIP ${CURRENT_CASE}/${TOTAL_CASES}: existing ${out_file##*/}"
+      echo "################################################################"
+      continue
+    fi
 
     echo ""
     echo "################################################################"
