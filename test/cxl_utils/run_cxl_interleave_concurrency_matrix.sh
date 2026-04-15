@@ -19,7 +19,9 @@
 # Optional env:
 #   MODEL_CLIENT, PORT, TP, DP_SIZE, MEM_FRACTION_STATIC, MAX_TOTAL_TOKENS
 #   CXL_DEV_PATH, CXL_DEV_PATH_2, CXL_MAP_BYTES_PER_DEVICE
-#   NUM_REQUESTS_CXL, NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS
+#   NUM_REQUESTS_CXL — if set, used for every concurrency (uniform override).
+#     If unset: conc 8 → 128, conc 16 → 256, conc 32/48/64 → 512 (faster low-parallel runs).
+#   NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS
 #   ROUND2_OUTPUT_MIN, ROUND2_OUTPUT_MAX, REQUEST_RATE, REPEAT_MODE, PROMPT_MODE
 #   HF_ENDPOINT, RESULTS_DIR, SERVER_STARTUP_WAIT, SKIP_SERVER
 #   SGLANG_ENV_SCRIPT, PYTHON_BIN
@@ -40,7 +42,8 @@ CXL_DEV_PATH="${CXL_DEV_PATH:-/dev/dax0.0}"
 CXL_DEV_PATH_2="${CXL_DEV_PATH_2:-/dev/dax1.0}"
 CXL_MAP_BYTES_PER_DEVICE="${CXL_MAP_BYTES_PER_DEVICE:-274877906944}"
 
-NUM_REQUESTS_CXL="${NUM_REQUESTS_CXL:-512}"
+# Empty = tiered by concurrency (see header). Non-empty = same count for all cases.
+NUM_REQUESTS_CXL="${NUM_REQUESTS_CXL:-}"
 NUM_UNIQUE_PROMPTS="${NUM_UNIQUE_PROMPTS:-1}"
 OUTPUT_TOKENS="${OUTPUT_TOKENS:-512}"
 ROUND2_OUTPUT_MIN="${ROUND2_OUTPUT_MIN:-0}"
@@ -69,6 +72,20 @@ CONCURRENCIES=(8 16 32 48 64)
 
 SCHEME="cxl_interleave_2"
 
+# num-requests per max-concurrency: low parallelism → fewer requests (shorter runs).
+cxl_num_requests_for_conc() {
+  local conc="$1"
+  if [[ -n "${NUM_REQUESTS_CXL}" ]]; then
+    echo "${NUM_REQUESTS_CXL}"
+    return
+  fi
+  case "${conc}" in
+    8) echo 128 ;;
+    16) echo 256 ;;
+    *) echo 512 ;;
+  esac
+}
+
 build_hisparse_cxl_interleave_2() {
   printf '%s' '{"top_k":2048,"device_buffer_size":4096,"cxl":{"enabled":true,"dev_paths":["'"${CXL_DEV_PATH}"'","'"${CXL_DEV_PATH_2}"'"],"map_bytes_per_device":'"${CXL_MAP_BYTES_PER_DEVICE}"'}}'
 }
@@ -94,7 +111,7 @@ while [[ $# -gt 0 ]]; do
     --env-script) SGLANG_ENV_SCRIPT="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
     -h|--help)
-      sed -n '1,26p' "$0"
+      sed -n '1,32p' "$0"
       exit 0
       ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
@@ -212,7 +229,11 @@ run_e2e_fast() {
   echo "TP=${TP} DP_SIZE=${DP_SIZE} PORT=${PORT}"
   echo "CONTEXT_LENGTHS=${CONTEXT_LENGTHS[*]}"
   echo "CONCURRENCIES=${CONCURRENCIES[*]}"
-  echo "NUM_REQUESTS_CXL=${NUM_REQUESTS_CXL}"
+  if [[ -n "${NUM_REQUESTS_CXL}" ]]; then
+    echo "NUM_REQUESTS_CXL=${NUM_REQUESTS_CXL} (uniform for all concurrencies)"
+  else
+    echo "NUM_REQUESTS_CXL=(unset) tiered: conc8=128 conc16=256 conc32/48/64=512"
+  fi
   echo "CXL_DEV_PATH=${CXL_DEV_PATH} CXL_DEV_PATH_2=${CXL_DEV_PATH_2}"
   echo "CXL_MAP_BYTES_PER_DEVICE=${CXL_MAP_BYTES_PER_DEVICE}"
   echo "RESULTS_DIR=${RESULTS_DIR}"
@@ -231,13 +252,14 @@ for tin in "${CONTEXT_LENGTHS[@]}"; do
   tag="$(ctx_tag "${tin}")"
   for conc in "${CONCURRENCIES[@]}"; do
     CURRENT_CASE=$((CURRENT_CASE + 1))
+    num_req="$(cxl_num_requests_for_conc "${conc}")"
     base="${SCHEME}_ctx${tag}_conc${conc}"
     out_file="${RESULTS_DIR}/${base}.json"
     srv_log="${RESULTS_DIR}/server_${base}.log"
 
     echo ""
     echo "################################################################"
-    echo "  CASE ${CURRENT_CASE}/${TOTAL_CASES}: ctx=${tin} (${tag})  max-concurrency=${conc}  num-requests=${NUM_REQUESTS_CXL}"
+    echo "  CASE ${CURRENT_CASE}/${TOTAL_CASES}: ctx=${tin} (${tag})  max-concurrency=${conc}  num-requests=${num_req}"
     echo "################################################################"
 
     if [[ "${SKIP_SERVER}" == "1" ]]; then
@@ -253,7 +275,7 @@ for tin in "${CONTEXT_LENGTHS[@]}"; do
     fi
 
     echo "  --- client -> ${out_file##*/} ---"
-    run_e2e_fast "${out_file}" "${tin}" "${NUM_REQUESTS_CXL}" "${conc}"
+    run_e2e_fast "${out_file}" "${tin}" "${num_req}" "${conc}"
 
     if [[ "${SKIP_SERVER}" != "1" ]]; then
       kill_server
