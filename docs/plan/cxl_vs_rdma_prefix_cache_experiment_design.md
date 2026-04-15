@@ -651,7 +651,7 @@ done
 
 ### 6.1 基础设施与 bulk 路径
 
-复用 `test/cxl_utils/sparse_kv_bench.py` 中的 loopback 与 pybind 封装；C 侧在 `rdma_scatter_read.c` 中提供 **`rdma_bulk_read(rctx, total_bytes)`**：将 `total_bytes` 按固定上限（如 1MB）拆成若干 **RDMA READ** WR，完成后 poll CQ 并返回耗时（微秒）。WR 数量随 **总字节数 / chunk**，而非 token 数。
+复用 `test/cxl_utils/sparse_kv_bench.py` 中的 loopback 与 pybind 封装；C 侧在 `rdma_scatter_read.c` 中提供 **`rdma_bulk_read(rctx, total_bytes)`**：将 `total_bytes` 按固定上限（如 8MB）拆成若干 **RDMA READ** WR，完成后 poll CQ 并返回耗时（微秒）。WR 数量随 **总字节数 / chunk**，而非 token 数。
 
 ### 6.2 数据流（page-first 远端 → bulk RDMA → layer-first 本地）
 

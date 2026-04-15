@@ -282,8 +282,8 @@ double rdma_bulk_read(struct rdma_context *rctx, size_t total_bytes) {
     if (total_bytes > rctx->local_size)
         total_bytes = rctx->local_size;
 
-    /* Max message size per WR -- use 1MB chunks for efficiency */
-    const size_t MAX_CHUNK = 1 * 1024 * 1024;
+    /* Max message size per WR -- default to 8MB for long-context bulk prefetch */
+    const size_t MAX_CHUNK = 8 * 1024 * 1024;
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -358,7 +358,8 @@ double rdma_bulk_read_offset(struct rdma_context *rctx,
     if (local_offset + length > rctx->local_size)
         length = rctx->local_size - local_offset;
 
-    const size_t MAX_CHUNK = 1 * 1024 * 1024;
+    /* Keep offset-aware bulk reads aligned with the default 8MB bulk chunk size. */
+    const size_t MAX_CHUNK = 8 * 1024 * 1024;
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
