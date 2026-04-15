@@ -521,17 +521,30 @@ class HiSparseCoordinator:
         from sglang.srt.mem_cache.rdma_memory_pool import (
             RDMAMLATokenToKVPoolHost,
             _resolve_ib_dev,
+            _resolve_ib_devs_for_striping,
         )
 
-        ib_dev = _resolve_ib_dev(rdma_config, tp_rank)
-        logger.info(
-            "HiSparse: initializing RDMA host pool: tp_rank=%d, ib_dev=%s, "
-            "local_ratio=%.2f, ib_devs=%s",
-            tp_rank,
-            ib_dev,
-            rdma_config.get("local_ratio", 0.0),
-            rdma_config.get("ib_devs", [rdma_config.get("ib_dev", "mlx5_0")]),
-        )
+        mode = rdma_config.get("mode", "rank_interleave")
+        if mode == "request_striping":
+            max_rnics = rdma_config.get("max_rnics_per_request", 1)
+            ib_devs = _resolve_ib_devs_for_striping(rdma_config, max_rnics)
+            logger.info(
+                "HiSparse: initializing RDMA host pool (request_striping): "
+                "tp_rank=%d, ib_devs=%s, max_rnics_per_request=%d, "
+                "min_tokens_per_rnic=%d, local_ratio=%.2f",
+                tp_rank, ib_devs, max_rnics,
+                rdma_config.get("min_tokens_per_rnic", 8192),
+                rdma_config.get("local_ratio", 0.0),
+            )
+        else:
+            ib_dev = _resolve_ib_dev(rdma_config, tp_rank)
+            logger.info(
+                "HiSparse: initializing RDMA host pool (rank_interleave): "
+                "tp_rank=%d, ib_dev=%s, local_ratio=%.2f, ib_devs=%s",
+                tp_rank, ib_dev,
+                rdma_config.get("local_ratio", 0.0),
+                rdma_config.get("ib_devs", [rdma_config.get("ib_dev", "mlx5_0")]),
+            )
         return RDMAMLATokenToKVPoolHost(
             device_pool=self.mem_pool_device,
             host_to_device_ratio=host_to_device_ratio,

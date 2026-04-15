@@ -111,7 +111,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
                     "'map_bytes' when 'dev_paths' has multiple devices"
                 )
 
-    # Validate RDMA multi-NIC interleave config
+    # Validate RDMA multi-NIC config
     if rdma_config and rdma_config.get("enabled"):
         ib_devs = rdma_config.get("ib_devs")
         if ib_devs is not None:
@@ -120,10 +120,43 @@ def _parse_sparse_config(server_args) -> SparseConfig:
                     "rdma_pool.ib_devs must be a non-empty list of IB device "
                     "names (e.g. [\"mlx5_0\", \"mlx5_1\"])"
                 )
+
+        mode = rdma_config.get("mode", "rank_interleave")
+        if mode not in ("rank_interleave", "request_striping"):
+            raise ValueError(
+                f"rdma_pool.mode must be 'rank_interleave' or "
+                f"'request_striping', got '{mode}'"
+            )
+
+        max_rnics = rdma_config.get("max_rnics_per_request", 1)
+        if not isinstance(max_rnics, int) or max_rnics < 1:
+            raise ValueError(
+                f"rdma_pool.max_rnics_per_request must be a positive integer, "
+                f"got {max_rnics}"
+            )
+
+        min_tokens = rdma_config.get("min_tokens_per_rnic", 8192)
+        if not isinstance(min_tokens, int) or min_tokens < 1:
+            raise ValueError(
+                f"rdma_pool.min_tokens_per_rnic must be a positive integer, "
+                f"got {min_tokens}"
+            )
+
+        if mode == "request_striping":
+            if not ib_devs or len(ib_devs) < 2:
+                raise ValueError(
+                    "request_striping mode requires ib_devs with at least 2 "
+                    "IB devices"
+                )
             logger.info(
-                "RDMA multi-NIC interleave: %d NICs configured (%s)",
-                len(ib_devs),
-                ib_devs,
+                "RDMA request_striping: %d NICs (%s), "
+                "max_rnics_per_request=%d, min_tokens_per_rnic=%d",
+                len(ib_devs), ib_devs, max_rnics, min_tokens,
+            )
+        elif ib_devs:
+            logger.info(
+                "RDMA rank_interleave: %d NICs configured (%s)",
+                len(ib_devs), ib_devs,
             )
 
     return SparseConfig(

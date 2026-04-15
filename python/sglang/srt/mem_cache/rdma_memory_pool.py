@@ -33,14 +33,21 @@ Uses real RDMA NIC loopback — the "remote" data is stored in a local
 DRAM region registered as an RDMA MR, and fetched through the NIC
 hardware (ibv_post_send RDMA READ → ibv_poll_cq).
 
-Multi-NIC interleave: when ``ib_devs`` is provided in rdma_config, each
-TP rank is assigned a NIC via ``tp_rank % len(ib_devs)``.
+Two multi-NIC modes (controlled by ``rdma_pool.mode``):
+
+  ``rank_interleave`` (default): each TP rank is assigned a single NIC
+  via ``tp_rank % len(ib_devs)``.  Single request → single NIC.
+
+  ``request_striping``: a single request's KV is split by token range
+  into shards, each shard read in parallel by a different NIC.  This
+  aggregates bandwidth from multiple RNICs for long-context prefetch.
 """
 
 from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 from typing import Dict, List, Optional, Set
 
@@ -114,11 +121,21 @@ def _try_load_rdma_ext():
 
 
 def _resolve_ib_dev(rdma_config: dict, tp_rank: int) -> str:
-    """Pick the IB device for this rank from config."""
+    """Pick the IB device for this rank from config (rank_interleave mode)."""
     ib_devs: Optional[List[str]] = rdma_config.get("ib_devs")
     if ib_devs and len(ib_devs) > 0:
         return ib_devs[tp_rank % len(ib_devs)]
     return rdma_config.get("ib_dev", "mlx5_0")
+
+
+def _resolve_ib_devs_for_striping(
+    rdma_config: dict, max_rnics: int
+) -> List[str]:
+    """Return the list of IB devices to use for request_striping mode."""
+    ib_devs: Optional[List[str]] = rdma_config.get("ib_devs")
+    if not ib_devs:
+        return [rdma_config.get("ib_dev", "mlx5_0")]
+    return ib_devs[:max_rnics]
 
 
 class RDMALoopbackContext:
@@ -196,6 +213,24 @@ class RDMALoopbackContext:
         else:
             return self.rdma_ext.rdma_bulk_read(total_bytes)
 
+    def bulk_read_offset(
+        self, remote_offset: int, local_offset: int, length: int
+    ) -> float:
+        """RDMA READ `length` bytes from remote MR at `remote_offset`
+        into local MR at `local_offset`.  Returns elapsed µs.
+
+        Requires the multi-instance RDMAContext API (bulk_read_offset).
+        """
+        if not self._initialized:
+            raise RuntimeError("RDMA context not initialized")
+        if length == 0:
+            return 0.0
+        if not self._use_handle:
+            raise RuntimeError(
+                "bulk_read_offset requires multi-instance RDMAContext API"
+            )
+        return self._handle.bulk_read_offset(remote_offset, local_offset, length)
+
     def destroy(self):
         if self._initialized:
             if self._use_handle and self._handle is not None:
@@ -221,6 +256,11 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
       1. Prefix KV already in remote_buffer (from Round 1).
       2. Skip simulate_remote_write.
       3. prefetch_for_decode: same RDMA + transpose as cold path.
+
+    Two multi-NIC modes:
+      rank_interleave (default): single NIC per rank, tp_rank % len(ib_devs).
+      request_striping: split one request's tokens into shards across NICs,
+        parallel bulk RDMA READ, per-shard transpose/scatter.
     """
 
     def __init__(
@@ -235,16 +275,33 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         override_kv_cache_dim: Optional[int] = None,
     ):
         self.local_ratio = rdma_config.get("local_ratio", 0.0)
-        self.ib_dev = _resolve_ib_dev(rdma_config, tp_rank)
         self.max_seq_len = rdma_config.get("max_seq_len", 131072)
         self.tp_rank = tp_rank
-        self._rdma_ctx: Optional[RDMALoopbackContext] = None
         self._remote_reqs: Set[int] = set()
         self._rdma_stats: Dict[str, float] = {
             "total_prefetch_us": 0.0,
             "total_transpose_us": 0.0,
             "prefetch_count": 0,
         }
+
+        self.mode = rdma_config.get("mode", "rank_interleave")
+        self.max_rnics_per_request = rdma_config.get("max_rnics_per_request", 1)
+        self.min_tokens_per_rnic = rdma_config.get("min_tokens_per_rnic", 8192)
+
+        if self.mode == "request_striping":
+            self._striping_ib_devs = _resolve_ib_devs_for_striping(
+                rdma_config, self.max_rnics_per_request
+            )
+            self.ib_dev = self._striping_ib_devs[0]
+        else:
+            self._striping_ib_devs = []
+            self.ib_dev = _resolve_ib_dev(rdma_config, tp_rank)
+
+        # Single-NIC context (rank_interleave or fallback)
+        self._rdma_ctx: Optional[RDMALoopbackContext] = None
+        # Multi-NIC contexts for request_striping
+        self._rdma_ctxs: List[RDMALoopbackContext] = []
+        self._landing_stagings: List[torch.Tensor] = []
 
         super().__init__(
             device_pool=device_pool,
@@ -259,9 +316,8 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
 
     def init_kv_buffer(self):
-        """Allocate host pool (layer-first) + remote buffer (page-first) + landing staging."""
+        """Allocate host pool (layer-first) + remote buffer (page-first) + landing staging(s)."""
         buffer = super().init_kv_buffer()
-        # buffer (kv_buffer) shape: [layer_num, num_tokens, 1, kv_cache_dim]
 
         # remote_buffer: page-first layout [num_tokens, layer_num, 1, kv_cache_dim]
         self.remote_buffer = torch.empty(
@@ -270,18 +326,25 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             pin_memory=True,
         )
 
-        # landing_staging: page-first, sized for one request's max KV
-        # shape: [max_seq_len, layer_num, 1, kv_cache_dim]
-        bytes_per_token = self.layer_num * self.kv_cache_dim * self.dtype.itemsize
-        staging_bytes = self.max_seq_len * bytes_per_token
+        remote_ptr = self.remote_buffer.data_ptr()
+        remote_size = self.remote_buffer.numel() * self.remote_buffer.element_size()
+
+        if self.mode == "request_striping" and len(self._striping_ib_devs) > 1:
+            self._init_striping_contexts(remote_ptr, remote_size)
+        else:
+            self._init_single_context(remote_ptr, remote_size)
+
+        return buffer
+
+    def _init_single_context(
+        self, remote_ptr: int, remote_size: int
+    ) -> None:
+        """rank_interleave: one landing_staging, one RDMA context."""
         self.landing_staging = torch.empty(
             (self.max_seq_len, self.layer_num, 1, self.kv_cache_dim),
             dtype=self.dtype,
             pin_memory=True,
         )
-
-        remote_ptr = self.remote_buffer.data_ptr()
-        remote_size = self.remote_buffer.numel() * self.remote_buffer.element_size()
         landing_ptr = self.landing_staging.data_ptr()
         landing_size = self.landing_staging.numel() * self.landing_staging.element_size()
 
@@ -295,23 +358,89 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             )
         except RuntimeError as e:
             logger.warning(
-                "RDMA loopback init failed (%s), falling back to simulation mode",
-                e,
+                "RDMA loopback init failed (%s), falling back to simulation mode", e
             )
             self._rdma_ctx = None
 
         logger.info(
-            "RDMA host pool (page-first remote): tp_rank=%d, ib_dev=%s, "
-            "local_ratio=%.2f, remote_buffer=%.2f GB (page-first), "
+            "RDMA host pool (rank_interleave): tp_rank=%d, ib_dev=%s, "
+            "local_ratio=%.2f, remote_buffer=%.2f GB, "
             "landing_staging=%.2f GB, rdma_available=%s",
-            self.tp_rank,
-            self.ib_dev,
-            self.local_ratio,
-            remote_size / 1e9,
-            landing_size / 1e9,
+            self.tp_rank, self.ib_dev, self.local_ratio,
+            remote_size / 1e9, landing_size / 1e9,
             self._rdma_ctx is not None,
         )
-        return buffer
+
+    def _init_striping_contexts(
+        self, remote_ptr: int, remote_size: int
+    ) -> None:
+        """request_striping: one RDMA context + one landing_staging per NIC."""
+        num_nics = len(self._striping_ib_devs)
+
+        # Each shard handles at most ceil(max_seq_len / num_nics) tokens
+        shard_max_tokens = (self.max_seq_len + num_nics - 1) // num_nics
+
+        # Allocate one contiguous landing buffer for all shards so each
+        # sub-region can be registered as the local MR for one NIC context.
+        # Total shape: [num_nics * shard_max_tokens, layer_num, 1, kv_cache_dim]
+        total_staging = torch.empty(
+            (num_nics * shard_max_tokens, self.layer_num, 1, self.kv_cache_dim),
+            dtype=self.dtype,
+            pin_memory=True,
+        )
+
+        bytes_per_token = self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+        shard_staging_size = shard_max_tokens * bytes_per_token
+
+        # Also keep a single landing_staging for the fallback single-NIC path
+        self.landing_staging = total_staging[:self.max_seq_len]
+
+        self._rdma_ctxs = []
+        self._landing_stagings = []
+        self._shard_max_tokens = shard_max_tokens
+
+        for i, ib_dev in enumerate(self._striping_ib_devs):
+            shard_staging = total_staging[
+                i * shard_max_tokens : (i + 1) * shard_max_tokens
+            ]
+            self._landing_stagings.append(shard_staging)
+
+            landing_ptr = shard_staging.data_ptr()
+            try:
+                ctx = RDMALoopbackContext(
+                    ib_dev=ib_dev,
+                    remote_buf_ptr=remote_ptr,
+                    remote_buf_size=remote_size,
+                    landing_buf_ptr=landing_ptr,
+                    landing_buf_size=shard_staging_size,
+                )
+                self._rdma_ctxs.append(ctx)
+            except RuntimeError as e:
+                logger.warning(
+                    "RDMA striping context init failed for %s (%s), "
+                    "falling back to %d contexts",
+                    ib_dev, e, len(self._rdma_ctxs),
+                )
+                break
+
+        # Fallback single context for short sequences
+        if self._rdma_ctxs:
+            self._rdma_ctx = self._rdma_ctxs[0]
+        else:
+            self._rdma_ctx = None
+
+        logger.info(
+            "RDMA host pool (request_striping): tp_rank=%d, ib_devs=%s, "
+            "active_nics=%d, shard_max_tokens=%d, local_ratio=%.2f, "
+            "remote_buffer=%.2f GB, total_staging=%.2f GB",
+            self.tp_rank,
+            self._striping_ib_devs,
+            len(self._rdma_ctxs),
+            shard_max_tokens,
+            self.local_ratio,
+            remote_size / 1e9,
+            total_staging.numel() * total_staging.element_size() / 1e9,
+        )
 
     def mark_request_locality(self, req_pool_idx: int) -> bool:
         """Determine if a request is local or remote based on local_ratio.
@@ -358,6 +487,9 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         Works for both cold path (after simulate_remote_write) and warm path
         (prefix KV already in remote_buffer from a previous round).
         Local requests skip entirely.  Returns RDMA transfer time in µs.
+
+        Dispatches to striped multi-NIC path when mode=request_striping and
+        the sequence is long enough to benefit.
         """
         if req_pool_idx not in self._remote_reqs:
             return 0.0
@@ -366,30 +498,35 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         if valid.numel() == 0:
             return 0.0
 
+        # Dispatch to striped path if applicable
+        num_tokens = valid.numel()
+        if (
+            self.mode == "request_striping"
+            and len(self._rdma_ctxs) > 1
+            and num_tokens >= self.min_tokens_per_rnic
+        ):
+            return self._prefetch_for_decode_striped(req_pool_idx, valid)
+
+        return self._prefetch_for_decode_single(req_pool_idx, valid)
+
+    def _prefetch_for_decode_single(
+        self, req_pool_idx: int, valid: torch.Tensor
+    ) -> float:
+        """Single-NIC prefetch path (rank_interleave or short sequence fallback)."""
         valid_cpu = valid.cpu()
         num_tokens = valid_cpu.numel()
         bytes_per_token = self.layer_num * self.kv_cache_dim * self.dtype.itemsize
         total_bytes = num_tokens * bytes_per_token
 
-        # Step 1: Copy remote_buffer[valid slots] → landing_staging[:num_tokens]
-        #         (contiguous page-first block ready for RDMA)
-        #         In a real system, this data is already contiguous at the remote
-        #         side; here we just ensure the staging region is packed.
         self.landing_staging[:num_tokens] = self.remote_buffer[valid_cpu]
 
-        # Step 2: Bulk RDMA READ (landing_staging as both src and dst via loopback,
-        #         simulating the NIC transfer latency for total_bytes)
         if self._rdma_ctx is not None:
             rdma_us = self._rdma_ctx.bulk_read(total_bytes)
         else:
             t0 = time.monotonic()
-            # Simulation: data is already in landing_staging, just measure time
             torch.cuda.synchronize() if torch.cuda.is_available() else None
             rdma_us = (time.monotonic() - t0) * 1e6
 
-        # Step 3: Transpose + scatter: landing_staging (page-first) → kv_buffer (layer-first)
-        # landing_staging[:num_tokens] shape: [num_tokens, layer_num, 1, kv_dim]
-        # → permute to [layer_num, num_tokens, 1, kv_dim] → scatter into kv_buffer slots
         t_transpose_start = time.monotonic()
         src = self.landing_staging[:num_tokens].permute(1, 0, 2, 3).contiguous()
         self.kv_buffer[:, valid_cpu] = src
@@ -401,14 +538,119 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         self._rdma_stats["prefetch_count"] += 1
 
         logger.debug(
-            "RDMA prefetch (bulk+transpose): req=%d, tokens=%d, ib_dev=%s, "
+            "RDMA prefetch single-NIC: req=%d, tokens=%d, ib_dev=%s, "
             "rdma=%.1f us, transpose=%.1f us, total=%.1f us (%.2f MB)",
-            req_pool_idx,
-            num_tokens,
-            self.ib_dev,
+            req_pool_idx, num_tokens, self.ib_dev,
+            rdma_us, transpose_us, rdma_us + transpose_us,
+            total_bytes / 1e6,
+        )
+        return rdma_us
+
+    def _prefetch_for_decode_striped(
+        self, req_pool_idx: int, valid: torch.Tensor
+    ) -> float:
+        """Multi-NIC striped prefetch: split tokens across NICs, parallel RDMA READ.
+
+        Steps:
+          1. Determine shard count S = min(num_ctxs, ceil(num_tokens / min_tokens_per_rnic))
+          2. Split valid host_indices into S contiguous token ranges
+          3. Pack each shard's page-first data into remote_buffer (already done by simulate_remote_write)
+          4. Copy each shard's remote_buffer region into its per-NIC landing_staging
+          5. Parallel bulk RDMA READ across S NICs (threads release GIL in C)
+          6. Per-shard transpose/scatter from landing_staging (page-first) → kv_buffer (layer-first)
+        """
+        valid_cpu = valid.cpu()
+        num_tokens = valid_cpu.numel()
+        num_ctxs = len(self._rdma_ctxs)
+        bytes_per_token = self.layer_num * self.kv_cache_dim * self.dtype.itemsize
+
+        # Determine actual shard count
+        num_shards = min(
+            num_ctxs,
+            max(1, (num_tokens + self.min_tokens_per_rnic - 1) // self.min_tokens_per_rnic),
+        )
+        if num_shards <= 1:
+            return self._prefetch_for_decode_single(req_pool_idx, valid)
+
+        # Split token indices into shards (contiguous ranges)
+        shard_size = (num_tokens + num_shards - 1) // num_shards
+        shard_ranges = []  # (start, end) indices into valid_cpu
+        for s in range(num_shards):
+            start = s * shard_size
+            end = min(start + shard_size, num_tokens)
+            if start < end:
+                shard_ranges.append((start, end))
+        num_shards = len(shard_ranges)
+
+        # Step 1: Pack each shard's page-first data into its landing_staging
+        for s, (start, end) in enumerate(shard_ranges):
+            shard_indices = valid_cpu[start:end]
+            shard_len = end - start
+            self._landing_stagings[s][:shard_len] = self.remote_buffer[shard_indices]
+
+        # Step 2: Parallel RDMA bulk READ across NICs.
+        # Each NIC reads from its own landing_staging (which serves as both
+        # the packed source and the RDMA local MR destination via loopback).
+        rdma_results: List[float] = [0.0] * num_shards
+        errors: List[Optional[Exception]] = [None] * num_shards
+
+        def _shard_rdma_read(shard_idx: int, shard_len: int) -> None:
+            try:
+                total = shard_len * bytes_per_token
+                ctx = self._rdma_ctxs[shard_idx]
+                rdma_results[shard_idx] = ctx.bulk_read(total)
+            except Exception as e:
+                errors[shard_idx] = e
+
+        threads = []
+        for s, (start, end) in enumerate(shard_ranges):
+            t = threading.Thread(
+                target=_shard_rdma_read, args=(s, end - start)
+            )
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        for s, err in enumerate(errors):
+            if err is not None:
+                logger.warning(
+                    "RDMA striped shard %d failed: %s, falling back to single-NIC",
+                    s, err,
+                )
+                return self._prefetch_for_decode_single(req_pool_idx, valid)
+
+        rdma_us = max(rdma_results)
+
+        # Step 3: Per-shard transpose/scatter from landing_staging → kv_buffer
+        t_transpose_start = time.monotonic()
+        for s, (start, end) in enumerate(shard_ranges):
+            shard_len = end - start
+            shard_indices = valid_cpu[start:end]
+            src = (
+                self._landing_stagings[s][:shard_len]
+                .permute(1, 0, 2, 3)
+                .contiguous()
+            )
+            self.kv_buffer[:, shard_indices] = src
+        t_transpose_end = time.monotonic()
+        transpose_us = (t_transpose_end - t_transpose_start) * 1e6
+
+        total_bytes = num_tokens * bytes_per_token
+        self._rdma_stats["total_prefetch_us"] += rdma_us
+        self._rdma_stats["total_transpose_us"] += transpose_us
+        self._rdma_stats["prefetch_count"] += 1
+
+        logger.debug(
+            "RDMA prefetch striped: req=%d, tokens=%d, shards=%d, "
+            "ib_devs=%s, rdma_max=%.1f us [%s], transpose=%.1f us, "
+            "total=%.1f us (%.2f MB)",
+            req_pool_idx, num_tokens, num_shards,
+            [self._striping_ib_devs[i] for i in range(num_shards)],
             rdma_us,
-            transpose_us,
-            rdma_us + transpose_us,
+            ", ".join(f"{r:.1f}" for r in rdma_results[:num_shards]),
+            transpose_us, rdma_us + transpose_us,
             total_bytes / 1e6,
         )
         return rdma_us
@@ -420,6 +662,8 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
     def get_rdma_stats(self) -> Dict[str, float]:
         """Return accumulated RDMA prefetch statistics."""
         stats = dict(self._rdma_stats)
+        stats["mode"] = self.mode  # type: ignore[assignment]
+        stats["num_nics"] = len(self._rdma_ctxs) if self._rdma_ctxs else (1 if self._rdma_ctx else 0)
         if stats["prefetch_count"] > 0:
             stats["avg_prefetch_us"] = (
                 stats["total_prefetch_us"] / stats["prefetch_count"]
@@ -430,5 +674,10 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         return stats
 
     def __del__(self):
-        if self._rdma_ctx is not None:
+        if self._rdma_ctxs:
+            for ctx in self._rdma_ctxs:
+                ctx.destroy()
+            self._rdma_ctxs = []
+            self._rdma_ctx = None
+        elif self._rdma_ctx is not None:
             self._rdma_ctx.destroy()

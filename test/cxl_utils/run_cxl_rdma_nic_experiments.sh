@@ -99,8 +99,10 @@ RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results_cxl_rdma_nic_${TIMESTAMP}}"
 # Context lengths (tokens): 16k / 32k / 64k / 128k
 CONTEXT_LENGTHS=(16384 32768 65536 131072)
 
-# Scheme order: CXL single, CXL interleave×2, RDMA 1-NIC, 2-NIC (local0 + local50), 4-NIC, 8-NIC
-SCHEMES=(cxl cxl_interleave_2 rdma_1nic_local0 rdma_2nic_local0 rdma_2nic_local50 rdma_4nic_local0 rdma_8nic_local0)
+# Scheme order: CXL single, CXL interleave×2,
+#   rank_interleave RDMA 1/2/4/8 NIC,
+#   request_striping RDMA 2/4/8 NIC
+SCHEMES=(cxl cxl_interleave_2 rdma_1nic_local0 rdma_2nic_local0 rdma_2nic_local50 rdma_4nic_local0 rdma_8nic_local0 rdma_stripe_2nic_local0 rdma_stripe_4nic_local0 rdma_stripe_8nic_local0)
 
 # --- HiSparse JSON builders ---
 # CXL single device: dev_path + map_bytes (consistent with run_all_experiments.sh)
@@ -113,6 +115,7 @@ build_hisparse_cxl_interleave_2() {
   printf '%s' '{"top_k":2048,"device_buffer_size":4096,"cxl":{"enabled":true,"dev_paths":["'"${CXL_DEV_PATH}"'","'"${CXL_DEV_PATH_2}"'"],"map_bytes_per_device":'"${CXL_MAP_BYTES_PER_DEVICE}"'}}'
 }
 
+# rank_interleave RDMA (backward-compatible, tp_rank % num_nics)
 build_hisparse_rdma() {
   local num_nics="$1"
   local local_ratio="${2:-0.0}"
@@ -122,6 +125,19 @@ build_hisparse_rdma() {
     devs_json+='"'"${ALL_IB_DEVS[$i]}"'"'
   done
   printf '%s' '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":'"${local_ratio}"',"ib_devs":['"${devs_json}"']}}'
+}
+
+# request_striping RDMA (single request → multiple NICs in parallel)
+build_hisparse_rdma_striping() {
+  local num_nics="$1"
+  local local_ratio="${2:-0.0}"
+  local min_tokens_per_rnic="${3:-8192}"
+  local devs_json=""
+  for ((i = 0; i < num_nics; i++)); do
+    if [[ $i -gt 0 ]]; then devs_json+=","; fi
+    devs_json+='"'"${ALL_IB_DEVS[$i]}"'"'
+  done
+  printf '%s' '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":'"${local_ratio}"',"ib_devs":['"${devs_json}"'],"mode":"request_striping","max_rnics_per_request":'"${num_nics}"',"min_tokens_per_rnic":'"${min_tokens_per_rnic}"'}}'
 }
 
 # --- CLI overrides ---
@@ -221,13 +237,16 @@ start_server_for_scheme() {
   local log_file="$2"
   local cfg=""
   case "${scheme}" in
-    cxl)                cfg="$(build_hisparse_cxl)" ;;
-    cxl_interleave_2)   cfg="$(build_hisparse_cxl_interleave_2)" ;;
-    rdma_1nic_local0)   cfg="$(build_hisparse_rdma 1 0.0)" ;;
-    rdma_2nic_local0)   cfg="$(build_hisparse_rdma 2 0.0)" ;;
-    rdma_2nic_local50)  cfg="$(build_hisparse_rdma 2 0.5)" ;;
-    rdma_4nic_local0)   cfg="$(build_hisparse_rdma 4 0.0)" ;;
-    rdma_8nic_local0)   cfg="$(build_hisparse_rdma 8 0.0)" ;;
+    cxl)                    cfg="$(build_hisparse_cxl)" ;;
+    cxl_interleave_2)       cfg="$(build_hisparse_cxl_interleave_2)" ;;
+    rdma_1nic_local0)       cfg="$(build_hisparse_rdma 1 0.0)" ;;
+    rdma_2nic_local0)       cfg="$(build_hisparse_rdma 2 0.0)" ;;
+    rdma_2nic_local50)      cfg="$(build_hisparse_rdma 2 0.5)" ;;
+    rdma_4nic_local0)       cfg="$(build_hisparse_rdma 4 0.0)" ;;
+    rdma_8nic_local0)       cfg="$(build_hisparse_rdma 8 0.0)" ;;
+    rdma_stripe_2nic_local0)  cfg="$(build_hisparse_rdma_striping 2 0.0)" ;;
+    rdma_stripe_4nic_local0)  cfg="$(build_hisparse_rdma_striping 4 0.0)" ;;
+    rdma_stripe_8nic_local0)  cfg="$(build_hisparse_rdma_striping 8 0.0)" ;;
     *) echo "Unknown scheme: ${scheme}"; return 1 ;;
   esac
 

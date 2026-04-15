@@ -347,6 +347,79 @@ double rdma_bulk_read(struct rdma_context *rctx, size_t total_bytes) {
     return elapsed_us;
 }
 
+double rdma_bulk_read_offset(struct rdma_context *rctx,
+                             size_t remote_offset,
+                             size_t local_offset,
+                             size_t length) {
+    if (length == 0) return 0.0;
+
+    if (remote_offset + length > rctx->remote_size)
+        length = rctx->remote_size - remote_offset;
+    if (local_offset + length > rctx->local_size)
+        length = rctx->local_size - local_offset;
+
+    const size_t MAX_CHUNK = 1 * 1024 * 1024;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    size_t done = 0;
+    int signal_interval = 16;
+    int wr_count = 0;
+
+    while (done < length) {
+        size_t chunk = length - done;
+        if (chunk > MAX_CHUNK) chunk = MAX_CHUNK;
+
+        wr_count++;
+        int do_signal = (wr_count % signal_interval == 0) ||
+                        (done + chunk >= length);
+
+        struct ibv_sge sge;
+        sge.addr   = (uint64_t)(uintptr_t)rctx->local_buf + local_offset + done;
+        sge.length = (uint32_t)chunk;
+        sge.lkey   = rctx->local_mr->lkey;
+
+        struct ibv_send_wr wr;
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id      = (uint64_t)wr_count;
+        wr.sg_list    = &sge;
+        wr.num_sge    = 1;
+        wr.opcode     = IBV_WR_RDMA_READ;
+        wr.send_flags = do_signal ? IBV_SEND_SIGNALED : 0;
+        wr.wr.rdma.remote_addr = rctx->remote_addr + remote_offset + done;
+        wr.wr.rdma.rkey        = rctx->remote_rkey;
+
+        struct ibv_send_wr *bad_wr = NULL;
+        int ret = ibv_post_send(rctx->qp, &wr, &bad_wr);
+        if (ret) {
+            fprintf(stderr, "rdma_bulk_read_offset: ibv_post_send failed at done=%zu: %s\n",
+                    done, strerror(ret));
+            return -1.0;
+        }
+
+        done += chunk;
+
+        if (do_signal) {
+            struct ibv_wc wc;
+            int ne;
+            do {
+                ne = ibv_poll_cq(rctx->send_cq, 1, &wc);
+            } while (ne == 0);
+            if (ne < 0 || wc.status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "rdma_bulk_read_offset: CQ poll error, status=%d\n",
+                        ne < 0 ? -1 : (int)wc.status);
+                return -1.0;
+            }
+        }
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double elapsed_us = (double)(t1.tv_sec - t0.tv_sec) * 1e6 +
+                        (double)(t1.tv_nsec - t0.tv_nsec) / 1e3;
+    return elapsed_us;
+}
+
 void rdma_destroy(struct rdma_context *rctx) {
     if (!rctx) return;
     if (rctx->qp)       ibv_destroy_qp(rctx->qp);

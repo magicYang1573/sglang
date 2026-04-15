@@ -150,7 +150,7 @@ Phase 2: CXL 后端集成                                       ← Week 2 前�
   └─ 验证 CXL host pool + prefix cache 端到端正确性
      ↓
 Phase 3: RDMA 后端 + Benchmark 脚本                         ← Week 2-3
-  ├─ rdma_memory_pool.py（新增，gather→bulk RDMA→scatter 模式）
+  ├─ rdma_memory_pool.py（新增，page-first 远端 → bulk RDMA → transpose/scatter 模式）
   ├─ rdma_scatter_read.c/.h/_py.cpp bulk read + 多实例扩展
   ├─ coordinator 后端选择逻辑
   └─ e2e_bench.py 两轮实验自动化
@@ -195,7 +195,7 @@ CXL host pool（`cxl_memory_pool.py`）已实现且与 HiSparse 集成完毕。P
 
 | 文件                              | 改动量        | 说明                                       |
 | ------------------------------- | ---------- | ---------------------------------------- |
-| `rdma_memory_pool.py`（新增）       | ~300 行     | RDMA host pool（gather→bulk RDMA→scatter + local/remote 分层） |
+| `rdma_memory_pool.py`（新增）       | ~300 行     | RDMA host pool（page-first 远端 → bulk RDMA → transpose/scatter + local/remote 分层） |
 | `hisparse_coordinator.py`       | ~40 行      | 后端选择 + decode prefetch + cleanup           |
 | `factory.py` + `SparseConfig`   | ~15 行      | rdma_pool JSON 解析 + 互斥校验                   |
 | `model_runner.py`               | ~2 行       | 传递 rdma_config                            |
@@ -212,7 +212,7 @@ CXL host pool（`cxl_memory_pool.py`）已实现且与 HiSparse 集成完毕。P
 | ----------- | ---------- | ------- | ----------------------------------------------- |
 | **Phase 1** | **~150 行** | ~150 行  | HiSparse + radix cache 兼容，prefix-hit 跳过 prefill |
 | Phase 2     | ~0 行       | ~150 行  | CXL 端到端验证                                       |
-| Phase 3     | ~920 行     | ~1070 行 | RDMA 后端（gather→bulk→scatter）+ 多样化 e2e benchmark + 实验自动化 |
+| Phase 3     | ~920 行     | ~1070 行 | RDMA 后端（page-first 远端 → bulk → transpose/scatter）+ 多样化 e2e benchmark + 实验自动化 |
 | Phase 4     | ~0 行       | ~1070 行 | 完整实验数据                                          |
 
 
@@ -480,7 +480,7 @@ Radix cache eviction（`RadixCache.evict()`）只释放 GPU 侧资源：调用 `
 
 | 模块                 | 新代码量       | 修改/新增                           | 说明                                       |
 | ------------------ | ---------- | ------------------------------- | ---------------------------------------- |
-| **RDMA Host Pool** | ~300 行     | 新增 `rdma_memory_pool.py`        | 方案 B 核心：gather→bulk RDMA→scatter + 本地缓存分层 |
+| **RDMA Host Pool** | ~300 行     | 新增 `rdma_memory_pool.py`        | 方案 B 核心：page-first 远端 → bulk RDMA → transpose/scatter + 本地缓存分层 |
 | **Coordinator 适配** | ~40 行      | 修改 `hisparse_coordinator.py`    | 根据配置选择 A/B/C 后端 + decode prefetch + cleanup |
 | **Config 扩展**      | ~15 行      | 修改 `factory.py` + `SparseConfig` | rdma_pool JSON 解析 + 互斥校验                   |
 | **ModelRunner**     | ~2 行       | 修改 `model_runner.py`           | 传递 rdma_config                            |
@@ -550,7 +550,7 @@ Round 2 (Warm, prefix cache hit, remote 请求):
 
 **修改文件**：`python/sglang/srt/managers/hisparse_coordinator.py`
 
-- **`__init__`**：`hisparse_config["rdma_pool"]` 存在且启用时构造 `RDMAMLATokenToKVPoolHost`（并传入 `rdma_config`；多网卡时另传 `tp_rank`，见 §9），否则保持现有 DRAM / CXL 分支。
+- **`__init__`**：`hisparse_config["rdma_pool"]` 存在且启用时构造 `RDMAMLATokenToKVPoolHost`（并传入 `rdma_config`；多网卡与请求级 striping 见 §9），否则保持现有 DRAM / CXL 分支。
 
 - **`admit_request_into_staging`（Cold 路径）**：在 staging DMA 完成后、请求加入 `ack_staging_queue` 之前，若请求被判为 remote 且 **不是** prefix cache hit（即走的是 Cold-start 分支），调用 `simulate_remote_write` 将 KV 写入 `remote_buffer`。**Prefix-hit 路径不调用 `simulate_remote_write`**——prefix 部分的 KV 已在 Round 1 的 cold-start 时写入了 `remote_buffer`。
 
@@ -685,7 +685,7 @@ remote_buffer (page-first, 连续)  ---bulk RDMA READ (loopback)--->  landing_st
 - 从 `landing_staging` 按 token 遍历，将每个 token 的各层 KV 分别写回 `kv_buffer[layer, slot]`
 - 等价于 `kv_buffer[:, slot_idx, :, :] = landing_staging[token_idx, :, :, :]`（反向 transpose）
 
-这两个转换都是 **CPU 内存操作**（pinned DRAM 间拷贝），延迟主要由 **总字节数 / DRAM 带宽** 决定。对于 32K tokens × 61 layers × 656B ≈ 1.2 GB 数据量，预期耗时约 **几毫秒到十几毫秒**，通常小于 RDMA 传输本身。
+这两个转换都是 **CPU 内存操作**（pinned DRAM 间拷贝），延迟主要由 **总字节数 / DRAM 带宽** 决定。对于 32K tokens × 61 layers × 656B ≈ 1.2 GB 数据量，预期耗时约 **几毫秒到十几毫秒**。在 loopback / 本机 DRAM 场景下，这部分开销**不一定总是显著小于** RDMA 传输本身，是否需要进一步优化应以 `rdma_us` / `transpose_us` 实测为准。
 
 ### 6.4 `local_ratio` 与触发时机
 
@@ -799,6 +799,8 @@ Round 2 (N 个请求，warm start):
 | **E2E Latency** | 整体请求延迟 | 综合指标 |
 | **Throughput** | output_tokens / wall_time | 系统吞吐 |
 
+> 注：评估 §9 `request_striping` 时，建议同时记录 **TTFT**、`get_rdma_stats()` 中的 **prefetch / transpose** 分项，以及（若接入）**单次 striped prefetch 的 wall time**，避免单一指标掩盖预取段变化。
+
 ### 8.3 完整流程
 
 ```bash
@@ -855,20 +857,13 @@ bash test/cxl_utils/run_all_experiments.sh \
 
 ---
 
-## 9. 多网卡 RDMA Interleave 全量预取设计
+## 9. 多网卡 RDMA：请求级分片与 RNIC 聚合（设计方案）
 
-### 9.1 动机与目标
+### 9.1 设计目标
 
-现有方案 B（RDMA 分布式池）使用**单张网卡**（如 `mlx5_0`）通过 loopback 模拟全量 KV Cache 预取。单网卡带宽上限约 25 GB/s（200Gbps HDR），对于大序列长度（如 32K tokens × 61 layers × 656 bytes ≈ 1.2 GB），单次 RDMA 预取延迟约 **48 ms**。
-
-即使增加网卡数量聚合带宽，KV Cache 全量搬运仍然可能受限于 **PCIe Root Complex (RC) 或 PCIe Switch 的共享带宽上限**（通常 64~128 GB/s）。多网卡的 RDMA READ 最终都要写入同一台机器的 DRAM，这是一个**不可绕过的硬件瓶颈**。
-
-**本设计的目标**：
-
-1. 真实调用本机 `mlx5_0` ~ `mlx5_7`，每个 rank 独占一张网卡进行 loopback 全量预取
-2. 所有网卡的 RDMA READ 结果**真实写入 DRAM**（非模拟），暴露 PCIe RC/Switch 的真实带宽瓶颈
-3. 通过 `--hisparse-config` 中的 `ib_devs` 列表手动控制使用几张网卡，对比不同网卡数下的预取延迟
-4. 按 DPA rank 对网卡做 interleave（`rank % len(ib_devs)` 选择网卡），与 CXL 多设备 interleave 策略对齐
+- **主目标**：在 remote 全量 prefetch 路径上，使**单请求**能够并行占用多张 RNIC，缩短预取关键路径上的传输时间。
+- **并存模式**：保留可选的 **`rank_interleave`**（`ib_devs[tp_rank % len(ib_devs)]`，每 rank 绑定一张 RNIC、单请求仍走单卡）；本章重点描述新增的 **`request_striping`**（按 token 区间把同一请求拆到多张 RNIC 上并行 bulk read）。
+- **非目标**：不改动 HiSparse decode 主循环与 swap-in 语义；仅在进入 decode 前的 prefetch 阶段增强并行度。
 
 ### 9.2 硬件拓扑与瓶颈分析
 
@@ -896,106 +891,156 @@ G0~G7 = GPU (H20), N0~N7 = NIC (mlx5_0 ~ mlx5_7)
 | PCIe RC (4 NIC 共享) | ~64 GB/s | 同 Socket 到 DRAM 的路径 |
 | 双 Socket UPI | ~128 GB/s | 跨 Socket 时的 UPI 总线 |
 
-**推论**：即使 8 张网卡理论聚合 200 GB/s，实际写入 DRAM 的带宽受限于 PCIe RC（~64 GB/s per socket），全量预取延迟下界约 **9~10 ms**，而非理论的 6 ms。实验将量化这一 sub-linear 的扩展效率。
+**推论**：即使 8 张网卡理论聚合 200 GB/s，实际写入 DRAM 的带宽仍受 PCIe RC / Switch / NUMA 路径约束，**扩展效率应为 sub-linear**；`request_striping` 的设计目标是在该物理上限内尽量吃满多 RNIC 的并行度。
 
-### 9.3 按 DPA Rank 的网卡分配策略
+### 9.3 Request-level striping：单请求多 RNIC 并行预取
 
-与 CXL 多设备 interleave（`cxl_hisparse_design_doc.md` 第 8 章）完全对齐，采用**每 rank 独占一张网卡**的策略：
+#### 9.3.1 核心思路
 
-```
-DPA 配置: --tp 8 --dp 8 --enable-dp-attention
-每个 rank 是独立 DP group，KV Cache 互不相同
+利用远端 page-first 布局：
 
-网卡分配: ib_dev = ib_devs[tp_rank % len(ib_devs)]
-
-示例 (ib_devs=["mlx5_0",.."mlx5_7"], 8 rank):
-  rank 0 → mlx5_0    rank 4 → mlx5_4
-  rank 1 → mlx5_1    rank 5 → mlx5_5
-  rank 2 → mlx5_2    rank 6 → mlx5_6
-  rank 3 → mlx5_3    rank 7 → mlx5_7
-
-示例 (ib_devs=["mlx5_0","mlx5_1"], 8 rank):
-  rank 0,2,4,6 → mlx5_0   (4 rank 共享一张网卡)
-  rank 1,3,5,7 → mlx5_1
+```text
+remote_buffer[token, layer, ...]
 ```
 
-**每个 rank 使用且仅使用一张网卡**，通过 `ib_devs` 列表长度手动控制实际参与的网卡数量。网卡数越多，各 rank 间的带宽竞争越少，但同时多张 NIC 同时向 DRAM 写入也会加剧 PCIe RC 竞争。
+同一请求的 token 区间天然适合按 **token range** 分片。对长度为 `N` 的 remote 请求，可把其 KV 划成 `S` 个 shard：
 
-### 9.4 C / pybind 层：多实例 RDMA Context
+- shard 0: tokens `[0, n0)`
+- shard 1: tokens `[n0, n1)`
+- ...
+- shard S-1: tokens `[n_{S-1}, N)`
 
-现有 `rdma_scatter_read_py.cpp` 若仍为**全局单例** `g_ctx`，多 rank（DPA）并发时各 rank 需独立 **QP/MR**。底层 C 已有 **`rdma_init_loopback` / `rdma_bulk_read` / `rdma_destroy`** 且以 `struct rdma_context*` 为句柄时，**.c/.h 可不改**，仅在 pybind 侧增加**可实例化**的上下文类（如 `RDMAContext`）：`init(ib_dev, local_ptr, local_size, remote_ptr, remote_size)` 对应 landing/gather 两块 staging 的注册地址，`bulk_read` 内释放 GIL 调用 `rdma_bulk_read`，析构时 `rdma_destroy`。与现有单例导出 API **并存**即可。
+每个 shard：
 
-### 9.5 Python 层集成
+- 绑定一张 RNIC / 一个 RDMA context / 一个 QP
+- 独立发起 bulk RDMA READ
+- 独立落到自己的 `landing_staging_shard`
+- 独立完成 page-first → layer-first 的局部 transpose/scatter
 
-#### 9.5.1 `rdma_memory_pool.py`
+这样，多 RNIC 才能缩短**单请求关键路径**。
 
-- 从 `rdma_config` 读取 **`ib_devs`**（列表）或回退 **`ib_dev`**（单卡）；若存在 `ib_devs`，则 **`self.ib_dev = ib_devs[tp_rank % len(ib_devs)]`**，与 CXL 多设备 interleave 对齐。
-- 每个 **TP/DP rank** 在 `init_kv_buffer` 里为 **本 rank 选中的网卡** 创建 **独立** pybind 上下文，并注册 **gather_staging / landing_staging**（逻辑同 §5.2，仍为小块连续缓冲）。
-- `prefetch_for_decode` 流程不变：gather → 本 rank 的 `bulk_read` → scatter。
+#### 9.3.2 建议的数据流
 
-#### 9.5.2 Coordinator
+```text
+request KV in remote_buffer (page-first)
+    ├─ shard 0 ──bulk_read on NIC 0──> landing_staging_0 ──transpose/scatter──> kv_buffer[:, slots_0]
+    ├─ shard 1 ──bulk_read on NIC 1──> landing_staging_1 ──transpose/scatter──> kv_buffer[:, slots_1]
+    ├─ shard 2 ──bulk_read on NIC 2──> landing_staging_2 ──transpose/scatter──> kv_buffer[:, slots_2]
+    └─ ...
+```
 
-构造 `RDMAMLATokenToKVPoolHost` 时传入当前 rank 的 **`tp_rank`**（或等价 rank id），以便 pool 内选择 `ib_devs[i]`；其余 coordinator 钩子与 §5.3 相同。
+相比 **rank 仅绑定单张 RNIC、单请求只走一张卡** 的路径，这里是**同一请求内部并行占用多张 RNIC**。
+
+#### 9.3.3 page-first 与分片天然对齐
+
+page-first 下同一 token 的所有层连续，按 token 范围切 shard 时：
+
+- 每个 shard 在远端地址上仍是**连续区间**
+- 每张 RNIC 看到的仍是 bulk READ，而不是离散 scatter
+- 不需要额外的 per-token gather
+
+也就是说，`page-first` 远端布局使 **request-level striping 可以直接在连续地址上完成**，是分片并行读的理想前提。
+
+### 9.4 本地重排分片与 overlap
+
+如果只把 RDMA READ 拆成多 NIC，但最终仍由一个线程串行做整段 transpose/scatter，则本地重排会成为新的瓶颈。因此建议同时做以下优化：
+
+1. **每个 shard 独立 transpose/scatter**  
+   每个 RNIC 对应自己的 `landing_staging_shard`，读完后只写自己负责的 slot 范围，减少单点串行 copy。
+
+2. **双缓冲 / 流水 overlap**  
+   当 shard A 还在 RDMA READ 时，CPU 可以开始处理 shard B 的 transpose/scatter；或当请求 i 的 shard 在转置时，请求 i+1 的 shard 已开始 RDMA。  
+   目标是 overlap：
+   - RNIC 传输
+   - CPU transpose/scatter
+   - device buffer 准备
+
+3. **尽量保持 slot 连续性**  
+   若 allocator 能尽量为一个请求分配连续 host slot，则 RDMA 与本地 scatter 都更容易接近大块顺序访问。
+
+### 9.5 Python / C 层改造要点
+
+#### 9.5.1 C / pybind 层
+
+在已实现的可实例化 `RDMAContext` / `RDMAContextHandle` 基础上扩展为**每 RNIC 一实例**，使单次 prefetch 可同时挂多个 QP。建议：
+
+- 为 `ib_devs` 中每张参与 striping 的 RNIC 维护独立 `RDMAContextHandle`
+- `bulk_read` 支持指定 **remote offset / local offset / length**（同一 MR 内子区间 READ）
+- 在 pybind 内释放 GIL，允许多个 shard **并行**发起与等待 completion
+
+#### 9.5.2 `rdma_memory_pool.py`
+
+新增/区分两种 `rdma_pool.mode`：
+
+- **`rank_interleave`**：`ib_devs[tp_rank % len(ib_devs)]`；每个 rank 绑定一张 RNIC，单请求预取只走该 rank 所选设备。
+- **`request_striping`**：单请求按 token 区间切 shard，并行占用多张 RNIC（shard 数 ≤ `max_rnics_per_request`）。
+
+建议新增接口与状态：
+
+- `self.rdma_handles: List[RDMAContextHandle]`（或与 `ib_devs` 对齐的句柄表）
+- `self.landing_stagings: List[Tensor]`（每 shard / 每 NIC 一块 page-first staging）
+- `prefetch_for_decode_striped(req_pool_idx, host_indices)`
+
+`prefetch_for_decode_striped()` 建议步骤：
+
+1. 根据序列长度、`ib_devs` 与 `max_rnics_per_request` 决定 shard 数 `S`
+2. 将 `host_indices` 切成 `S` 段连续 token 区间（若 slot 不连续，则按区间合并或回退到子块 READ）
+3. 对每个 shard 计算 `remote_buffer` 中的字节偏移与长度，并行 `bulk_read`
+4. 各 shard 在对应 `landing_staging_i` 上独立完成 page-first → layer-first 的局部 transpose/scatter，写回 `kv_buffer` 对应列
+5. **全部 shard 完成**后返回，再由 coordinator 进入 decode
+
+#### 9.5.3 Coordinator
+
+remote 请求仍在 **staging 完成 → 进入 decode 前** 调用一次预取；仅将调用点从 `prefetch_for_decode()` 切换为 **`prefetch_for_decode_striped()`**（由 `rdma_pool.mode` 决定），scheduler / HiSparse decode 主流程其余契约不变。
 
 ### 9.6 配置接口
 
-`hisparse-config` 的 `rdma_pool` 字段新增 `ib_devs` 列表，**手动控制参与的网卡数量**：
+`rdma_pool` 同时描述**可用 RNIC 集合**与**使用方式**：
 
 ```json
 {
     "rdma_pool": {
         "enabled": true,
         "local_ratio": 0.0,
-        "ib_devs": ["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3",
-                     "mlx5_4", "mlx5_5", "mlx5_6", "mlx5_7"]
+        "ib_devs": ["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3"],
+        "mode": "request_striping",
+        "max_rnics_per_request": 4,
+        "min_tokens_per_rnic": 8192
     }
 }
 ```
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `ib_dev` | string | 单网卡模式（向后兼容），所有 rank 共用同一张 NIC |
-| `ib_devs` | list | 多网卡模式；`rank % len(ib_devs)` 决定本 rank 使用哪张 NIC |
-| 优先级 | — | `ib_devs` 存在时忽略 `ib_dev` |
+| `ib_dev` | string | 单卡模式（向后兼容） |
+| `ib_devs` | list | 可用 RNIC 列表 |
+| `mode` | string | `rank_interleave` 或 `request_striping`（本方案主推荐） |
+| `max_rnics_per_request` | int | 单请求 striping 并行上限 |
+| `min_tokens_per_rnic` | int | 低于该阈值时不拆 shard，避免消息过碎 |
 
-**实验启动示例**：
+### 9.7 验证与实验矩阵（面向 striping）
 
-```bash
-# 1 张网卡 (所有 rank 共用 mlx5_0, 基线)
---hisparse-config '{"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0"]}}'
+1. **固定输入长度，扫描 `max_rnics_per_request`**：例如 32K / 64K / 128K tokens，`S ∈ {1,2,4,8}`，记录单次 `prefetch_for_decode_striped` 总耗时及 `get_rdma_stats()` 中分项。
+2. **固定 `S`，扫描 `ib_devs` 子集**：验证 shard 与物理 NIC 一一映射时的带宽与稳定性。
+3. **对比 `mode=rank_interleave` 与 `mode=request_striping`**：同硬件、同序列长度下，比较预取阶段 wall time 与 TTFT（客户端或 server 日志）。
+4. **可选**：在 `e2e_bench_fast.py` 中增加短输出子配置，使单次请求 wall time 更贴近 prefetch 段，便于自动化回归 striping 收益。
 
-# 2 张网卡 (rank 0,2,4,6 → mlx5_0; rank 1,3,5,7 → mlx5_1)
---hisparse-config '{"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1"]}}'
+### 9.8 预期与物理边界
 
-# 4 张网卡
---hisparse-config '{"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1","mlx5_2","mlx5_3"]}}'
+在 `request_striping` 生效且 shard 粒度合理时：
 
-# 8 张网卡 (每 rank 独占一张)
---hisparse-config '{"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1","mlx5_2","mlx5_3","mlx5_4","mlx5_5","mlx5_6","mlx5_7"]}}'
-```
+- 单请求 prefetch 的**传输段**应随并行 RNIC 数量增加而缩短，直至触及 **PCIe RC / Switch / NUMA / DRAM 写入**上限。
+- 扩展曲线仍为 **sub-linear**；当本地 transpose/scatter 成为瓶颈时，需依赖 §9.4 的分片与 overlap 继续压榨。
 
-### 9.7 实验矩阵与预期结论
-
-在原有 A / B-0 / B-30 / C 四方案基础上，新增多网卡子实验：
-
-| 方案 | `ib_devs` 长度 | rank 共享网卡数 | 预期瓶颈 |
-| --- | --- | --- | --- |
-| B-0-1nic | 1 | 8 rank 共用 1 NIC | NIC 线速（~25 GB/s） |
-| B-0-2nic | 2 | 4 rank 共用 1 NIC | PCIe Switch |
-| B-0-4nic | 4 | 2 rank 共用 1 NIC | PCIe RC |
-| B-0-8nic | 8 | 每 rank 独占 1 NIC | 双 Socket RC + UPI |
-
-**预期结论**：随 NIC 数量增多，单 rank 的预取延迟降低，但收益 sub-linear（PCIe RC/Switch 瓶颈）。即使 8 NIC 全独占（最优情况，~10 ms），与 CXL 的 sparse read（~2 ms）仍有约 5x 差距，从而有力支撑**全量 RDMA 预取即使配置充裕带宽仍劣于 CXL 按需读取**的核心论点。
-
-### 9.8 代码改动量
+### 9.9 代码改动量（估算）
 
 | 模块 | 改动 | 行数 |
 | --- | --- | --- |
-| `rdma_scatter_read_py.cpp` | 新增 `RDMAContextHandle` 类 | ~50 行 |
-| `rdma_memory_pool.py` | `tp_rank` 参数 + `ib_devs` 路由 + 切换为实例化 handle | ~30 行 |
-| `hisparse_coordinator.py` | 传递 `tp_rank` 给 pool 构造 | ~3 行 |
-| `factory.py` / `SparseConfig` | 解析 `ib_devs` 列表 | ~5 行 |
-| `run_all_experiments.sh` | 新增 1/2/4/8 NIC 子实验循环 | ~20 行 |
-| **合计** | | **~110 行** |
+| `rdma_scatter_read_py.cpp` | 多 context + offset-aware bulk read + 并行等待 | ~80-120 行 |
+| `rdma_memory_pool.py` | request-level striping / 多 staging / shard transpose | ~120-180 行 |
+| `hisparse_coordinator.py` | 可选切换到 striped prefetch | ~10-20 行 |
+| `factory.py` / `SparseConfig` | 解析 `mode` / `max_rnics_per_request` 等字段 | ~10 行 |
+| benchmark / scripts | 增加 TTFT-sensitive 子实验与统计打印 | ~20-40 行 |
+| **合计** | | **~240-370 行** |
 
 ---

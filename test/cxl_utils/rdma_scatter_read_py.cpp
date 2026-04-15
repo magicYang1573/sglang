@@ -132,6 +132,17 @@ public:
         return us;
     }
 
+    double bulk_read_offset(size_t remote_offset, size_t local_offset,
+                            size_t length) {
+        if (!initialized_)
+            throw std::runtime_error("RDMAContext not initialized");
+        double us = rdma_bulk_read_offset(&ctx_, remote_offset, local_offset,
+                                          length);
+        if (us < 0)
+            throw std::runtime_error("RDMAContext::bulk_read_offset failed");
+        return us;
+    }
+
     double scatter_read(uint64_t indices_ptr, int top_k, int item_size) {
         if (!initialized_)
             throw std::runtime_error("RDMAContext not initialized");
@@ -198,6 +209,12 @@ PYBIND11_MODULE(rdma_scatter_ext, m) {
              py::arg("total_bytes"),
              py::call_guard<py::gil_scoped_release>(),
              "Bulk contiguous RDMA READ. Returns elapsed microseconds.")
+        .def("bulk_read_offset", &RDMAContextHandle::bulk_read_offset,
+             py::arg("remote_offset"), py::arg("local_offset"),
+             py::arg("length"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Offset-aware RDMA READ: read `length` bytes from remote_offset "
+             "into local_offset. Used by request_striping mode.")
         .def("scatter_read", &RDMAContextHandle::scatter_read,
              py::arg("indices_ptr"), py::arg("top_k"), py::arg("item_size"),
              py::call_guard<py::gil_scoped_release>(),

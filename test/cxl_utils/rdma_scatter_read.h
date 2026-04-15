@@ -81,6 +81,21 @@ double rdma_scatter_read(struct rdma_context *rctx,
 double rdma_bulk_read(struct rdma_context *rctx, size_t total_bytes);
 
 /*
+ * Offset-aware bulk RDMA READ: read `length` bytes starting at
+ * `remote_offset` in the remote MR into `local_offset` in the local MR.
+ *
+ * Used by request_striping mode where each NIC reads a different shard
+ * of the same request's KV data from a specific region of remote_buffer
+ * into a specific region of landing_staging.
+ *
+ * Returns elapsed time in microseconds (CLOCK_MONOTONIC).
+ */
+double rdma_bulk_read_offset(struct rdma_context *rctx,
+                             size_t remote_offset,
+                             size_t local_offset,
+                             size_t length);
+
+/*
  * Tear down all RDMA resources.
  */
 void rdma_destroy(struct rdma_context *rctx);

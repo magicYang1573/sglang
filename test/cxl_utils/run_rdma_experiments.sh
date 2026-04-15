@@ -81,16 +81,20 @@ RESULTS_DIR="${RESULTS_DIR:-exp/exp_rdma_${TIMESTAMP}}"
 # Context lengths (tokens): 16k / 32k / 64k / 128k
 CONTEXT_LENGTHS=(16384 32768 65536 131072)
 
-# RDMA schemes only
+# RDMA schemes: rank_interleave + request_striping
 SCHEMES=(
   rdma_1nic_local0
   rdma_2nic_local0
   rdma_2nic_local50
   rdma_4nic_local0
   rdma_8nic_local0
+  rdma_stripe_2nic_local0
+  rdma_stripe_4nic_local0
+  rdma_stripe_8nic_local0
 )
 
-# --- HiSparse RDMA JSON builder ---
+# --- HiSparse RDMA JSON builders ---
+# rank_interleave (backward-compatible, tp_rank % num_nics)
 build_hisparse_rdma() {
   local num_nics="$1"
   local local_ratio="${2:-0.0}"
@@ -100,6 +104,19 @@ build_hisparse_rdma() {
     devs_json+='"'"${ALL_IB_DEVS[$i]}"'"'
   done
   printf '%s' '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":'"${local_ratio}"',"ib_devs":['"${devs_json}"']}}'
+}
+
+# request_striping (single request → multiple NICs in parallel)
+build_hisparse_rdma_striping() {
+  local num_nics="$1"
+  local local_ratio="${2:-0.0}"
+  local min_tokens_per_rnic="${3:-8192}"
+  local devs_json=""
+  for ((i = 0; i < num_nics; i++)); do
+    if [[ $i -gt 0 ]]; then devs_json+=","; fi
+    devs_json+='"'"${ALL_IB_DEVS[$i]}"'"'
+  done
+  printf '%s' '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":'"${local_ratio}"',"ib_devs":['"${devs_json}"'],"mode":"request_striping","max_rnics_per_request":'"${num_nics}"',"min_tokens_per_rnic":'"${min_tokens_per_rnic}"'}}'
 }
 
 # --- CLI overrides ---
@@ -193,11 +210,14 @@ start_server_for_scheme() {
   local log_file="$2"
   local cfg=""
   case "${scheme}" in
-    rdma_1nic_local0)   cfg="$(build_hisparse_rdma 1 0.0)" ;;
-    rdma_2nic_local0)   cfg="$(build_hisparse_rdma 2 0.0)" ;;
-    rdma_2nic_local50)  cfg="$(build_hisparse_rdma 2 0.5)" ;;
-    rdma_4nic_local0)   cfg="$(build_hisparse_rdma 4 0.0)" ;;
-    rdma_8nic_local0)   cfg="$(build_hisparse_rdma 8 0.0)" ;;
+    rdma_1nic_local0)           cfg="$(build_hisparse_rdma 1 0.0)" ;;
+    rdma_2nic_local0)           cfg="$(build_hisparse_rdma 2 0.0)" ;;
+    rdma_2nic_local50)          cfg="$(build_hisparse_rdma 2 0.5)" ;;
+    rdma_4nic_local0)           cfg="$(build_hisparse_rdma 4 0.0)" ;;
+    rdma_8nic_local0)           cfg="$(build_hisparse_rdma 8 0.0)" ;;
+    rdma_stripe_2nic_local0)    cfg="$(build_hisparse_rdma_striping 2 0.0)" ;;
+    rdma_stripe_4nic_local0)    cfg="$(build_hisparse_rdma_striping 4 0.0)" ;;
+    rdma_stripe_8nic_local0)    cfg="$(build_hisparse_rdma_striping 8 0.0)" ;;
     *) echo "Unknown scheme: ${scheme}"; return 1 ;;
   esac
 
