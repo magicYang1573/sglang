@@ -1,0 +1,11 @@
+run_rdma_2nic_local0_concurrency_matrix.sh
+timestamp=20260415_192745
+SCHEME=rdma_2nic_local0
+MODEL_PATH=/data2/ljr/a/models/DeepSeek-V3.2-AWQ MODEL_CLIENT=deepseek-ai/DeepSeek-V3.2
+TP=8 DP_SIZE=8 PORT=30000
+CONTEXT_LENGTHS=16384 32768 65536 131072
+CONCURRENCIES=8 16 32 48 64
+NUM_REQUESTS_RDMA=256
+IB_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+RESULTS_DIR=./exp/rdma_concurrency_scale
+PYTHON_BIN=/home/cxl_gpu/anaconda3/envs/sgl/bin/python
