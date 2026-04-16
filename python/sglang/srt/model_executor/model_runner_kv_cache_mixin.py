@@ -905,6 +905,21 @@ class ModelRunnerKVCacheMixin:
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
+        if getattr(self, "enable_hisparse", False):
+            max_num_reqs = self.server_args.max_running_requests
+            if max_num_reqs is not None:
+                # HiSparse keeps bulk KV on host. When users explicitly set
+                # --max-running-requests for decode-heavy experiments, honor
+                # that per-DP target directly instead of clamping it by the
+                # GPU-centric estimated upper bound.
+                max_num_reqs = max(max_num_reqs // self.dp_size, 1)
+                if self.mambaish_config is not None:
+                    ratio = self._calculate_mamba_ratio()
+                    max_num_reqs = min(
+                        max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+                    )
+                return max_num_reqs
+
         # HiSparse keeps bulk KV on host; the effective token namespace is
         # token_capacity * host_to_device_ratio, so we use that larger budget
         # when estimating how many requests can decode concurrently.
