@@ -954,6 +954,17 @@ class ModelRunnerKVCacheMixin:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         self.max_total_num_tokens = config.max_total_num_tokens
         self.max_running_requests = config.max_running_requests
+        if getattr(self, "enable_hisparse", False):
+            forced_max_reqs = self.server_args.max_running_requests
+            if forced_max_reqs is not None:
+                # Keep HiSparse decode-heavy experiments from being silently
+                # capped by earlier heuristics. This value also determines the
+                # req_to_token_pool size, so enforce the explicit user target
+                # here as well.
+                self.max_running_requests = max(
+                    self.max_running_requests,
+                    max(forced_max_reqs // self.dp_size, 1),
+                )
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
