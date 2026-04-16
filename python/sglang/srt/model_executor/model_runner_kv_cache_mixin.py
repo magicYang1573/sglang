@@ -905,15 +905,27 @@ class ModelRunnerKVCacheMixin:
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
-        # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
+        # HiSparse keeps bulk KV on host; the effective token namespace is
+        # token_capacity * host_to_device_ratio, so we use that larger budget
+        # when estimating how many requests can decode concurrently.
+        effective_capacity = token_capacity
+        estimated_upper = 4096
+        if getattr(self, "enable_hisparse", False):
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            hisparse_cfg = parse_hisparse_config(self.server_args)
+            ratio = max(hisparse_cfg.host_to_device_ratio, 1)
+            effective_capacity = token_capacity * ratio
+            estimated_upper = max(estimated_upper, 4096 * ratio)
+
+        estimated = int(effective_capacity / self.model_config.context_len * 512)
+        estimated = max(min(estimated, estimated_upper), 2048)
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
             max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
         else:
-            max_num_reqs = min(estimated, token_capacity // 2)
+            max_num_reqs = min(estimated, effective_capacity // 2)
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
