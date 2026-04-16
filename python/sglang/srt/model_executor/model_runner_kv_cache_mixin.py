@@ -912,7 +912,8 @@ class ModelRunnerKVCacheMixin:
                 # --max-running-requests for decode-heavy experiments, honor
                 # that per-DP target directly instead of clamping it by the
                 # GPU-centric estimated upper bound.
-                max_num_reqs = max(max_num_reqs // self.dp_size, 1)
+                divisor = 1 if self.server_args.enable_dp_attention else self.dp_size
+                max_num_reqs = max(max_num_reqs // divisor, 1)
                 if self.mambaish_config is not None:
                     ratio = self._calculate_mamba_ratio()
                     max_num_reqs = min(
@@ -938,7 +939,8 @@ class ModelRunnerKVCacheMixin:
 
         max_num_reqs = self.server_args.max_running_requests
         if max_num_reqs is not None:
-            max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
+            divisor = 1 if self.server_args.enable_dp_attention else self.dp_size
+            max_num_reqs = min(max_num_reqs // divisor, estimated)
         else:
             max_num_reqs = min(estimated, effective_capacity // 2)
 
@@ -961,9 +963,10 @@ class ModelRunnerKVCacheMixin:
                 # capped by earlier heuristics. This value also determines the
                 # req_to_token_pool size, so enforce the explicit user target
                 # here as well.
+                divisor = 1 if self.server_args.enable_dp_attention else self.dp_size
                 self.max_running_requests = max(
                     self.max_running_requests,
-                    max(forced_max_reqs // self.dp_size, 1),
+                    max(forced_max_reqs // divisor, 1),
                 )
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
