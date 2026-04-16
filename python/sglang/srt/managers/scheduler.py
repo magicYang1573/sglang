@@ -2172,6 +2172,11 @@ class Scheduler(
                 else:
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+                # HiSparse bypasses the normal last_batch merge path below, so
+                # it would otherwise miss the usual batch_is_full reset. This
+                # can leave admission stuck after the first prefill wave even
+                # when more waiting requests can still be staged into decode.
+                self.running_batch.batch_is_full = False
 
         if (
             not self.enable_hisparse
