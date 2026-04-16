@@ -1,0 +1,12 @@
+run_cxl_interleave_concurrency_matrix.sh
+timestamp=20260416_012743
+SCHEME=cxl_interleave_2
+MODEL_PATH=/data3/yt/models/DeepSeek-V3.2-AWQ MODEL_CLIENT=deepseek-ai/DeepSeek-V3.2
+TP=8 DP_SIZE=8 PORT=30000
+CONTEXT_LENGTHS=16384 32768 65536 131072
+CONCURRENCIES=8 16 32 48 64
+NUM_REQUESTS_CXL=(unset) tiered: conc8=128 conc16=256 conc32/48/64=512
+CXL_DEV_PATH=/dev/dax0.0 CXL_DEV_PATH_2=/dev/dax1.0
+CXL_MAP_BYTES_PER_DEVICE=274877906944
+RESULTS_DIR=./exp/cxl_concurrency_scale
+PYTHON_BIN=/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
