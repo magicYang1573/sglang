@@ -6592,34 +6592,64 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
+            import json as _json
+
             from sglang.srt.configs.model_config import is_deepseek_nsa
 
             hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
-                "(e.g., DeepSeek V3.2, GLM-5). "
-            )
+
+            # Peek algorithm name from hisparse_config so we can relax the
+            # "must be DSA" guard for model-agnostic algorithms (Quest, ...).
+            _algo = None
+            if self.hisparse_config is not None:
+                try:
+                    _algo = _json.loads(self.hisparse_config).get("algorithm")
+                except Exception:
+                    _algo = None
+            _algo = (_algo or "deepseek_nsa").lower()
+
+            if _algo == "deepseek_nsa":
+                assert is_deepseek_nsa(hf_config), (
+                    "--enable-hisparse with algorithm=deepseek_nsa is only "
+                    "supported for DSA models (e.g., DeepSeek V3.2, GLM-5)."
+                )
+                for attr, label in [
+                    ("nsa_prefill_backend", "prefill"),
+                    ("nsa_decode_backend", "decode"),
+                ]:
+                    backend = getattr(self, attr)
+                    if backend is not None and backend != "flashmla_sparse":
+                        raise ValueError(
+                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                            f"but got --nsa-{label}-backend={backend}. "
+                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        )
+                if self.kv_cache_dtype != "bfloat16":
+                    raise ValueError(
+                        f"HiSparse (DSA) requires bfloat16 KV cache, but got "
+                        f"--kv-cache-dtype={self.kv_cache_dtype}."
+                    )
+            elif _algo == "quest":
+                # Quest + HiSparse targets MHA / GQA (e.g. Qwen).
+                if is_deepseek_nsa(hf_config):
+                    raise ValueError(
+                        "algorithm=quest is for non-native-sparse models; "
+                        "use algorithm=deepseek_nsa for DSA models."
+                    )
+                if self.kv_cache_dtype not in ("bfloat16", "float16"):
+                    raise ValueError(
+                        f"HiSparse (Quest) requires bf16/fp16 KV cache, but got "
+                        f"--kv-cache-dtype={self.kv_cache_dtype}."
+                    )
+            else:
+                raise ValueError(
+                    f"HiSparse: unsupported algorithm={_algo!r}. "
+                    "Supported: 'deepseek_nsa', 'quest'."
+                )
 
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
-                    raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                    )
-
-            if self.kv_cache_dtype != "bfloat16":
-                raise ValueError(
-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16."
-                )
 
         assert (
             self.schedule_conservativeness >= 0

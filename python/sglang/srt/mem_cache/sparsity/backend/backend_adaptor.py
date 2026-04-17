@@ -105,6 +105,11 @@ class FlashAttentionAdaptor(BackendAdaptor):
         Modifies page_table, cache_seqlens, and related metadata to redirect
         FlashAttention to only process selected sparse pages.
 
+        When a HiSparse IO subsystem is attached (``io_subsystem`` kwarg),
+        the logical→physical page indices are additionally translated to
+        the small hisparse device buffer via
+        ``HiSparseMHATokenToKVPool.translate_loc_to_hisparse_device``.
+
         # TODO: Optimize performance
         """
         if self._original_metadata is None:
@@ -124,6 +129,33 @@ class FlashAttentionAdaptor(BackendAdaptor):
             req_to_token,
             page_size,
         )
+
+        # HiSparse path: translate logical device pages into the compact
+        # hisparse device buffer pages.  We look up the per-token mapping
+        # at the page's first token, then divide by page_size.
+        io_subsystem = kwargs.get("io_subsystem")
+        if io_subsystem is not None and page_size == 1:
+            # Fast path: page_size == 1 means page idx == token idx, so we can
+            # translate directly.
+            translate = (
+                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device
+            )
+            physical_pages = torch.where(
+                physical_pages >= 0,
+                translate(physical_pages.to(torch.int64)).to(torch.int32),
+                physical_pages,
+            )
+        elif io_subsystem is not None and page_size > 1:
+            translate = (
+                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device
+            )
+            first_tok = physical_pages.to(torch.int64) * page_size
+            translated_tok = translate(first_tok).to(torch.int64)
+            physical_pages = torch.where(
+                physical_pages >= 0,
+                (translated_tok // page_size).to(torch.int32),
+                physical_pages,
+            )
 
         max_selected = physical_pages.shape[1]
         valid_mask = torch.arange(max_selected, device=physical_pages.device).unsqueeze(

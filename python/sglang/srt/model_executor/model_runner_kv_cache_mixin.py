@@ -506,24 +506,57 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
-                    )
+                    _use_hisparse_mha = False
+                    if self.enable_hisparse:
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_hisparse_config,
+                        )
+
+                        _hs_cfg = parse_hisparse_config(self.server_args)
+                        _use_hisparse_mha = (
+                            (_hs_cfg.algorithm or "deepseek_nsa").lower()
+                            == "quest"
+                        )
+
+                    if _use_hisparse_mha:
+                        from sglang.srt.mem_cache.hisparse_mha_memory_pool import (
+                            HiSparseMHATokenToKVPool,
+                        )
+
+                        self.token_to_kv_pool = HiSparseMHATokenToKVPool(
+                            size=self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            head_num=self.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            ),
+                            head_dim=self.model_config.head_dim,
+                            layer_num=self.num_effective_layers,
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            start_layer=self.start_layer,
+                            end_layer=self.end_layer,
+                            host_to_device_ratio=_hs_cfg.host_to_device_ratio,
+                        )
+                    else:
+                        self.token_to_kv_pool = MHATokenToKVPool(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            head_num=self.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            ),
+                            head_dim=self.model_config.head_dim,
+                            layer_num=self.num_effective_layers,
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            start_layer=self.start_layer,
+                            end_layer=self.end_layer,
+                            enable_alt_stream=not self.server_args.enable_pdmux,
+                            enable_kv_cache_copy=(
+                                self.server_args.speculative_algorithm is not None
+                            ),
+                        )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -573,17 +606,37 @@ class ModelRunnerKVCacheMixin:
                         )
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
-                        self.token_to_kv_pool_allocator = (
-                            HiSparseTokenToKVPoolAllocator(
-                                self.max_total_num_tokens,
-                                page_size=self.page_size,
-                                dtype=self.kv_cache_dtype,
-                                device=self.device,
-                                kvcache=self.token_to_kv_pool,
-                                need_sort=need_sort,
-                                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                        _algo = (
+                            hisparse_cfg.algorithm or "deepseek_nsa"
+                        ).lower()
+                        if _algo == "quest":
+                            from sglang.srt.mem_cache.hisparse_mha_memory_pool import (
+                                HiSparseMHATokenToKVPoolAllocator,
                             )
-                        )
+
+                            self.token_to_kv_pool_allocator = (
+                                HiSparseMHATokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                )
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = (
+                                HiSparseTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                )
+                            )
                     elif self.page_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,

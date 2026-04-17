@@ -86,3 +86,61 @@ def load_cache_to_device_buffer_mla(
         page_size,
         item_size_bytes,
     )
+
+
+def load_cache_to_device_buffer_mha(
+    top_k_tokens: torch.Tensor,
+    device_buffer_tokens: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    device_buffer_locs: torch.Tensor,
+    host_cache_k: torch.Tensor,
+    host_cache_v: torch.Tensor,
+    device_buffer_k: torch.Tensor,
+    device_buffer_v: torch.Tensor,
+    top_k_device_locs: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
+    item_size_bytes: int,
+    num_top_k: int,
+    hot_buffer_size: int,
+    page_size: int = 1,
+    block_size: int = 256,
+    num_real_reqs: torch.Tensor | None = None,
+) -> None:
+    """MHA / GQA variant of the HiSparse swap-in kernel.
+
+    Both ``host_cache_{k,v}`` and ``device_buffer_{k,v}`` must share the same
+    per-token stride (``item_size_bytes`` bytes). Shape is typically
+    ``[num_tokens, head_num, head_dim]``.
+    """
+    assert (
+        hot_buffer_size >= num_top_k
+    ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
+
+    module = _jit_sparse_module(
+        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla=False
+    )
+
+    if num_real_reqs is None:
+        num_real_reqs = torch.tensor(
+            [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
+        )
+
+    module.load_cache_to_device_buffer(
+        top_k_tokens,
+        device_buffer_tokens,
+        host_cache_locs,
+        device_buffer_locs,
+        host_cache_k,
+        host_cache_v,
+        device_buffer_k,
+        device_buffer_v,
+        top_k_device_locs,
+        req_pool_indices,
+        seq_lens,
+        lru_slots,
+        num_real_reqs,
+        page_size,
+        item_size_bytes,
+    )

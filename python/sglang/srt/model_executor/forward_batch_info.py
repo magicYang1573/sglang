@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -432,6 +432,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For hisparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    # Algorithm-layer sparse coordinator (present for Quest/HiSparse on
+    # non-native-sparse models).  When set, ``RadixAttention.forward`` will
+    # call ``attention_begin/attention_end`` on it so that the algorithm can
+    # compute page representations (prefill) and drive topk + swap-in
+    # (decode).
+    sparse_coordinator: Optional[Any] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None

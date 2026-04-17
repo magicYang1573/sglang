@@ -114,6 +114,8 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
+        sparse_coordinator = getattr(forward_batch, "sparse_coordinator", None)
+
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
@@ -122,9 +124,23 @@ class RadixAttention(nn.Module):
             unified_attention_with_output(
                 q, k, v, output, save_kv_cache, self.layer_id, **kwargs
             )
+            if sparse_coordinator is not None:
+                # Prefill pass: let the algorithm build its representations
+                # (e.g. Quest page bounding boxes) from the freshly-written K.
+                sparse_coordinator.attention_end(output, self, forward_batch)
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            if sparse_coordinator is not None:
+                sparse_coordinator.attention_begin(
+                    q,
+                    k,
+                    v,
+                    self,
+                    forward_batch,
+                    forward_batch.attn_backend.forward_metadata,
+                    **kwargs,
+                )
+            out = forward_batch.attn_backend.forward(
                 q,
                 k,
                 v,
@@ -133,6 +149,9 @@ class RadixAttention(nn.Module):
                 save_kv_cache,
                 **kwargs,
             )
+            if sparse_coordinator is not None:
+                sparse_coordinator.attention_end(out, self, forward_batch)
+            return out
 
 
 @register_custom_op(mutates_args=["output"])

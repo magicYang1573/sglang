@@ -475,6 +475,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        self.sparse_coordinator = None
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
@@ -690,23 +691,70 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init hisparse coordinator (must happen before CUDA graph capture)
         if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             hisparse_cfg = parse_hisparse_config(self.server_args)
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_cfg.top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            tp_cpu_group = (
+                self.attention_tp_group.cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_group.cpu_group
             )
+            _algo = (hisparse_cfg.algorithm or "deepseek_nsa").lower()
+            if _algo == "deepseek_nsa":
+                from sglang.srt.managers.hisparse_coordinator import (
+                    HiSparseCoordinator,
+                )
+
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_cfg.top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=tp_cpu_group,
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                )
+            elif _algo == "quest":
+                from sglang.srt.managers.hisparse_mha_coordinator import (
+                    HiSparseMHACoordinator,
+                )
+                from sglang.srt.mem_cache.sparsity import (
+                    create_sparse_coordinator,
+                )
+
+                mha_coord = HiSparseMHACoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_cfg.top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=tp_cpu_group,
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                )
+                # The scheduler / forward_batch talk to a single
+                # hisparse coordinator. We expose the MHA one under the
+                # same attribute so the existing plumbing (scheduler
+                # admit / retract / request_finished) continues to work.
+                self.hisparse_coordinator = mha_coord
+
+                # Build and register the SparseCoordinator (algorithm
+                # layer).  It reads the K buffer via token_to_kv_pool to
+                # compute Quest bounding boxes, and drives swap-in via
+                # mha_coord.
+                self.sparse_coordinator = create_sparse_coordinator(
+                    device=self.device,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    server_args=self.server_args,
+                    io_subsystem=mha_coord,
+                )
+            else:
+                raise ValueError(
+                    f"Unknown hisparse algorithm={_algo!r}. "
+                    "Supported: 'deepseek_nsa', 'quest'."
+                )
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()
@@ -2982,6 +3030,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+        # Expose the algorithm-layer sparse coordinator (Quest, ...) so that
+        # RadixAttention.forward can drive attention_begin/attention_end.
+        sparse_coord = getattr(self, "sparse_coordinator", None)
+        forward_batch.sparse_coordinator = sparse_coord
+        if sparse_coord is not None:
+            sparse_coord.forward_begin(forward_batch)
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

@@ -27,6 +27,133 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_max = {}
         self.page_valid = {}
 
+    # ------------------------------------------------------------------
+    # Batched top-k retrieval (CUDA-graph friendly)
+    # ------------------------------------------------------------------
+    def retrieve_topk(
+        self,
+        queries: torch.Tensor,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        """Batched Quest top-k.
+
+        Returns ``(selected_pages, valid_lengths)`` where
+        ``selected_pages`` is ``[bs, max_k]`` int32 with -1 padding and
+        ``valid_lengths`` is ``[bs]`` int32 giving the real number of
+        selected *pages* per request.  When ``sparse_mask[i]`` is False we
+        emit an empty row.
+        """
+        forward_batch = kwargs.get("forward_batch", None)
+        if forward_batch is None or not hasattr(forward_batch, "seq_lens"):
+            raise ValueError(
+                "forward_batch with seq_lens is required for Quest retrieve_topk"
+            )
+
+        device = queries.device
+        seq_lens = forward_batch.seq_lens.to(device)
+        bs = queries.shape[0]
+        if bs == 0:
+            return (
+                torch.empty(0, 0, dtype=torch.int32, device=device),
+                torch.empty(0, dtype=torch.int32, device=device),
+            )
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        max_req_tokens = req_to_token.shape[1]
+
+        num_pages_per_req = (seq_lens + self.page_size - 1) // self.page_size
+        max_num_pages = int(num_pages_per_req.max().item()) if bs > 0 else 0
+        if max_num_pages == 0:
+            return (
+                torch.empty(bs, 0, dtype=torch.int32, device=device),
+                torch.zeros(bs, dtype=torch.int32, device=device),
+            )
+
+        # ----- logical -> physical page map per request ----------------
+        page_idx = torch.arange(max_num_pages, device=device)
+        page_start_tok = (page_idx * self.page_size).unsqueeze(0).expand(bs, -1)
+        page_start_tok = page_start_tok.clamp(max=max_req_tokens - 1)
+        first_tokens = req_to_token[
+            req_pool_indices.unsqueeze(1).expand(-1, max_num_pages),
+            page_start_tok,
+        ]
+        phys_pages = first_tokens // self.page_size  # [bs, max_num_pages]
+
+        # ----- bounding-box scores -------------------------------------
+        scores = self._retrieve_page_scores(
+            layer_id,
+            phys_pages,
+            req_pool_indices,
+            queries,
+        )  # [bs, max_num_pages]
+
+        # Mask out out-of-range pages for each request.
+        valid_page_mask = (
+            page_idx.unsqueeze(0) < num_pages_per_req.unsqueeze(1)
+        )  # [bs, max_num_pages]
+        scores = torch.where(
+            valid_page_mask,
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+
+        # Mask the tail ``num_recent_pages`` so they are always selected
+        # via the "recent" append path below.
+        recent_start = (num_pages_per_req - self.num_recent_pages).clamp(min=0)
+        recent_mask = page_idx.unsqueeze(0) >= recent_start.unsqueeze(1)
+        scores = torch.where(
+            recent_mask, torch.full_like(scores, float("-inf")), scores
+        )
+
+        # Per-request history page count (positions before the recent tail).
+        history_pages = recent_start.clamp(min=1)
+        k_per_req = (history_pages.float() * self.sparsity_ratio).clamp(min=1).long()
+        k_per_req = torch.minimum(k_per_req, history_pages)
+        k_global = int(k_per_req.max().item())
+
+        # Global top-k (sorted by score desc) then mask to per-req k.
+        topk_scores, topk_idx = torch.topk(
+            scores, k=k_global, dim=1, sorted=True
+        )  # [bs, k_global]
+        arange_k = torch.arange(k_global, device=device).unsqueeze(0)
+        keep_topk = (arange_k < k_per_req.unsqueeze(1)) & torch.isfinite(topk_scores)
+
+        # ----- append recent pages ------------------------------------
+        recent_idx = recent_start.unsqueeze(1) + torch.arange(
+            self.num_recent_pages, device=device
+        ).unsqueeze(0)
+        keep_recent = (recent_idx < num_pages_per_req.unsqueeze(1)) & (
+            recent_idx >= 0
+        )
+
+        # Concatenate top-k + recent into a single padded tensor.
+        max_combined = k_global + self.num_recent_pages
+        selected_pages = torch.full(
+            (bs, max_combined), -1, dtype=torch.int32, device=device
+        )
+        selected_pages[:, :k_global] = torch.where(
+            keep_topk, topk_idx.to(torch.int32), torch.full_like(topk_idx, -1).to(torch.int32)
+        )
+        selected_pages[:, k_global:] = torch.where(
+            keep_recent,
+            recent_idx.to(torch.int32),
+            torch.full_like(recent_idx, -1).to(torch.int32),
+        )
+
+        # Zero-out rows that don't need sparse attention.
+        sparse_mask_row = sparse_mask.unsqueeze(1)
+        selected_pages = torch.where(
+            sparse_mask_row,
+            selected_pages,
+            torch.full_like(selected_pages, -1),
+        )
+
+        valid_lengths = (selected_pages >= 0).sum(dim=1).to(torch.int32)
+        return selected_pages, valid_lengths
+
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
     ):

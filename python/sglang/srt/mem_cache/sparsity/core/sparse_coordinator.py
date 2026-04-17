@@ -67,6 +67,69 @@ class SparseConfig:
     )  # Algorithm-specific config, parsed by each algorithm
 
 
+def _expand_selected_pages_to_tokens(
+    selected_pages: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_size: int,
+    num_top_k: int,
+) -> torch.Tensor:
+    """Expand per-request selected page indices to a padded token-index tensor.
+
+    Args:
+        selected_pages: ``[bs, max_pages]`` int32, -1 padded.
+        seq_lens: ``[bs]`` int32/int64.
+        page_size: Pages of ``page_size`` tokens.
+        num_top_k: Output width (must match the kernel's ``NUM_TOP_K``).
+
+    Returns:
+        ``[bs, num_top_k]`` int32, -1 padded.  Token indices greater or equal
+        to ``seq_len`` are dropped and later tokens are right-padded with -1.
+    """
+    bs, max_pages = selected_pages.shape
+    device = selected_pages.device
+    if bs == 0:
+        return torch.full(
+            (0, num_top_k), -1, dtype=torch.int32, device=device
+        )
+
+    seq_lens_i32 = seq_lens.to(torch.int32).to(device)
+
+    page_offset = torch.arange(page_size, device=device, dtype=torch.int32)
+    expanded = (
+        selected_pages.unsqueeze(-1) * page_size
+        + page_offset.view(1, 1, -1)
+    )  # [bs, max_pages, page_size]
+    expanded = expanded.view(bs, max_pages * page_size)
+
+    # Invalidate tokens from padded pages (pages == -1 -> negative token idx
+    # after multiplication) and tokens past seq_len.
+    page_is_valid = (selected_pages >= 0).unsqueeze(-1).expand(
+        -1, -1, page_size
+    ).reshape(bs, max_pages * page_size)
+    in_seq = expanded < seq_lens_i32.unsqueeze(1)
+    valid = page_is_valid & in_seq
+
+    # Compact valid tokens via stable sort: valid=1 sorted ascending puts
+    # invalid (=0) tokens *after* valid ones when we sort on ``~valid``.
+    # Using torch.argsort on ``(~valid).to(int8)`` with ``stable=True``
+    # places valid indices first while preserving relative order.
+    keys = (~valid).to(torch.int8)
+    order = torch.argsort(keys, dim=1, stable=True)
+    gathered = torch.gather(expanded, 1, order)
+    gathered = torch.where(
+        torch.gather(valid, 1, order),
+        gathered,
+        torch.full_like(gathered, -1),
+    )
+
+    out = torch.full(
+        (bs, num_top_k), -1, dtype=torch.int32, device=device
+    )
+    copy_len = min(num_top_k, gathered.shape[1])
+    out[:, :copy_len] = gathered[:, :copy_len]
+    return out
+
+
 class SparseCoordinator:
     """
     Coordinator for sparse attention with retrievable KV cache compression.
@@ -103,6 +166,7 @@ class SparseCoordinator:
         start_layer: int,
         end_layer: int,
         device: torch.device,
+        io_subsystem: Optional[Any] = None,
     ):
         self.config = config
         self.algorithm = algorithm
@@ -113,6 +177,11 @@ class SparseCoordinator:
         self.end_layer = end_layer
         self.device = device
         self.page_size = config.page_size
+
+        # Optional HiSparse IO subsystem (MLA or MHA coordinator).  When
+        # present the coordinator drives swap-in via this object; when None
+        # the sparse algorithm operates directly on full-resident KV cache.
+        self.io_subsystem = io_subsystem
 
         self.states = RequestTrackers(
             req_to_token_pool.req_to_token.shape[0],
@@ -132,7 +201,9 @@ class SparseCoordinator:
         )
 
         logger.info(
-            f"SparseCoordinator initialized with sparse algorithm={type(algorithm).__name__}"
+            "SparseCoordinator initialized with sparse algorithm=%s, io_subsystem=%s",
+            type(algorithm).__name__,
+            type(io_subsystem).__name__ if io_subsystem is not None else "none",
         )
 
     def on_request_begin(self, req: "Req") -> None:
@@ -158,26 +229,18 @@ class SparseCoordinator:
         # - Release host indices if any were allocated for offloading
 
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
-        """
-        Handle forward pass begin event. Called before each forward pass starts.
-
-        Wait for pending KVCache offloading operations to complete before forward pass.
-        Ensures memory consistency for subsequent sparse attention operations.
-        """
-        # TODO: Implement forward begin handling
-        # - Check if there are pending offloading operations
-        pass
+        """Wait for any pending HiSparse host backup before the forward pass."""
+        if self.io_subsystem is None:
+            return
+        if forward_batch.forward_mode.is_decode_or_idle():
+            self.io_subsystem.wait_for_pending_backup()
 
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
-        """
-        Handle forward pass end event. Called after each forward pass completes.
-
-        Trigger async KVCache offloading operations.
-        """
-        # TODO: Implement forward end handling
-        # - Identify tokens to offload
-        # - Trigger async offloading operations
-        pass
+        """Trigger HiSparse eager backup / mapping after the forward pass."""
+        # Scheduler already drives ``map_last_loc_to_buffer`` prior to the
+        # forward (see ``ScheduleBatch.prepare_for_decode``); nothing extra is
+        # needed here for the current MLA/MHA coordinators.
+        return
 
     def attention_begin(
         self,
@@ -242,8 +305,8 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
-        # Compute Topk
         sparse_mask = self._compute_sparse_mask(req_pool_indices)
+
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer.layer_id,
@@ -254,7 +317,33 @@ class SparseCoordinator:
             **kwargs,
         )
 
-        # Adapt Attention Metadata
+        # When HiSparse IO is attached, we must also swap in the selected
+        # KV from host to device.  ``selected_indices`` carries page-level
+        # indices; expand them to the token-level padded tensor expected
+        # by the swap-in kernel, run the kernel, then hand the returned
+        # device slots to the backend adapter.
+        device_locs_per_tok: Optional[torch.Tensor] = None
+        if (
+            self.io_subsystem is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and selected_indices is not None
+        ):
+            top_k_tokens = _expand_selected_pages_to_tokens(
+                selected_pages=selected_indices,
+                seq_lens=forward_batch.seq_lens,
+                page_size=self.page_size,
+                num_top_k=self.config.top_k,
+            )
+            device_locs_per_tok = self.io_subsystem.swap_in_selected_pages(
+                req_pool_indices=req_pool_indices,
+                seq_lens=forward_batch.seq_lens.to(torch.int32),
+                top_k_tokens=top_k_tokens,
+                layer_id=layer.layer_id,
+            )
+
+        if self.backend_adaptor is None:
+            return None
+
         return self.backend_adaptor.adapt_for_attn_metadata(
             selected_indices=selected_indices,
             valid_lengths=valid_lengths,
@@ -264,6 +353,8 @@ class SparseCoordinator:
             req_to_token=self.req_to_token_pool.req_to_token,
             page_size=self.page_size,
             layer_id=layer.layer_id,
+            device_locs_per_tok=device_locs_per_tok,
+            io_subsystem=self.io_subsystem,
         )
 
     def _compute_sparse_mask(self, req_pool_indices):

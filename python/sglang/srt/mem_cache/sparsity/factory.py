@@ -113,9 +113,17 @@ def create_sparse_coordinator(
     start_layer: int,
     end_layer: int,
     server_args,
+    io_subsystem=None,
     **kwargs,
 ) -> SparseCoordinator:
     config = _parse_sparse_config(server_args)
+
+    # Inherit defaults that only make sense at this callsite.
+    if config.page_size is None:
+        config.page_size = getattr(token_to_kv_pool, "page_size", 1)
+    if config.min_sparse_prompt_len is None:
+        config.min_sparse_prompt_len = 0
+
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool
@@ -130,6 +138,7 @@ def create_sparse_coordinator(
         start_layer=start_layer,
         end_layer=end_layer,
         device=device,
+        io_subsystem=io_subsystem,
     )
     register_sparse_coordinator(coordinator)
     return coordinator
