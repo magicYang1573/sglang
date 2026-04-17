@@ -1,8 +1,16 @@
-"""RDMA distributed memory pool simulation for HiSparse KV Cache.
+"""RDMA distributed memory pool for HiSparse KV Cache.
 
 Simulates a distributed KV Cache pool where only a fraction of requests
 have their KV data cached locally in DRAM.  The rest reside on a "remote"
 node and must be fetched via RDMA before decode can start.
+
+The ``rdma_scatter_ext`` native extension must be **pre-built** before
+starting SGLang (no runtime JIT).  From the repo root::
+
+    cd test/cxl_utils && make rdma PYTHON=$(which python3)
+
+If the extension is missing or fails to import, initialization raises
+``RuntimeError`` (there is no CPU simulation fallback).
 
 Layout model — page-first remote, layer-first local:
 
@@ -57,67 +65,78 @@ from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
 
+# Loaded once; RDMALoopbackContext instances share this module.
+_rdma_ext_module: Optional[object] = None
 
-def _try_load_rdma_ext():
-    """Load the RDMA pybind11 extension, JIT-compiling if necessary."""
+
+def _load_rdma_ext():
+    """Import the pre-built ``rdma_scatter_ext`` extension (no JIT).
+
+    Build before starting the server::
+
+        cd <repo>/test/cxl_utils && make rdma PYTHON=<same-python-as-sglang>
+
+    Raises:
+        RuntimeError: if the ``.so`` is missing or import fails.
+    """
+    global _rdma_ext_module
+    if _rdma_ext_module is not None:
+        return _rdma_ext_module
+
     import sys
+    import sysconfig
     from pathlib import Path
-
-    from torch.utils.cpp_extension import load
 
     sglang_root = Path(__file__).resolve().parents[4]
     cxl_utils = sglang_root / "test" / "cxl_utils"
 
-    so_files = list(cxl_utils.glob("rdma_scatter_ext*.so"))
-    if so_files:
-        sys.path.insert(0, str(cxl_utils))
-        try:
-            import rdma_scatter_ext
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    preferred = cxl_utils / f"rdma_scatter_ext{ext_suffix}"
 
-            return rdma_scatter_ext
-        except ImportError as e:
-            logger.warning(
-                "Pre-built rdma_scatter_ext found but failed to import: %s", e
-            )
-
-    src_c = cxl_utils / "rdma_scatter_read.c"
-    src_cpp = cxl_utils / "rdma_scatter_read_py.cpp"
-    src_h = cxl_utils / "rdma_scatter_read.h"
-
-    if not (src_c.exists() and src_cpp.exists() and src_h.exists()):
-        logger.warning(
-            "RDMA sources not found in %s. RDMA backend unavailable.",
-            cxl_utils,
+    if preferred.is_file():
+        so_hint = str(preferred)
+    else:
+        candidates = sorted(
+            cxl_utils.glob("rdma_scatter_ext*.so"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
         )
-        return None
+        if not candidates:
+            raise RuntimeError(
+                "Pre-built rdma_scatter_ext is missing. Compile before starting "
+                "SGLang (runtime JIT is disabled):\n"
+                f"  cd {cxl_utils} && make rdma PYTHON={sys.executable}\n"
+                f"Expected file: rdma_scatter_ext{ext_suffix}\n"
+                "Requires: libibverbs-dev, pybind11, Python dev headers."
+            )
+        so_hint = str(candidates[0])
+        logger.warning(
+            "rdma_scatter_ext%s not found; using newest %s — rebuild with "
+            "``make rdma PYTHON=%s`` if import fails.",
+            ext_suffix,
+            candidates[0].name,
+            sys.executable,
+        )
 
-    build_dir = cxl_utils / "build" / "rdma_ext"
-    build_dir.mkdir(parents=True, exist_ok=True)
+    cxl_str = str(cxl_utils)
+    if cxl_str not in sys.path:
+        sys.path.insert(0, cxl_str)
 
     try:
-        logger.info(
-            "JIT-compiling rdma_scatter_ext (first run only, cached in %s)...",
-            build_dir,
-        )
-        ext = load(
-            name="rdma_scatter_ext",
-            sources=[str(src_c), str(src_cpp)],
-            extra_cflags=["-O3", "-Wall", "-fPIC"],
-            extra_cxx_flags=["-O3", "-Wall", "-fPIC", "-std=c++17"],
-            extra_ldflags=["-libverbs"],
-            build_directory=str(build_dir),
-            verbose=False,
-            with_cuda=False,
-        )
-        logger.info("rdma_scatter_ext compiled successfully.")
+        import rdma_scatter_ext as ext  # type: ignore[import-not-found]
+
+        _rdma_ext_module = ext
+        logger.info("Loaded pre-built rdma_scatter_ext from %s", cxl_utils)
         return ext
     except Exception as e:
-        logger.warning(
-            "Failed to JIT-compile rdma_scatter_ext: %s. "
-            "Is libibverbs-dev installed?",
-            e,
-        )
-        return None
+        raise RuntimeError(
+            "Failed to import pre-built rdma_scatter_ext. "
+            "Rebuild with the same Python you use to launch SGLang:\n"
+            f"  cd {cxl_utils} && make clean && make rdma PYTHON={sys.executable}\n"
+            f"(looked for rdma_scatter_ext{ext_suffix} under {cxl_utils}; "
+            f"last candidate: {so_hint})\n"
+            f"Import error: {e}"
+        ) from e
 
 
 def _resolve_ib_dev(rdma_config: dict, tp_rank: int) -> str:
@@ -139,7 +158,7 @@ def _resolve_ib_devs_for_striping(
 
 
 class RDMALoopbackContext:
-    """Manages RDMA resources for loopback bulk-read simulation.
+    """Manages RDMA resources for NIC loopback bulk-read.
 
     Registers remote_buffer region as the RDMA remote MR (READ source)
     and landing_staging as the RDMA local MR (READ destination).
@@ -155,12 +174,7 @@ class RDMALoopbackContext:
         landing_buf_size: int,
         max_wr: int = 4096,
     ):
-        self.rdma_ext = _try_load_rdma_ext()
-        if self.rdma_ext is None:
-            raise RuntimeError(
-                "RDMA extension (rdma_scatter_ext) not found. "
-                "Build it with 'make rdma' in test/cxl_utils/"
-            )
+        self.rdma_ext = _load_rdma_ext()
 
         self.ib_dev = ib_dev
 
@@ -241,7 +255,7 @@ class RDMALoopbackContext:
 
 
 class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
-    """MLA KV Cache host pool with RDMA distributed pool simulation.
+    """MLA KV Cache host pool with RDMA-backed distributed pool.
 
     remote_buffer: page-first [num_tokens, layer_num, 1, kv_cache_dim]
     kv_buffer:     layer-first [layer_num, num_tokens, 1, kv_cache_dim]
@@ -348,27 +362,20 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
         landing_ptr = self.landing_staging.data_ptr()
         landing_size = self.landing_staging.numel() * self.landing_staging.element_size()
 
-        try:
-            self._rdma_ctx = RDMALoopbackContext(
-                ib_dev=self.ib_dev,
-                remote_buf_ptr=remote_ptr,
-                remote_buf_size=remote_size,
-                landing_buf_ptr=landing_ptr,
-                landing_buf_size=landing_size,
-            )
-        except RuntimeError as e:
-            logger.warning(
-                "RDMA loopback init failed (%s), falling back to simulation mode", e
-            )
-            self._rdma_ctx = None
+        self._rdma_ctx = RDMALoopbackContext(
+            ib_dev=self.ib_dev,
+            remote_buf_ptr=remote_ptr,
+            remote_buf_size=remote_size,
+            landing_buf_ptr=landing_ptr,
+            landing_buf_size=landing_size,
+        )
 
         logger.info(
             "RDMA host pool (rank_interleave): tp_rank=%d, ib_dev=%s, "
             "local_ratio=%.2f, remote_buffer=%.2f GB, "
-            "landing_staging=%.2f GB, rdma_available=%s",
+            "landing_staging=%.2f GB",
             self.tp_rank, self.ib_dev, self.local_ratio,
             remote_size / 1e9, landing_size / 1e9,
-            self._rdma_ctx is not None,
         )
 
     def _init_striping_contexts(
@@ -406,28 +413,16 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
             self._landing_stagings.append(shard_staging)
 
             landing_ptr = shard_staging.data_ptr()
-            try:
-                ctx = RDMALoopbackContext(
-                    ib_dev=ib_dev,
-                    remote_buf_ptr=remote_ptr,
-                    remote_buf_size=remote_size,
-                    landing_buf_ptr=landing_ptr,
-                    landing_buf_size=shard_staging_size,
-                )
-                self._rdma_ctxs.append(ctx)
-            except RuntimeError as e:
-                logger.warning(
-                    "RDMA striping context init failed for %s (%s), "
-                    "falling back to %d contexts",
-                    ib_dev, e, len(self._rdma_ctxs),
-                )
-                break
+            ctx = RDMALoopbackContext(
+                ib_dev=ib_dev,
+                remote_buf_ptr=remote_ptr,
+                remote_buf_size=remote_size,
+                landing_buf_ptr=landing_ptr,
+                landing_buf_size=shard_staging_size,
+            )
+            self._rdma_ctxs.append(ctx)
 
-        # Fallback single context for short sequences
-        if self._rdma_ctxs:
-            self._rdma_ctx = self._rdma_ctxs[0]
-        else:
-            self._rdma_ctx = None
+        self._rdma_ctx = self._rdma_ctxs[0]
 
         logger.info(
             "RDMA host pool (request_striping): tp_rank=%d, ib_devs=%s, "
@@ -520,12 +515,12 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
 
         self.landing_staging[:num_tokens] = self.remote_buffer[valid_cpu]
 
-        if self._rdma_ctx is not None:
-            rdma_us = self._rdma_ctx.bulk_read(total_bytes)
-        else:
-            t0 = time.monotonic()
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            rdma_us = (time.monotonic() - t0) * 1e6
+        if self._rdma_ctx is None:
+            raise RuntimeError(
+                "RDMA context is unset; RDMAMLATokenToKVPoolHost requires a "
+                "successful RDMALoopbackContext init."
+            )
+        rdma_us = self._rdma_ctx.bulk_read(total_bytes)
 
         t_transpose_start = time.monotonic()
         src = self.landing_staging[:num_tokens].permute(1, 0, 2, 3).contiguous()
@@ -615,11 +610,9 @@ class RDMAMLATokenToKVPoolHost(MLATokenToKVPoolHost):
 
         for s, err in enumerate(errors):
             if err is not None:
-                logger.warning(
-                    "RDMA striped shard %d failed: %s, falling back to single-NIC",
-                    s, err,
-                )
-                return self._prefetch_for_decode_single(req_pool_idx, valid)
+                raise RuntimeError(
+                    f"RDMA striped shard {s} failed (no single-NIC fallback): {err}"
+                ) from err
 
         rdma_us = max(rdma_results)
 

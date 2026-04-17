@@ -1,7 +1,12 @@
 # Makefile for building the RDMA scatter read pybind11 extension.
 #
+# HiSparse RDMA host pool loads this extension at server startup only (no JIT).
+# Build with the same interpreter you use for ``python -m sglang.launch_server``:
+#
+#   cd test/cxl_utils && make rdma PYTHON=/path/to/venv/bin/python
+#
 # Usage:
-#   make rdma          # Build rdma_scatter_ext.so
+#   make rdma          # Build rdma_scatter_ext$(EXT_SUFFIX)
 #   make clean         # Remove build artefacts
 #
 # Prerequisites:
