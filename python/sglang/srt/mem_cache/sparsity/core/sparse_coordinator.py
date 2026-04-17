@@ -53,7 +53,19 @@ class RequestTrackers:
 
 @dataclass
 class SparseConfig:
-    """Configuration for sparse attention."""
+    """Configuration for sparse attention.
+
+    Page sizing follows the "sparse_page_size = backend_page_size × N" rule
+    (N >= 1, integer):
+
+    * ``page_size``         — the *sparse* page size (i.e. the unit the
+      algorithm selects at; Quest's bounding-box pool is indexed at this
+      granularity).  Defaults to ``backend_page_size`` when not set, which
+      gives the zero-overhead 1:1 mapping.
+    * ``backend_page_size`` — the attention backend's page size (``server_args.page_size``).
+      The ``MetadataAdapter`` expands each selected sparse page into
+      ``N = page_size / backend_page_size`` consecutive backend pages.
+    """
 
     top_k: int = 2048
     device_buffer_size: int = 4096
@@ -61,6 +73,7 @@ class SparseConfig:
     algorithm: Optional[str] = None
     backend: Optional[str] = None
     page_size: Optional[int] = None
+    backend_page_size: Optional[int] = None
     min_sparse_prompt_len: Optional[int] = None
     sparse_extra_config: dict = field(
         default_factory=dict
@@ -352,6 +365,9 @@ class SparseCoordinator:
             forward_batch=forward_batch,
             req_to_token=self.req_to_token_pool.req_to_token,
             page_size=self.page_size,
+            backend_page_size=(
+                self.config.backend_page_size or self.page_size
+            ),
             layer_id=layer.layer_id,
             device_locs_per_tok=device_locs_per_tok,
             io_subsystem=self.io_subsystem,

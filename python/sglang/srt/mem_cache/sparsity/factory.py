@@ -118,28 +118,65 @@ def create_sparse_coordinator(
 ) -> SparseCoordinator:
     config = _parse_sparse_config(server_args)
 
-    # Inherit defaults that only make sense at this callsite.
+    # Resolve page sizes.
+    #
+    # ``backend_page_size`` comes from the attention backend's page size
+    # (server_args.page_size == token_to_kv_pool.page_size).  When the user
+    # does not override ``page_size`` in --hisparse-config we keep the 1:1
+    # mapping (sparse_page_size == backend_page_size, N == 1).
+    backend_page_size = getattr(token_to_kv_pool, "page_size", 1)
+    config.backend_page_size = backend_page_size
     if config.page_size is None:
-        config.page_size = getattr(token_to_kv_pool, "page_size", 1)
+        config.page_size = backend_page_size
     if config.min_sparse_prompt_len is None:
         config.min_sparse_prompt_len = 0
 
-    # Quest maintains a per-page bounding-box pool on GPU:
-    #   page_k_min/max: [num_pages, kv_heads, head_dim, float32]
-    # Its GPU footprint is O(num_tokens / page_size). With page_size == 1
-    # the pool is exactly as large as the full device KV pool stored in
-    # float32, which is 4× the size of the bf16 KV cache itself and makes
-    # HiSparse infeasible on anything but a giant GPU.  Refuse early with a
-    # clear message so users know to pass ``"page_size": 16`` (or larger).
-    _algo = (config.algorithm or "deepseek_nsa").lower()
-    if _algo == "quest" and config.page_size is not None and config.page_size < 8:
+    # Page-granularity sparse algorithms (Quest, ChunkKV, ...) must satisfy
+    #   sparse_page_size = backend_page_size * N,  N in {1, 2, 4, ...}
+    if (
+        config.page_size < backend_page_size
+        or config.page_size % backend_page_size != 0
+    ):
         raise ValueError(
-            "HiSparse+Quest: page_size={ps} is too small. Quest's bounding-box "
-            "representation pool scales as O(num_tokens / page_size) × kv_heads × "
-            "head_dim × 4B × num_layers; with page_size<=1 it easily exceeds GPU "
-            "memory.\nPlease pass --page-size 16 (or larger) at launch, or set "
-            '\"page_size\": 16 in --hisparse-config.'.format(ps=config.page_size)
+            "HiSparse page-granularity sparse algorithm requires "
+            "sparse_page_size = backend_page_size * N (N >= 1 integer), "
+            "but got sparse_page_size={sp} vs backend_page_size={bp}. "
+            "Either omit 'page_size' in --hisparse-config (inherits "
+            "backend page size), or set it to a positive integer multiple "
+            "of the backend page size.".format(
+                sp=config.page_size, bp=backend_page_size
+            )
         )
+
+    # Helpful heuristic warning: Quest keeps per-sparse-page bbox tensors on
+    # GPU; when sparse_page_size is tiny (e.g. == backend_page_size == 1) the
+    # pool is huge (scales with num_tokens) and often OOMs at startup.
+    _algo = (config.algorithm or "deepseek_nsa").lower()
+    if _algo == "quest" and config.page_size < 8:
+        try:
+            _total_tokens = int(
+                token_to_kv_pool.get_key_buffer(
+                    getattr(token_to_kv_pool, "start_layer", 0)
+                ).shape[0]
+            )
+            _head_num = int(getattr(token_to_kv_pool, "head_num", 0))
+            _head_dim = int(getattr(token_to_kv_pool, "head_dim", 0))
+            _num_layers = int(getattr(token_to_kv_pool, "layer_num", 0))
+            _num_pages = (_total_tokens + config.page_size - 1) // config.page_size
+            _bbox_bytes = _num_pages * _head_num * _head_dim * 4 * 2 * _num_layers
+            if _bbox_bytes > 2 * (1024**3):  # > 2 GB
+                logger.warning(
+                    "HiSparse+Quest: sparse page_size=%d is small; the bbox "
+                    "representation pool will take ~%.1f GB of GPU memory "
+                    "across all layers. Consider setting "
+                    '\"page_size\": 16 (or a larger multiple of '
+                    "backend_page_size=%d) in --hisparse-config.",
+                    config.page_size,
+                    _bbox_bytes / (1024**3),
+                    backend_page_size,
+                )
+        except Exception:
+            pass
 
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
