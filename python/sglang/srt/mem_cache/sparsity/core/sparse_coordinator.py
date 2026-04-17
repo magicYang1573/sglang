@@ -317,6 +317,26 @@ class SparseCoordinator:
         attn_metadata: Optional[Any],
         **kwargs,
     ) -> Optional[torch.Tensor]:
+        # CUDA graph capture of the FA3 path runs the kernel with a baked
+        # ``scheduler_metadata`` tensor whose shape is derived from the
+        # *capture-time* ``max_seq_len_k`` / ``cache_seqlens``.  Our
+        # ``FlashAttentionAdaptor.adapt_for_attn_metadata`` modifies those
+        # fields per step, which invalidates the baked scheduler metadata
+        # and causes FA3 to raise
+        # ``scheduler_metadata must have shape (metadata_size)`` at replay.
+        # Until we teach the FA3 backend to recompute scheduler_metadata
+        # after the adapter runs, the sparse + HiSparse-MHA path is
+        # incompatible with CUDA graph capture: launch with
+        # ``--disable-cuda-graph``.  During capture we early-return to let
+        # the dense kernel run so capture itself does not fail; sparse
+        # retrieval is only meaningful at eager-mode replay anyway.
+        from sglang.srt.model_executor.cuda_graph_runner import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return None
+
         req_pool_indices = forward_batch.req_pool_indices
         sparse_mask = self._compute_sparse_mask(req_pool_indices)
 

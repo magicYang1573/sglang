@@ -131,21 +131,17 @@ def create_sparse_coordinator(
     if config.min_sparse_prompt_len is None:
         config.min_sparse_prompt_len = 0
 
-    # Page-granularity sparse algorithms (Quest, ChunkKV, ...) must satisfy
-    #   sparse_page_size = backend_page_size * N,  N in {1, 2, 4, ...}
-    if (
-        config.page_size < backend_page_size
-        or config.page_size % backend_page_size != 0
-    ):
+    # For SGLang's FA3 path, ``metadata.page_table`` is always stored at
+    # token granularity (req_to_token slice), so the adaptor can work with
+    # any ``sparse_page_size``; we still keep ``sparse_page_size >= 1`` as
+    # a lower bound.  For truly paged attention backends where page_table
+    # is at page granularity (e.g. flashmla_sparse used by DSA), the N-fold
+    # expansion constraint (sparse_page_size = backend_page_size * N) does
+    # apply, but DSA takes a different code path and does not go through
+    # this factory.
+    if config.page_size < 1:
         raise ValueError(
-            "HiSparse page-granularity sparse algorithm requires "
-            "sparse_page_size = backend_page_size * N (N >= 1 integer), "
-            "but got sparse_page_size={sp} vs backend_page_size={bp}. "
-            "Either omit 'page_size' in --hisparse-config (inherits "
-            "backend page size), or set it to a positive integer multiple "
-            "of the backend page size.".format(
-                sp=config.page_size, bp=backend_page_size
-            )
+            f"HiSparse sparse_page_size must be >= 1, got {config.page_size}."
         )
 
     # Helpful heuristic warning: Quest keeps per-sparse-page bbox tensors on
