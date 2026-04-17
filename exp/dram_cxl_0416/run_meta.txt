@@ -1,0 +1,11 @@
+run_cxl_interleave2_dram_output_concurrency_sweep.sh
+timestamp=20260417_013441
+MODEL_PATH=/data3/yt/models/DeepSeek-V3.2-AWQ MODEL_CLIENT=deepseek-ai/DeepSeek-V3.2
+TP=8 DP_SIZE=8 PORT=30000
+NUM_REQUESTS_CXL=(unset) tiered by concurrency
+MAX_CONCURRENCY_FIXED=64 (phase 2)
+CXL_DEV_PATH=/dev/dax0.0 CXL_DEV_PATH_2=/dev/dax1.0
+CXL_MAP_BYTES_PER_DEVICE=274877906944
+TOTAL_CASES=32 (phase1=16 phase2=16)
+RESULTS_DIR=./exp/dram_cxl_0416
+PYTHON_BIN=/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
