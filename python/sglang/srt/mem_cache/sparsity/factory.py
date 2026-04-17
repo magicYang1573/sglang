@@ -124,6 +124,23 @@ def create_sparse_coordinator(
     if config.min_sparse_prompt_len is None:
         config.min_sparse_prompt_len = 0
 
+    # Quest maintains a per-page bounding-box pool on GPU:
+    #   page_k_min/max: [num_pages, kv_heads, head_dim, float32]
+    # Its GPU footprint is O(num_tokens / page_size). With page_size == 1
+    # the pool is exactly as large as the full device KV pool stored in
+    # float32, which is 4× the size of the bf16 KV cache itself and makes
+    # HiSparse infeasible on anything but a giant GPU.  Refuse early with a
+    # clear message so users know to pass ``"page_size": 16`` (or larger).
+    _algo = (config.algorithm or "deepseek_nsa").lower()
+    if _algo == "quest" and config.page_size is not None and config.page_size < 8:
+        raise ValueError(
+            "HiSparse+Quest: page_size={ps} is too small. Quest's bounding-box "
+            "representation pool scales as O(num_tokens / page_size) × kv_heads × "
+            "head_dim × 4B × num_layers; with page_size<=1 it easily exceeds GPU "
+            "memory.\nPlease pass --page-size 16 (or larger) at launch, or set "
+            '\"page_size\": 16 in --hisparse-config.'.format(ps=config.page_size)
+        )
+
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool
