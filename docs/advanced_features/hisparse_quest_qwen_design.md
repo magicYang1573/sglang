@@ -125,27 +125,17 @@ Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，�
 
 ### 3.3 Topk 的语义对齐
 
+与 DSA 完全对齐：**用户配置的是 `top_k`（每步参与 attention 的 token 数量）**，kernel 期望的也是 token 级索引。区别仅在内部实现层——Quest 按页选，页内的 token 全部带出：
+
 | 维度 | DSA 现状 | Quest + Qwen 新路径 |
 |------|----------|---------------------|
-| topk 单位 | token 级（indexer 输出 token 索引） | page 级（Quest 输出 page 索引） |
-| topk 值 | logical token idx（全量池里的位置） | logical page idx |
-| kernel 期望 | `top_k_tokens`（int32，shape `[bs, top_k]`，-1 填充） | 同左，需要把 page idx 展开为 token idx |
+| 用户 config | `top_k = 2048`（token 数） | `top_k = 2048`（token 数，同语义） |
+| 算法输出 | indexer 直接给 token 级索引 | Quest 给 page 级索引（`num_topk_pages = ⌈top_k / page_size⌉`） |
+| 喂给 kernel | `top_k_tokens`（int32，shape `[bs, top_k]`，-1 填充） | 同左：对 page 级索引做 `page × page_size + [0..page_size)` 展开后得到 token 级 |
 
-因此 Quest 路径在 `SparseCoordinator.attention_begin` 里对 `selected_indices`（page 级）**需要展开为 token 级**再喂给 kernel：
+Quest 路径在 `SparseCoordinator._handle_sparse_retrieve` 里对 `selected_indices`（page 级）展开为 token 级，由辅助函数 `_expand_selected_pages_to_tokens` 完成：给定 `selected_pages: [bs, num_topk_pages]` 和 `seq_lens`，输出 `[bs, top_k]`，-1 padding 并保证 token 级索引严格小于 `seq_lens`。
 
-```
-# pseudo-code
-tokens_per_req = []
-for i, pages in enumerate(selected_indices):     # [bs, max_pages]
-    toks = pages[:, None] * page_size + arange(page_size)
-    toks = toks[toks < seq_lens[i]]
-    tokens_per_req.append(toks)
-top_k_tokens = pad_to_topk(tokens_per_req, top_k=config.top_k, pad=-1)
-```
-
-为了避免重新分配 tensor，可在 `SparseCoordinator` 里预分配 `top_k_tokens_buffer: [max_reqs, top_k]`（CUDA-graph 友好），在 kernel 之前做 in-place 展开。
-
-> 选择 `top_k = num_topk_pages × page_size` 是最简单的；更精细可以按 bbox score 为每页选不同数量，但会让 CUDA graph 捕获变形，**首版不做**。
+> 固定选 `num_topk_pages = ⌈top_k / page_size⌉` 页、固定输出宽度 `top_k`，**CUDA graph 友好**。不做按页动态 k 的变形（Quest/DSA 原论文实现也不依赖）。
 
 ### 3.4 Host Pool / Device Pool 的 MHA 版本
 
@@ -227,13 +217,11 @@ Qwen 默认走 FA3。FA3 的 `forward_extend` / `forward_decode` 路径里**没�
     "backend":   "flashmla_sparse" | "fa3",
     "top_k": 2048,
     "device_buffer_size": 6144,
-    "host_to_device_ratio": 10,
-    "page_size": 16,
-    "min_sparse_prompt_len": 8192,
-    "sparsity_ratio": 0.3,          # Quest 专用
-    "num_recent_pages": 4            # Quest 专用
+    "host_to_device_ratio": 10
 }'
 ```
+
+**与 DSA HiSparse 完全一致的配置表面**：用户只需给定 `top_k`、`device_buffer_size`、`host_to_device_ratio`，Quest 内部自动按 `num_topk_pages = ⌈top_k / page_size⌉` 选页，不需要也不接受 `sparsity_ratio / num_recent_pages / min_sparse_prompt_len`。
 
 - `algorithm="deepseek_nsa"` 时维持现有 DSA + flashmla_sparse 约束不变（向后兼容）。
 - `algorithm="quest"` 时允许 `backend in {"fa3"}`，允许非 MLA 模型；并且 `kv_cache_dtype` 从 `bfloat16/float16` 中选（kernel 的 `item_size_bytes` 动态计算，不强绑 bf16）。
@@ -245,9 +233,7 @@ Qwen 默认走 FA3。FA3 的 `forward_extend` / `forward_decode` 路径里**没�
 2. 预分配 `req_device_buffer_tokens / _token_locs / lru_slots`；
 3. 通过 `num_real_reqs` 标量让 kernel 里的 padded block early-return。
 
-MHA 路径 **完全复用** 这套结构。需要注意的是：
-- `top_k_tokens_buffer`（Quest 输出 → 展开成 token 级）也要预分配，且在 graph replay 前写入。
-- `QuestAlgorithm.retrieve_topk` 当前默认实现用 Python `for i in range(bs)` 每 req 一次 `torch.topk`，**不 CUDA-graph 友好**；首版 Quest + HiSparse 需要重写成批量版本（参见 `base_algorithm.py:274` 的 TODO）。可以用 `torch.topk` 在 `[bs, num_pages]` 上一次完成，padding 到 `[bs, num_total_pages]` 并用 `-inf` 做非法页掩码。
+MHA 路径 **完全复用** 这套结构。`QuestAlgorithm.retrieve_topk` 被覆盖为一次 `torch.topk` 的批量版本（`[bs, max_num_pages]` 上一次完成，对非法/越界页用 `-inf` 掩码），输出宽度固定为 `num_topk_pages = ⌈top_k / page_size⌉`；后续的 page→token 展开以及 kernel 调用也都是固定形状，整条链路 CUDA graph 安全。
 
 ---
 
@@ -359,11 +345,7 @@ python3 -m sglang.launch_server \
         "backend": "fa3",
         "top_k": 2048,
         "device_buffer_size": 6144,
-        "host_to_device_ratio": 10,
-        "page_size": 16,
-        "min_sparse_prompt_len": 8192,
-        "sparsity_ratio": 0.3,
-        "num_recent_pages": 4
+        "host_to_device_ratio": 10
     }'
 ```
 

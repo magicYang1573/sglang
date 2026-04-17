@@ -358,9 +358,12 @@ class SparseCoordinator:
         )
 
     def _compute_sparse_mask(self, req_pool_indices):
-        mask = (
-            self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
+        threshold = self.config.min_sparse_prompt_len or 0
+        if threshold <= 0:
+            # Always run sparse attention (matches DSA HiSparse behavior).
+            return torch.ones(
+                req_pool_indices.shape[0], dtype=torch.bool, device=self.device
+            )
+        return (
+            self.states.prompt_lens[req_pool_indices] >= threshold
         )
-
-        return mask

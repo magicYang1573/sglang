@@ -79,15 +79,15 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
 
-    if device_buffer_size < top_k:
-        raise ValueError(
-            f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
-        )
-
     algorithm = extra_config.pop("algorithm", None)
     backend = extra_config.pop("backend", None)
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
+
+    if device_buffer_size < top_k:
+        raise ValueError(
+            f"device_buffer_size ({device_buffer_size}) must be no smaller than top_k ({top_k})"
+        )
 
     return SparseConfig(
         top_k=top_k,

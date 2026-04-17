@@ -113,17 +113,14 @@ class TestQuestBatchedRetrieve(unittest.TestCase):
         states.last_constructed_page = torch.tensor([num_pages], device=device)
 
         config = SparseConfig(
-            top_k=page_size * 2,
+            top_k=page_size * 2,  # 2 pages worth of tokens
             device_buffer_size=page_size * 4,
             host_to_device_ratio=2,
             algorithm="quest",
             backend="fa3",
             page_size=page_size,
             min_sparse_prompt_len=0,
-            sparse_extra_config={
-                "sparsity_ratio": 0.5,
-                "num_recent_pages": 1,
-            },
+            sparse_extra_config={},
         )
 
         algo = QuestAlgorithm(config, device)
@@ -166,6 +163,8 @@ class TestQuestBatchedRetrieve(unittest.TestCase):
         )
         self.assertEqual(pages.dim(), 2)
         self.assertEqual(pages.shape[0], 1)
+        # Output width must equal ceil(top_k / page_size) — here 2*page / page = 2.
+        self.assertEqual(pages.shape[1], 2)
         self.assertGreaterEqual(int(lens[0]), 1)
         # No padding slots should point beyond the page range.
         valid = pages[0][pages[0] >= 0]
