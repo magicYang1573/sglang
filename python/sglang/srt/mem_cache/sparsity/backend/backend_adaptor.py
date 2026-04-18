@@ -101,25 +101,24 @@ class FlashAttentionAdaptor(BackendAdaptor):
     ) -> Any:
         """Adapt FA3 metadata for sparse KV access.
 
-        SGLang's FA3 path stores ``metadata.page_table`` as **token-level**
-        physical KV slot indices (``req_to_token[req, :seq_len]``), because
-        the KV buffer is laid out as ``[num_slots, num_heads, head_dim]``
-        (flat, no explicit page dim).  FA3 sees this as "page_size=1 paged
-        KV" at kernel level, regardless of the server-side
-        ``--page-size`` (which only controls allocation alignment).
+        **Interface contract (MVP, see docs/advanced_features/
+        hisparse_quest_qwen_design.md §1.4):** when FA3 serves as the
+        attention backend for a non-native-sparse algorithm (Quest /
+        SnapKV / ...), the ``server_args.page_size`` **must be 1** so that
+        ``metadata.page_table`` carries **token-level** physical KV slot
+        indices.  Under this contract the adapter only needs to expand the
+        algorithm's selected *sparse pages* into per-token logical
+        positions, translate through ``req_to_token`` (and, when HiSparse
+        is attached, through ``translate_loc_to_hisparse_device``), and
+        write the compact list of hisparse-device token slots into
+        ``page_table[:, :valid_tokens]``.  ``cache_seqlens_int32`` is then
+        ``valid_tokens``.
 
-        Therefore this adaptor:
-
-        1. Expands the selected *sparse* pages ``[bs, num_topk_pages]``
-           into token-level logical positions
-           ``[bs, num_topk_pages * sparse_page_size]``.
-        2. Maps through ``req_to_token`` to get physical token slots.
-        3. (Optional) Translates logical slots → hisparse device buffer
-           slots via ``HiSparseMHATokenToKVPool.translate_loc_to_hisparse_device``.
-        4. Writes the contiguous-compacted slot list into
-           ``metadata.page_table[:, :valid_tokens]``; pads the rest with 0.
-        5. Fixes ``cache_seqlens_int32 / cu_seqlens_k / max_seq_len_k`` to
-           reflect only the tokens we actually selected.
+        ``page_size > 1`` on the attention backend is explicitly out of
+        scope for this MVP: HiSparse's swap-in kernel places each selected
+        token at an arbitrary hot-buffer slot, which is incompatible with
+        FA3's page-aligned addressing when ``page_size > 1``.  We fail
+        loudly here so misconfiguration does not silently produce garbage.
         """
         if self._original_metadata is None:
             return current_metadata
@@ -128,6 +127,15 @@ class FlashAttentionAdaptor(BackendAdaptor):
             return current_metadata
 
         sparse_page_size = page_size  # from SparseCoordinator
+        backend_page_size = int(kwargs.get("backend_page_size", 1) or 1)
+        if backend_page_size != 1:
+            raise ValueError(
+                "FlashAttentionAdaptor requires --page-size 1 when used as "
+                "the attention backend for HiSparse non-native sparse "
+                "algorithms (got backend_page_size="
+                f"{backend_page_size}).  See "
+                "docs/advanced_features/hisparse_quest_qwen_design.md §1.4."
+            )
         device = forward_batch.seq_lens.device
 
         # Reset metadata to its captured baseline before we touch it.
@@ -136,19 +144,52 @@ class FlashAttentionAdaptor(BackendAdaptor):
             self._original_metadata["cache_seqlens_int32"]
         )
 
+        io_subsystem = kwargs.get("io_subsystem")
+        self._write_token_level(
+            selected_indices=selected_indices,
+            sparse_mask=sparse_mask,
+            current_metadata=current_metadata,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            sparse_page_size=sparse_page_size,
+            io_subsystem=io_subsystem,
+            device=device,
+        )
+        return current_metadata
+
+    # ------------------------------------------------------------------
+    # Token-level write strategy (the only supported path for HiSparse +
+    # non-native sparse algorithms on FA3; see docstring above).
+    # ------------------------------------------------------------------
+    def _write_token_level(
+        self,
+        selected_indices: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        current_metadata: Any,
+        forward_batch: "ForwardBatch",
+        req_to_token: torch.Tensor,
+        sparse_page_size: int,
+        io_subsystem: Optional[Any],
+        device: torch.device,
+    ) -> None:
+        """Token-level write into FA3 ``page_table`` (backend_page_size == 1).
+
+        Expands the Quest-selected sparse pages to per-token logical
+        positions, resolves them through ``req_to_token`` (and, when
+        HiSparse is attached, ``translate_loc_to_hisparse_device``), and
+        writes the compact list of physical KV slots into
+        ``page_table[:, :valid_tokens]``.
+        """
         bs, num_topk_pages = selected_indices.shape
         seq_lens = forward_batch.seq_lens.to(torch.int32)
 
-        # 1) Page idx -> token positions per request.
-        #    logical_token_pos[b, i*page_size + j] = page[b,i] * page_size + j
-        #                                          or -1 if page[b,i] == -1
         offsets = torch.arange(
             sparse_page_size, device=device, dtype=torch.int32
         )
         token_pos = (
             selected_indices.unsqueeze(-1).to(torch.int32) * sparse_page_size
             + offsets.view(1, 1, sparse_page_size)
-        ).view(bs, num_topk_pages * sparse_page_size)  # [bs, T]
+        ).view(bs, num_topk_pages * sparse_page_size)
         page_valid = (
             (selected_indices >= 0)
             .unsqueeze(-1)
@@ -156,47 +197,31 @@ class FlashAttentionAdaptor(BackendAdaptor):
             .reshape(bs, num_topk_pages * sparse_page_size)
         )
         in_seq = token_pos < seq_lens.unsqueeze(1)
-        tok_valid = page_valid & in_seq  # [bs, T]
+        tok_valid = page_valid & in_seq
 
-        # Compact valid token positions to the front of each row via a
-        # stable sort on the inverted mask (0 = valid first, 1 = invalid).
         sort_key = (~tok_valid).to(torch.int8)
         order = torch.argsort(sort_key, dim=1, stable=True)
         token_pos_sorted = torch.gather(token_pos, 1, order)
         tok_valid_sorted = torch.gather(tok_valid, 1, order)
 
-        # 2) Logical token pos -> physical KV slot via req_to_token.
         req_idx = forward_batch.req_pool_indices.unsqueeze(1)
-        # Clamp out-of-bounds positions (the invalid tail) before indexing.
         token_pos_clamped = token_pos_sorted.clamp(min=0).to(torch.int64)
         max_req_tokens = req_to_token.shape[1]
         token_pos_clamped = token_pos_clamped.clamp(max=max_req_tokens - 1)
-        physical_slots = req_to_token[req_idx, token_pos_clamped]  # [bs, T]
+        physical_slots = req_to_token[req_idx, token_pos_clamped]
 
-        # 3) Optional: translate logical physical slots to the compact
-        #    hisparse device buffer slots.  This mirrors the NSA backend's
-        #    ``translate_loc_to_hisparse_device(page_table_1)`` call site.
-        io_subsystem = kwargs.get("io_subsystem")
         if io_subsystem is not None:
             translate = (
                 forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device
             )
             physical_slots = translate(physical_slots.to(torch.int64))
 
-        physical_slots = physical_slots.to(
-            current_metadata.page_table.dtype
-        )
+        physical_slots = physical_slots.to(current_metadata.page_table.dtype)
+        valid_tokens = tok_valid_sorted.sum(dim=1).to(torch.int32)
 
-        # Number of valid tokens per request (for page_table write & seqlen).
-        valid_tokens = tok_valid_sorted.sum(dim=1).to(torch.int32)  # [bs]
-
-        # 4) Write token-level slots into page_table[:, :T], zero-pad tail.
         T = token_pos_sorted.shape[1]
         pt_width = current_metadata.page_table.shape[1]
         if T > pt_width:
-            # If caller asked for more tokens than page_table can hold,
-            # truncate — page_table is sized for the un-sparsified max
-            # context, so this should not normally happen.
             T = pt_width
             physical_slots = physical_slots[:, :T]
             tok_valid_sorted = tok_valid_sorted[:, :T]
@@ -207,12 +232,9 @@ class FlashAttentionAdaptor(BackendAdaptor):
             physical_slots,
             torch.zeros_like(physical_slots),
         )
-        # Any pre-existing entries past the compacted valid tail are
-        # logically "unused" — zero them so FA3 never reads stale slots.
         if T < pt_width:
             current_metadata.page_table[:, T:] = 0
 
-        # 5) Fix up cache seqlens to reflect only the selected tokens.
         current_metadata.cache_seqlens_int32 = torch.where(
             sparse_mask,
             valid_tokens,
@@ -227,4 +249,3 @@ class FlashAttentionAdaptor(BackendAdaptor):
         current_metadata.max_seq_len_k = int(
             current_metadata.cache_seqlens_int32.max()
         )
-        return current_metadata

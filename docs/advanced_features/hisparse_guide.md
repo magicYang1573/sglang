@@ -130,6 +130,13 @@ python3 -m sglang.bench_serving \
       - **~1 TB** host memory → `host_to_device_ratio: 5`
       - **~2 TB** host memory → `host_to_device_ratio: 10`
 
+### Non-native sparse algorithms (Quest on Qwen / MHA / GQA)
+
+HiSparse also supports non-native sparse algorithms via `--hisparse-config '{"algorithm": "quest", ...}'` (see
+[`hisparse_quest_qwen_design.md`](./hisparse_quest_qwen_design.md)).  In that mode FA3 is the attention
+backend and uses a **token-level** `page_table` — therefore **`--page-size 1` is required**.
+Setting `--page-size > 1` will cause a startup-time `ValueError`.
+
 ## Acknowledgments
 
 We would like to thank the SGLang team and community for the implementation and generous support, especially Zhiqiang Xie, Zhangheng Huang, Tingwei Huang, Shangming Cai, Teng Ma, and many others. We also thank the Alibaba Cloud TairKVCache team and the AntGroup SCT Inference team for their valuable contributions.

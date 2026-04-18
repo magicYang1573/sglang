@@ -212,7 +212,20 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         phys_tok = req_to_token[
             reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
             tok_pos.clamp(0, req_to_token.shape[1] - 1),
-        ].clamp(0, k_buffer.shape[0] - 1)
+        ]
+
+        # Under HiSparse, K is physically stored at *hisparse device* slots
+        # (see HiSparseMHATokenToKVPool.set_kv_buffer which translates the
+        # logical loc before writing).  req_to_token however still keeps
+        # *logical* slots, so we must translate once more here before
+        # indexing k_buffer; otherwise Quest would read garbage for its
+        # bounding-box representations.
+        translate = getattr(
+            self.token_to_kv_pool, "_translate_loc_to_hisparse_device", None
+        )
+        if translate is not None:
+            phys_tok = translate(phys_tok.to(torch.int64))
+        phys_tok = phys_tok.to(torch.int64).clamp(0, k_buffer.shape[0] - 1)
 
         keys = k_buffer[phys_tok].to(torch.float32)
         mask = tok_mask.unsqueeze(-1).unsqueeze(-1)

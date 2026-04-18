@@ -6641,6 +6641,22 @@ class ServerArgs:
                         f"HiSparse (Quest) requires bf16/fp16 KV cache, but got "
                         f"--kv-cache-dtype={self.kv_cache_dtype}."
                     )
+                # MVP: FA3 serves this path with token-level page_table
+                # (see docs/advanced_features/hisparse_quest_qwen_design.md
+                # §1.4).  Any server_args.page_size > 1 would flip FA3's
+                # page_table into page-level addressing, which is
+                # incompatible with HiSparse's token-granular swap-in.
+                if self.page_size is not None and self.page_size != 1:
+                    raise ValueError(
+                        "HiSparse (Quest) + FA3 requires --page-size 1 "
+                        f"(got --page-size={self.page_size}). "
+                        "Non-native sparse algorithms expose a token-level "
+                        "page_table to the attention backend; any larger "
+                        "page_size breaks the FA3 <-> HiSparse interface."
+                    )
+                # Pin page_size=1 so later _handle_page_size / per-backend
+                # defaults cannot silently flip it.
+                self.page_size = 1
             else:
                 raise ValueError(
                     f"HiSparse: unsupported algorithm={_algo!r}. "

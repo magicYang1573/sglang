@@ -202,9 +202,17 @@ class HiSparseMHATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "Page size = 1 is not supported in HiSparse MHA allocator"
-        )
+        # Only reachable when ``page_size == 1``.  For page_size > 1 the
+        # scheduler drives allocation via ``alloc_extend`` / ``alloc_decode``
+        # instead.  Forwarding to ``hisparse_attn_allocator`` here is only
+        # used by ``alloc_device_buffer`` when topping up hot-buffer slots.
+        if self.page_size != 1:
+            raise NotImplementedError(
+                "HiSparseMHATokenToKVPoolAllocator.alloc(need_size) is only "
+                "defined for page_size==1 (the Quest + FA3 MVP path); for "
+                "page_size>1 use alloc_extend / alloc_decode."
+            )
+        return self.hisparse_attn_allocator.alloc(need_size)
 
     def alloc_logical_only(
         self,
@@ -273,7 +281,12 @@ class HiSparseMHATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
-        assert self.page_size > 1
+        # ``page_size == 1`` is the Quest + FA3 MVP (see
+        # docs/advanced_features/hisparse_quest_qwen_design.md §1.4).  For
+        # that case ``get_num_new_pages`` degenerates to
+        # ``extend_num_tokens`` and the underlying
+        # ``PagedTokenToKVPoolAllocator.alloc_extend`` still works (page ==
+        # token).  No special branching needed here.
 
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
