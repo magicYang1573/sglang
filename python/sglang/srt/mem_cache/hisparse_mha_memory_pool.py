@@ -202,17 +202,53 @@ class HiSparseMHATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def alloc(self, need_size: int):
-        # Only reachable when ``page_size == 1``.  For page_size > 1 the
-        # scheduler drives allocation via ``alloc_extend`` / ``alloc_decode``
-        # instead.  Forwarding to ``hisparse_attn_allocator`` here is only
-        # used by ``alloc_device_buffer`` when topping up hot-buffer slots.
+        # With ``--page-size 1`` the scheduler's ``alloc_for_extend`` /
+        # ``alloc_for_decode`` both collapse to
+        # ``alloc_token_slots -> allocator.alloc(need_size)`` (see
+        # ``sglang.srt.mem_cache.common``).  We must therefore service
+        # **both** the prefill/extend and the decode call paths here.
+        #
+        # Semantics (page_size == 1):
+        # * Always allocate ``need_size`` logical slots -- these are what
+        #   the scheduler writes into ``req_to_token_pool.req_to_token``.
+        # * During prefill/extend, also allocate matching hisparse slots
+        #   and populate ``full_to_hisparse_device_index_mapping`` so that
+        #   ``HiSparseMHATokenToKVPool.set_kv_buffer`` writes KV at the
+        #   correct hisparse-device location.  ``alloc_device_buffer``
+        #   will later "reclaim" these hisparse slots into the per-request
+        #   hot buffer and clear the mapping.
+        # * During decode, the coordinator's ``map_last_loc_to_buffer``
+        #   overwrites the mapping with a hot-buffer slot *after* this
+        #   function returns.  It is cheap and harmless to still pair a
+        #   fresh hisparse slot here: (a) decode K/V also flows through
+        #   ``set_kv_buffer`` *before* ``map_last_loc_to_buffer`` on the
+        #   very first step, so the mapping needs a temporary value; (b)
+        #   the soon-to-be-unused hisparse slot is freed by the
+        #   coordinator via ``alloc_device_buffer`` / grow-path or by
+        #   ``free_hisparse`` on request finish.
+        # * For ``page_size > 1`` the scheduler routes extend/decode
+        #   through ``alloc_extend`` / ``alloc_decode`` directly; this
+        #   ``alloc(need_size)`` entry point is not used (aside from
+        #   ``alloc_device_buffer`` top-ups, which hit
+        #   ``hisparse_attn_allocator.alloc`` directly).
         if self.page_size != 1:
             raise NotImplementedError(
                 "HiSparseMHATokenToKVPoolAllocator.alloc(need_size) is only "
                 "defined for page_size==1 (the Quest + FA3 MVP path); for "
                 "page_size>1 use alloc_extend / alloc_decode."
             )
-        return self.hisparse_attn_allocator.alloc(need_size)
+
+        logical_indices = self.logical_attn_allocator.alloc(need_size)
+        if logical_indices is None:
+            return None
+        hisparse_indices = self.hisparse_attn_allocator.alloc(need_size)
+        if hisparse_indices is None:
+            # Rollback the logical reservation so the caller's OOM path
+            # observes a consistent state.
+            self.logical_attn_allocator.free(logical_indices)
+            return None
+        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
+        return logical_indices
 
     def alloc_logical_only(
         self,

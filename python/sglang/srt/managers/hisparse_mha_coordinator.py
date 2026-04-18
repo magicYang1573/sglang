@@ -380,9 +380,28 @@ class HiSparseMHACoordinator:
         self.req_device_buffer_token_locs[
             :, req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
-        self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
-            reserved_buffer_loc
-        )
+
+        # In the ``--page-size 1`` path the allocator's ``alloc(need_size)``
+        # hands out *paired* (logical, hisparse) slots for every extend /
+        # decode token (see HiSparseMHATokenToKVPoolAllocator.alloc).  For
+        # fresh decode tokens the hisparse half is about to be overwritten
+        # by ``reserved_buffer_loc`` (a slot from the hot buffer), so the
+        # original hisparse slot would leak unless we recycle it.
+        #
+        # Order matters: we first *read the stale mapping*, then *install
+        # the new mapping*, and only *after that* return the stale hisparse
+        # slots to the allocator.  If we freed before grow/alloc ran, the
+        # allocator could hand the same slot back as a "fresh" hot-buffer
+        # slot in the very same step and we would alias two tokens onto
+        # one device slot.  (``_grow_device_buffers`` above has already
+        # completed any hot-buffer allocation before we reach this point.)
+        mapping = self.mem_pool_device.full_to_hisparse_device_index_mapping
+        stale_hisparse = None
+        if self.mem_pool_device.page_size == 1:
+            stale_hisparse = mapping[out_cache_loc].clone()
+        mapping[out_cache_loc] = reserved_buffer_loc
+        if stale_hisparse is not None:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(stale_hisparse)
 
     def _eager_backup_previous_token(
         self,
