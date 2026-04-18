@@ -151,6 +151,44 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         )
 
         valid_lengths = (selected_pages >= 0).sum(dim=1).to(torch.int32)
+
+        if not getattr(self, "_debug_retrieve_left", 6):
+            pass
+        else:
+            left = getattr(self, "_debug_retrieve_left", 6)
+            if left > 0 and layer_id == self.start_layer:
+                self._debug_retrieve_left = left - 1
+                import logging as _logging
+                _logging.getLogger("hisparse.debug").warning(
+                    "[HS-DBG Quest.retrieve L%d] bs=%d top_k=%d page_size=%d "
+                    "num_topk_pages=%d k_take=%d max_num_pages=%d "
+                    "selected_pages[0, :8]=%s valid_lengths=%s "
+                    "scores.max=%.2f scores.min_finite=%.2f "
+                    "num_finite_scores=%d",
+                    layer_id,
+                    int(bs),
+                    int(top_k_tokens),
+                    int(page_size),
+                    int(num_topk_pages),
+                    int(k_take),
+                    int(max_num_pages),
+                    selected_pages[0, :8].tolist() if bs > 0 else [],
+                    valid_lengths.tolist(),
+                    float(scores.max().item()) if scores.numel() else 0.0,
+                    float(
+                        torch.where(
+                            torch.isfinite(scores),
+                            scores,
+                            torch.full_like(scores, float("inf")),
+                        )
+                        .min()
+                        .item()
+                    )
+                    if scores.numel()
+                    else 0.0,
+                    int(torch.isfinite(scores).sum().item()),
+                )
+
         return selected_pages, valid_lengths
 
     def _initialize_representation_pools(
@@ -255,6 +293,33 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_min[layer_id][target_pages] = page_min[idx[:, 0], idx[:, 1]]
         self.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
         self.page_valid[layer_id][target_pages] = True
+
+        if layer_id == self.start_layer and not getattr(
+            self, "_debug_compute_logged", False
+        ):
+            import logging as _logging
+            self._debug_compute_logged = True
+            _logging.getLogger("hisparse.debug").warning(
+                "[HS-DBG Quest._compute L%d] n=%d max_pages=%d page_size=%d "
+                "phys_pg_unique=%d target_pages[:8]=%s "
+                "page_min.abs.mean=%.4f page_max.abs.mean=%.4f "
+                "k_buffer_idx_range=(%d,%d) logical_first=%s hisparse_first=%s",
+                layer_id,
+                int(n),
+                int(max_pages),
+                int(self.page_size),
+                int(target_pages.unique().numel()),
+                target_pages[:8].tolist(),
+                float(page_min.abs().mean().item()),
+                float(page_max.abs().mean().item()),
+                int(phys_tok.min().item()),
+                int(phys_tok.max().item()),
+                req_to_token[reqs[:1].view(1, 1, 1).expand(1, 1, self.page_size),
+                             tok_pos[:1, :1].clamp(0, req_to_token.shape[1] - 1)][
+                    0, 0
+                ].tolist(),
+                phys_tok[0, 0].tolist(),
+            )
 
     def _retrieve_page_scores(
         self,

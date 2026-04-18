@@ -249,3 +249,28 @@ class FlashAttentionAdaptor(BackendAdaptor):
         current_metadata.max_seq_len_k = int(
             current_metadata.cache_seqlens_int32.max()
         )
+
+        left = getattr(self, "_debug_adapter_left", 6)
+        if left > 0:
+            self._debug_adapter_left = left - 1
+            import logging as _logging
+            _logging.getLogger("hisparse.debug").warning(
+                "[HS-DBG Adapter] sparse_page_size=%d T=%d "
+                "valid_tokens=%s cache_seqlens=%s max_k=%d "
+                "page_table[0, :16]=%s physical_slots[0, :8]=%s "
+                "token_pos_sorted[0, :8]=%s",
+                int(sparse_page_size),
+                int(T),
+                valid_tokens.tolist(),
+                current_metadata.cache_seqlens_int32.tolist(),
+                int(current_metadata.max_seq_len_k),
+                current_metadata.page_table[0, :16].tolist()
+                if current_metadata.page_table.numel()
+                else [],
+                physical_slots[0, :8].tolist()
+                if physical_slots.numel()
+                else [],
+                token_pos_sorted[0, :8].tolist()
+                if token_pos_sorted.numel()
+                else [],
+            )

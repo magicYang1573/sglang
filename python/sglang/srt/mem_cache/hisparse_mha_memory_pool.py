@@ -99,6 +99,8 @@ class HiSparseMHATokenToKVPool(MHATokenToKVPool):
     ) -> torch.Tensor:
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
+    _debug_set_kv_left = 4  # class-level budget
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -108,8 +110,24 @@ class HiSparseMHATokenToKVPool(MHATokenToKVPool):
         k_scale: Optional[torch.Tensor] = None,
         v_scale: Optional[torch.Tensor] = None,
     ):
-        loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_kv_buffer(layer, loc, cache_k, cache_v, k_scale, v_scale)
+        hisparse_loc = self.translate_loc_to_hisparse_device(loc)
+        if HiSparseMHATokenToKVPool._debug_set_kv_left > 0:
+            import logging as _logging
+            HiSparseMHATokenToKVPool._debug_set_kv_left -= 1
+            k_flat_abs = cache_k.abs().mean().item() if cache_k.numel() else 0.0
+            v_flat_abs = cache_v.abs().mean().item() if cache_v.numel() else 0.0
+            _logging.getLogger("hisparse.debug").warning(
+                "[HS-DBG set_kv_buffer] layer=%d loc.shape=%s loc[:8]=%s "
+                "hisparse_loc[:8]=%s |k|=%.4f |v|=%.4f cache_k.shape=%s",
+                layer.layer_id,
+                tuple(loc.shape),
+                loc[:8].tolist() if loc.numel() else [],
+                hisparse_loc[:8].tolist() if hisparse_loc.numel() else [],
+                k_flat_abs,
+                v_flat_abs,
+                tuple(cache_k.shape),
+            )
+        super().set_kv_buffer(layer, hisparse_loc, cache_k, cache_v, k_scale, v_scale)
 
     # Some utility methods that HiCache implements are intentionally
     # not supported in the HiSparse flow (see MLA variant for parity).

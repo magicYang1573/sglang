@@ -528,6 +528,28 @@ class HiSparseMHACoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
+
+        left = getattr(self, "_debug_swap_left", 6)
+        if left > 0 and layer_id == 0:
+            self._debug_swap_left = left - 1
+            import logging as _logging
+            _logging.getLogger("hisparse.debug").warning(
+                "[HS-DBG swap_in L%d] seq_lens=%s top_k_tokens[0,:8]=%s "
+                "top_k_device_locs[0,:8]=%s device_buffer_size=%d "
+                "req_device_buffer_size[0]=%s",
+                layer_id,
+                seq_lens[:4].tolist() if seq_lens.numel() else [],
+                top_k_tokens[0, :8].tolist()
+                if top_k_tokens.numel() and top_k_tokens.size(0) > 0
+                else [],
+                top_k_indices[0, :8].tolist()
+                if top_k_indices.numel() and top_k_indices.size(0) > 0
+                else [],
+                int(self.device_buffer_size),
+                int(self.req_device_buffer_size[int(req_pool_indices[0].item())])
+                if req_pool_indices.numel()
+                else -1,
+            )
         return top_k_indices
 
     # ------------------------------------------------------------------
