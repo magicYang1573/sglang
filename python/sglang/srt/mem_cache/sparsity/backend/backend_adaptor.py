@@ -106,35 +106,48 @@ class FlashAttentionAdaptor(BackendAdaptor):
         attention backend for a non-native-sparse algorithm (Quest /
         SnapKV / ...), the ``server_args.page_size`` **must be 1** so that
         ``metadata.page_table`` carries **token-level** physical KV slot
-        indices.  Under this contract the adapter only needs to expand the
-        algorithm's selected *sparse pages* into per-token logical
-        positions, translate through ``req_to_token`` (and, when HiSparse
-        is attached, through ``translate_loc_to_hisparse_device``), and
-        write the compact list of hisparse-device token slots into
-        ``page_table[:, :valid_tokens]``.  ``cache_seqlens_int32`` is then
-        ``valid_tokens``.
+        indices.
 
-        ``page_size > 1`` on the attention backend is explicitly out of
-        scope for this MVP: HiSparse's swap-in kernel places each selected
-        token at an arbitrary hot-buffer slot, which is incompatible with
-        FA3's page-aligned addressing when ``page_size > 1``.  We fail
-        loudly here so misconfiguration does not silently produce garbage.
+        Under HiSparse, K/V is physically stored at the **hisparse device
+        slots** (see ``HiSparseMHATokenToKVPool.set_kv_buffer`` which
+        translates the logical slot before writing); the vanilla
+        ``metadata.page_table`` set up by the FA3 backend however still
+        contains **logical** slots (straight from ``req_to_token``).  If
+        we leave that as-is, FA3 will read from a slot that was never
+        written and produce garbage (the " the the the ..." failure mode
+        you saw).
+
+        Therefore this adapter always rewrites ``metadata.page_table``
+        into hisparse-device slots:
+
+        * **Quest selected something**: expand the selected sparse pages
+          into per-token logical positions, translate through
+          ``req_to_token`` and ``translate_loc_to_hisparse_device``, and
+          write a compact list of hisparse slots (``cache_seqlens`` is
+          shrunk accordingly).
+        * **Quest selected nothing** (warmup / no bbox yet): fall back to
+          **dense** -- translate the full ``req_to_token[req, :seq_len]``
+          into hisparse slots; ``cache_seqlens`` keeps the original
+          sequence length.  This preserves correctness at the cost of
+          attending to every resident token (which is fine because the
+          hot buffer holds everything when the prompt fits).
         """
         if self._original_metadata is None:
             return current_metadata
 
         if not sparse_mask.any():
-            return current_metadata
-
-        # Defensive fallback: if the sparse algorithm could not select
-        # **anything** this step (e.g. during warmup, or before bbox reps
-        # are constructed), honour ``sparse_mask`` but skip the rewrite --
-        # writing ``cache_seqlens=0`` would make FA3 attend to zero tokens
-        # and produce garbage output.  Better to fall through to the
-        # dense baseline captured in ``_original_metadata`` for this step.
-        if selected_indices is None or selected_indices.numel() == 0:
-            return current_metadata
-        if bool((selected_indices < 0).all()):
+            # Without HiSparse the baseline is already correct; with
+            # HiSparse, every attention backend forward that hits this
+            # sparse-coordinator path has to translate.  ``sparse_mask``
+            # being all-False means nothing to do for *sparse*, but we
+            # still must ensure ``page_table`` addresses hisparse slots.
+            io_subsystem = kwargs.get("io_subsystem")
+            if io_subsystem is not None:
+                self._write_dense_translated(
+                    current_metadata=current_metadata,
+                    forward_batch=forward_batch,
+                    req_to_token=req_to_token,
+                )
             return current_metadata
 
         sparse_page_size = page_size  # from SparseCoordinator
@@ -148,6 +161,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
                 "docs/advanced_features/hisparse_quest_qwen_design.md §1.4."
             )
         device = forward_batch.seq_lens.device
+        io_subsystem = kwargs.get("io_subsystem")
 
         # Reset metadata to its captured baseline before we touch it.
         current_metadata.page_table.copy_(self._original_metadata["page_table"])
@@ -155,7 +169,24 @@ class FlashAttentionAdaptor(BackendAdaptor):
             self._original_metadata["cache_seqlens_int32"]
         )
 
-        io_subsystem = kwargs.get("io_subsystem")
+        empty_selection = (
+            selected_indices is None
+            or selected_indices.numel() == 0
+            or bool((selected_indices < 0).all())
+        )
+        if empty_selection:
+            # Sparse algorithm has nothing to select yet (e.g. warmup).
+            # Under HiSparse, the captured baseline page_table holds
+            # *logical* slots; FA3 needs hisparse slots.  Translate the
+            # full sequence for each request so FA3 reads resident KV.
+            if io_subsystem is not None:
+                self._write_dense_translated(
+                    current_metadata=current_metadata,
+                    forward_batch=forward_batch,
+                    req_to_token=req_to_token,
+                )
+            return current_metadata
+
         self._write_token_level(
             selected_indices=selected_indices,
             sparse_mask=sparse_mask,
@@ -167,6 +198,53 @@ class FlashAttentionAdaptor(BackendAdaptor):
             device=device,
         )
         return current_metadata
+
+    def _write_dense_translated(
+        self,
+        current_metadata: Any,
+        forward_batch: "ForwardBatch",
+        req_to_token: torch.Tensor,
+    ) -> None:
+        """Write a dense, hot-buffer addressed ``page_table``.
+
+        Rewrites ``metadata.page_table[b, i]`` from the baseline *logical*
+        slot to the matching **hot-buffer** (hisparse-device) slot for
+        **token position ``i`` in the request**.  The source of truth is
+        ``io_subsystem.req_to_device_buffer[req, i]`` which the HiSparse
+        coordinator maintains for every resident token (prefill block set
+        by ``alloc_device_buffer``; decode tokens appended by
+        ``_grow_device_buffers``).  Unlike
+        ``translate_loc_to_hisparse_device(logical)`` -- which returns 0
+        for *prefill* slots after they have been "reclaimed" into the hot
+        buffer and their mapping cleared -- ``req_to_device_buffer`` stays
+        valid for the whole request lifetime (fast-path assumption:
+        ``seq_len <= device_buffer_size``).
+
+        ``cache_seqlens`` / ``cu_seqlens_k`` remain the baseline
+        per-request true sequence lengths.
+        """
+        current_metadata.page_table.copy_(self._original_metadata["page_table"])
+        current_metadata.cache_seqlens_int32.copy_(
+            self._original_metadata["cache_seqlens_int32"]
+        )
+
+        io_subsystem = getattr(forward_batch, "hisparse_coordinator", None)
+        if io_subsystem is None:
+            return
+        r2db = getattr(io_subsystem, "req_to_device_buffer", None)
+        if r2db is None:
+            return
+
+        pt = current_metadata.page_table
+        if pt.numel() == 0:
+            return
+        bs, pt_width = pt.shape
+        r2db_width = r2db.shape[1]
+        copy_w = min(pt_width, r2db_width)
+        req_idx = forward_batch.req_pool_indices
+        pt[:, :copy_w] = r2db[req_idx, :copy_w].to(pt.dtype)
+        if copy_w < pt_width:
+            pt[:, copy_w:] = 0
 
     # ------------------------------------------------------------------
     # Token-level write strategy (the only supported path for HiSparse +
@@ -217,15 +295,24 @@ class FlashAttentionAdaptor(BackendAdaptor):
 
         req_idx = forward_batch.req_pool_indices.unsqueeze(1)
         token_pos_clamped = token_pos_sorted.clamp(min=0).to(torch.int64)
-        max_req_tokens = req_to_token.shape[1]
-        token_pos_clamped = token_pos_clamped.clamp(max=max_req_tokens - 1)
-        physical_slots = req_to_token[req_idx, token_pos_clamped]
 
         if io_subsystem is not None:
-            translate = (
-                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device
-            )
-            physical_slots = translate(physical_slots.to(torch.int64))
+            # Under HiSparse, look up the hot-buffer (hisparse-device)
+            # slot of each selected token directly via the coordinator's
+            # ``req_to_device_buffer[req, token_pos_in_req]`` table.  This
+            # is the only authoritative mapping **after**
+            # ``alloc_device_buffer`` clears the logical->hisparse
+            # mapping; going through ``req_to_token`` +
+            # ``translate_loc_to_hisparse_device`` would return 0 for
+            # prefill tokens and FA3 would attend to an empty slot.
+            r2db = io_subsystem.req_to_device_buffer  # [max_reqs, dbs+page]
+            r2db_width = r2db.shape[1]
+            token_pos_clamped = token_pos_clamped.clamp(max=r2db_width - 1)
+            physical_slots = r2db[req_idx, token_pos_clamped]
+        else:
+            max_req_tokens = req_to_token.shape[1]
+            token_pos_clamped = token_pos_clamped.clamp(max=max_req_tokens - 1)
+            physical_slots = req_to_token[req_idx, token_pos_clamped]
 
         physical_slots = physical_slots.to(current_metadata.page_table.dtype)
         valid_tokens = tok_valid_sorted.sum(dim=1).to(torch.int32)
