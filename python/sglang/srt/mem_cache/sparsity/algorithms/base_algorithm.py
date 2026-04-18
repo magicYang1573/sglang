@@ -198,17 +198,25 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_extend():
             return
 
-        num_pages = seq_lens // self.page_size
+        # Use **ceil** here so prompts whose length is not a multiple of
+        # ``page_size`` still get their tail partial page covered.  Without
+        # this, any request with ``seq_len < page_size`` (e.g. server
+        # warmup) leaves every page as ``page_valid=False`` and Quest
+        # returns all -1 selections, which makes the FA3 adapter write
+        # ``cache_seqlens=0`` and the model attends to zero tokens.
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
         valid_mask = (
             ~self.states.repr_constructed[req_pool_indices]
             & (seq_lens >= self.states.prompt_lens[req_pool_indices])
-            & (num_pages > 0)
+            & (seq_lens > 0)
         )
 
         if not valid_mask.any():
             return
 
-        # Compute page representations by subclass
+        # Compute page representations by subclass.  ``_compute_page_representations``
+        # already respects ``seq_lens`` when masking tokens inside the last
+        # (possibly partial) page.
         self._compute_page_representations(
             layer_id,
             req_pool_indices[valid_mask],
@@ -218,11 +226,15 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             k_buffer,
         )
 
-        # Update tracking states
+        # Update tracking states.  ``last_constructed_page`` stores the
+        # number of **fully** constructed pages so that
+        # ``update_representations`` knows where to pick up; a partial tail
+        # page remains "in flight" -- see there for handling.
         if layer_id == self.end_layer - 1:
             success_indices = req_pool_indices[valid_mask]
             self.states.repr_constructed[success_indices] = True
-            self.states.last_constructed_page[success_indices] = num_pages[valid_mask]
+            full_pages = seq_lens[valid_mask] // self.page_size
+            self.states.last_constructed_page[success_indices] = full_pages
 
     def update_representations(
         self,
@@ -235,8 +247,13 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_decode_or_idle():
             return
 
+        # ``start_page`` = number of already-finalized (full) pages.
+        # ``end_page`` = ceil(seq_len / page_size): the exclusive upper
+        # bound we want bbox coverage over, including a possibly partial
+        # tail page.  Re-running the subclass on the tail page every decode
+        # step is cheap and keeps Quest's min/max monotonically correct.
         start_page = self.states.last_constructed_page[req_pool_indices]
-        end_page = seq_lens // self.page_size
+        end_page = (seq_lens + self.page_size - 1) // self.page_size
         valid_mask = self.states.repr_constructed[req_pool_indices] & (
             start_page < end_page
         )
@@ -254,10 +271,14 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             k_buffer,
         )
 
-        # Update tracking states
+        # Promote ``last_constructed_page`` only when a page has just been
+        # completed (seq_len is now a multiple of page_size).  This keeps
+        # the partial tail page "live" so subsequent decodes keep
+        # refreshing its bbox until the page fills up.
         if layer_id == self.end_layer - 1:
             success_indices = req_pool_indices[valid_mask]
-            self.states.last_constructed_page[success_indices] = end_page[valid_mask]
+            full_pages = seq_lens[valid_mask] // self.page_size
+            self.states.last_constructed_page[success_indices] = full_pages
 
     def retrieve_topk(
         self,

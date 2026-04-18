@@ -126,6 +126,17 @@ class FlashAttentionAdaptor(BackendAdaptor):
         if not sparse_mask.any():
             return current_metadata
 
+        # Defensive fallback: if the sparse algorithm could not select
+        # **anything** this step (e.g. during warmup, or before bbox reps
+        # are constructed), honour ``sparse_mask`` but skip the rewrite --
+        # writing ``cache_seqlens=0`` would make FA3 attend to zero tokens
+        # and produce garbage output.  Better to fall through to the
+        # dense baseline captured in ``_original_metadata`` for this step.
+        if selected_indices is None or selected_indices.numel() == 0:
+            return current_metadata
+        if bool((selected_indices < 0).all()):
+            return current_metadata
+
         sparse_page_size = page_size  # from SparseCoordinator
         backend_page_size = int(kwargs.get("backend_page_size", 1) or 1)
         if backend_page_size != 1:

@@ -355,11 +355,21 @@ class SparseCoordinator:
         # indices; expand them to the token-level padded tensor expected
         # by the swap-in kernel, run the kernel, then hand the returned
         # device slots to the backend adapter.
+        #
+        # If the algorithm returned an empty / all-``-1`` selection (e.g.
+        # representations not yet built during warmup), skip both swap-in
+        # and adapter rewrite; the adapter will fall back to the dense
+        # baseline (see FlashAttentionAdaptor.adapt_for_attn_metadata).
+        empty_selection = (
+            selected_indices is None
+            or selected_indices.numel() == 0
+            or bool((selected_indices < 0).all())
+        )
         device_locs_per_tok: Optional[torch.Tensor] = None
         if (
             self.io_subsystem is not None
             and forward_batch.forward_mode.is_decode_or_idle()
-            and selected_indices is not None
+            and not empty_selection
         ):
             top_k_tokens = _expand_selected_pages_to_tokens(
                 selected_pages=selected_indices,
