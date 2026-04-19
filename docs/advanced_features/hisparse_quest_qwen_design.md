@@ -8,25 +8,28 @@
 
 ## 1. 背景与动机
 
-### 1.1 现有 HiSparse 的限制
+### 1.1 现有 HiSparse 的两条算法分支
 
-现有 HiSparse 实现（`python/sglang/srt/managers/hisparse_coordinator.py`）与 DSA 家族模型深度绑定：
+**DSA（`algorithm=deepseek_nsa`，默认）** 与 `python/sglang/srt/managers/hisparse_coordinator.py` 深度绑定：
 
-- `server_args.py` 中有强校验：`--enable-hisparse` 仅接受 DeepSeek-NSA 模型、`flashmla_sparse` 后端、`bfloat16` KV、`--disable-radix-cache`。
-- 设备/主机 KV 池使用 MLA 结构（`HiSparseNSATokenToKVPool` + `MLATokenToKVPoolHost`），一次只有一个 latent buffer。
-- topk 不由 HiSparse 自身产生，而是由 DSA 的 lightning indexer 原生输出，HiSparse 仅负责根据 topk 从 host → device 做 swap-in。
-- Page-table 改写仅存在于 NSA 后端（`nsa_backend.py` 中调用 `translate_loc_to_hisparse_device`）。
+- `server_args.py` 校验：模型须为 DeepSeek-NSA 族、NSA prefill/decode 后端为 `flashmla_sparse`、`bfloat16` KV、`--disable-radix-cache`。
+- 设备/主机 KV 池为 MLA（`HiSparseNSATokenToKVPool` + `MLATokenToKVPoolHost`）；topk 由 DSA lightning indexer 给出；NSA 路径在 `nsa_backend.py` 等处做 `translate_loc_to_hisparse_device` 类改写。
+
+**Quest（`algorithm=quest`）** 针对 **MHA/GQA（如 Qwen）+ FA3**：
+
+- 使用 `HiSparseMHATokenToKVPool` / `HiSparseMHACoordinator`（`hisparse_mha_memory_pool.py`、`hisparse_mha_coordinator.py`）与 `load_cache_to_device_buffer_mha`；topk 由 `QuestAlgorithm.retrieve_topk` 产生。
+- `server_args` 要求 **`--page-size 1`**（见 §1.4）、`--disable-radix-cache`，KV 为 `bfloat16` 或 `float16`；**当前 MVP 要求 `--disable-cuda-graph`**（FA3 在稀疏改写后需重算 `scheduler_metadata`，与 graph capture 不兼容，见 §3.9）。
 
 ### 1.2 非原生稀疏模型（Qwen 系列）的情况
 
-Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，要做 decode 阶段稀疏必须显式补一个"算法"来选 topk page/token。仓库中已经存在一套通用的稀疏算法框架：
+Qwen2 / Qwen3 属于 MHA 或 GQA，没有 lightning indexer，decode 稀疏由 **Quest** 在通用稀疏框架里完成。当前 **Quest + HiSparse + FA3** 已在运行时连通：
 
-- `python/sglang/srt/mem_cache/sparsity/core/sparse_coordinator.py` —— 通用 `SparseCoordinator`（生命周期钩子）
-- `python/sglang/srt/mem_cache/sparsity/algorithms/quest_algorithm.py` —— Quest 算法（页级 min/max bbox 评分）
-- `python/sglang/srt/mem_cache/sparsity/algorithms/base_algorithm.py` —— `BaseSparseAlgorithmImpl` 提供通用 construct / update / retrieve 流程
-- `python/sglang/srt/mem_cache/sparsity/backend/backend_adaptor.py` —— `FlashAttentionAdaptor` 可改写 FA3 的 page_table / cache_seqlens
+- `SparseCoordinator`（`sparse_coordinator.py`）在 `attention_begin` 中串联 `retrieve_topk`、（decode 且非空选择时）`swap_in_selected_pages`、`FlashAttentionAdaptor.adapt_for_attn_metadata`；`forward_begin` / `forward_end` 与 HiSparse 的 backup / `map_last_loc_to_buffer` 对齐。
+- `model_runner.py` 在 `algorithm=quest` 时构造 `HiSparseMHACoordinator` 并 **`register_sparse_coordinator(create_sparse_coordinator(..., io_subsystem=mha_coord))`**。
+- `QuestAlgorithm` + `BaseSparseAlgorithmImpl`：`construct_representations` / `update_representations` 维护 bbox；**bbox 读 K 时**若池子提供 `translate_loc_to_hisparse_device`，会把 `req_to_token` 给出的逻辑槽翻译成 **hisparse device 槽** 再索引 `k_buffer`（与 hot buffer 上的物理布局一致）。
+- `FlashAttentionAdaptor`：在 HiSparse 下 **统一用 `req_to_device_buffer[req, token_pos]` 写入 FA3 的 `page_table`**（稀疏选中与稠密兜底皆然），避免仅依赖 `translate_loc_to_hisparse_device(logical)` 在 `alloc_device_buffer` 后 prefill 槽映射被清空而读到空槽的问题。
 
-该框架目前是 **骨架**：`SparseCoordinator.forward_begin/forward_end` 仍为 `pass`，`NSABackendAdaptor` 未实现，`factory.create_sparse_coordinator` 未被任何运行路径调用；它与 `HiSparseCoordinator` 尚未连通。
+`NSABackendAdaptor` 仍为占位，与 Quest/FA3 路径无关。
 
 ### 1.3 目标
 
@@ -45,7 +48,7 @@ Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，�
 
 - 当 `--page-size > 1` 时，SGLang 的 FA3 集成会把 `page_table` 压成 **页号**（`flashattention_backend.py` 末尾对 `req_to_token` 做 strided + `// page_size`），注意力读 KV 时必须按「整页 × 页内 offset」寻址。
 - HiSparse 的 swap-in kernel 在 **长序列**下按 **token** 粒度把历史 K/V 散落到 hot buffer 的各槽位，**不保证**同一 Quest「稀疏页」内的 16 个 token 在 hisparse device 上仍落在 **同一个 FA3 物理页** 里。二者叠在一起时，`FlashAttentionAdaptor` 要么写页号（与 scatter 冲突），要么写 token 槽位（与 FA3 页语义冲突）。
-- 固定 **`--page-size 1`** 后，FA3 始终用 **token 槽位** 索引 `k_cache`，`FlashAttentionAdaptor` 只需把「逻辑 token → `req_to_token` →（可选）`translate_loc_to_hisparse_device`」写回 `page_table`，**与稀疏算法内部用多大「Quest 页」无关**，框架前面不被 FA3 的页布局绑死。
+- 固定 **`--page-size 1`** 后，FA3 始终用 **token 槽位** 索引 `k_cache`；`FlashAttentionAdaptor` 在 HiSparse 下以 **`req_to_device_buffer`** 为权威把「请求内 token 位置」映射到 **hot buffer 槽位** 写回 `page_table`，**与 Quest 内部 `N_quest` 无关**，框架前面不被 FA3 的 server 级分页绑死。
 
 **与 `hisparse-config` 里 `page_size` 的关系（避免混淆）**：
 
@@ -54,7 +57,7 @@ Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，�
 | **`--page-size 1`**（server） | KV 分配与 **FA3 `page_table` 语义**：MVP 下必须为 **1**。 |
 | **`"page_size": N` in `--hisparse-config`**（可选） | **Quest 稀疏页大小**（bbox / `retrieve_topk` 的页粒度），可与 server 的 1 不同，例如 `N=16` 表示「每 16 个 token 一个 Quest 页」，再展开成 token 喂 swap-in 与 adaptor。 |
 
-**实现侧待办（与本文档对齐）**：`HiSparseMHATokenToKVPoolAllocator` 当前有 `assert self.page_size > 1`；要真正允许 `--page-size 1`，需放宽或分支该断言并核对 `PagedTokenToKVPoolAllocator` 在 `page_size=1` 下的行为。**在 allocator 改完之前，文档上的「MVP = page_size 1」与仓库代码可能仍不一致，以代码校验为准。**
+**实现状态**：`check_server_args` 在 `algorithm=quest` 且 `enable_hisparse` 时 **强制 `--page-size 1`**（否则 `ValueError`），并 **将 `self.page_size` 固定为 1**，避免后续按后端默认把分页改大。`HiSparseMHATokenToKVPoolAllocator` / `map_last_loc_to_buffer` 已支持该路径（含 decode 新 token 时释放被覆盖的 transient hisparse 槽，避免池子泄漏）。
 
 **非目标（MVP 之后）**：在 **不** 改 HiSparse kernel（按页 swap / 页对齐 hot buffer）的前提下，支持 Quest + FA3 + **`--page-size > 1`** 的端到端正确性；可作为后续工作单独设计。
 
@@ -71,18 +74,18 @@ Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，�
 │                end / forward_begin / forward_end / on_request_  │
 │                end                                              │
 │  - 调用 algorithm.retrieve_topk 拿 topk                         │
-│  - 调用 io_subsystem.swap_in(topk) 装载 KV                      │
+│  - 调用 io.swap_in_selected_pages(...) 装载 KV                 │
 │  - 调用 backend_adaptor 改写 attention metadata                 │
 └───────────────┬──────────────────────────┬──────────────────────┘
                 │                          │
                 ▼                          ▼
    ┌──────────────────────┐     ┌──────────────────────────────┐
-   │   SparseAlgorithm     │     │    HiSparseIOSubsystem       │
-   │ (QuestAlgorithm ...)  │     │ (原 HiSparseCoordinator)     │
-   │ - construct_repr      │     │ - host pool / device buffer  │
-   │ - update_repr         │     │ - staging / direct admit     │
-   │ - retrieve_topk → idx │     │ - swap_in_selected_pages     │
-   │ (不感知 host/device)   │     │ - eager_backup / release     │
+   │   SparseAlgorithm     │     │ HiSparseCoordinator /         │
+   │ (QuestAlgorithm ...)  │     │ HiSparseMHACoordinator        │
+   │ - construct_repr      │     │ - host pool / device buffer   │
+   │ - update_repr         │     │ - staging / direct admit      │
+   │ - retrieve_topk → idx │     │ - swap_in_selected_pages      │
+   │ - bbox 读 k_buffer    │     │ - eager_backup / release      │
    └──────────────────────┘     └──────────────────────────────┘
                                              ▲
                                              │
@@ -93,25 +96,27 @@ Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，�
 ```
 
 **关键原则：**
-- `SparseAlgorithm` 只负责"给定 query 和历史 K 的表示，输出 **Quest 逻辑页号** topk"（页大小由 `hisparse-config` 的 `page_size` 决定，与 §1.4 中 server `--page-size` 解耦）。它对 host/device 一无所知，仅读 GPU 上的 K buffer（此 K buffer 即 hot buffer，下文 §3.2 会讨论近似性）。
-- `HiSparseIOSubsystem` 只负责"给定 topk，把对应的 K（或 K/V）从 host 换入 device"，对算法无感知。
+- `SparseAlgorithm` 只负责"给定 query 和历史 K 的表示，输出 **Quest 逻辑页号** topk"（页大小由 `hisparse-config` 的 `page_size` 决定，与 §1.4 中 server `--page-size` 解耦）。它不直接做 host→device IO；读 K 算 bbox 时走 **当前层 `k_buffer`**，在 HiSparse 下通过 **`translate_loc_to_hisparse_device`**（若池子提供）把逻辑槽换到 **device 上实际存 K 的槽**（通常为 hot buffer 区），见 §3.2。
+- `HiSparseCoordinator`（MLA）/ `HiSparseMHACoordinator`（MHA）只负责"给定 token 级 topk 索引，把对应 K/V 从 host 换入 device hot buffer"，对 Quest 评分无感知。
 - `SparseCoordinator` 做粘合，在 `attention_begin` 里串起 `retrieve_topk → swap_in → adapt_metadata`。
 - 两种链路共存：
   - **DSA 链路**（现状）：indexer 产 topk → `HiSparseCoordinator.swap_in_selected_pages` → 改写 NSA `page_table_1`。
   - **新增 Quest/Qwen 链路**：`QuestAlgorithm.retrieve_topk` 产 topk → MHA 版 `swap_in_selected_pages` → 改写 FA3 `page_table`。
 
-### 2.2 代码落点
+### 2.2 代码落点（与当前仓库一致）
 
-| 新增/修改 | 路径 | 说明 |
-|-----------|------|------|
-| 修改 | `python/sglang/srt/mem_cache/sparsity/core/sparse_coordinator.py` | 填充 `forward_begin/forward_end`，让 `attention_begin` 既能走"算法 topk + HiSparse swap_in"，也能走纯算法（无 HiSparse）路径 |
-| 修改 | `python/sglang/srt/mem_cache/sparsity/factory.py` | 支持按模型族装配 `io_subsystem`（DSA / MHA-HiSparse / None） |
-| 新增 | `python/sglang/srt/mem_cache/hisparse_memory_pool.py` | 新增 `HiSparseMHATokenToKVPool` + `HiSparseMHATokenToKVPoolAllocator` |
-| 修改 | `python/sglang/srt/managers/hisparse_coordinator.py` | 抽象为 `HiSparseIOSubsystem` 基类 + `HiSparseMLAIO` / `HiSparseMHAIO` 两个子类；或保持单类，通过 `is_mla` 分支走两套 host pool |
-| 新增 | `python/sglang/jit_kernel/hisparse.py` | 增加 `load_cache_to_device_buffer_mha` wrapper（kernel 本身已支持 `IsMLA=false`） |
-| 修改 | `python/sglang/srt/mem_cache/sparsity/backend/backend_adaptor.py` | `FlashAttentionAdaptor` 已实现，但需要接入 HiSparse 的 "logical → hisparse device" 映射 |
-| 修改 | `python/sglang/srt/server_args.py` | 解除"仅 DSA + flashmla_sparse"硬断言，按算法/模型族动态校验 |
-| 修改 | `python/sglang/srt/model_executor/model_runner.py` | `enable_hisparse` 时，根据模型族决定实例化哪种 IO 子系统，并构造 `SparseCoordinator` |
+| 类型 | 路径 | 说明 |
+|------|------|------|
+| 核心编排 | `python/sglang/srt/mem_cache/sparsity/core/sparse_coordinator.py` | `attention_begin` / `attention_end`、`forward_begin` / `forward_end`；`_handle_sparse_retrieve`：空选择时 **跳过** `swap_in_selected_pages`，仍调用 adaptor 做 **稠密 + `req_to_device_buffer` 寻址** |
+| 工厂 | `python/sglang/srt/mem_cache/sparsity/factory.py` | `create_sparse_coordinator`：解析 `hisparse-config`，挂接 `QuestAlgorithm` + `FlashAttentionAdaptor` + 可选 `io_subsystem` |
+| MHA 池 | `python/sglang/srt/mem_cache/hisparse_mha_memory_pool.py` | `HiSparseMHATokenToKVPool`、`HiSparseMHATokenToKVPoolAllocator`（含 **`--page-size 1`** 下 logical + hisparse 双分配与映射） |
+| MHA 协调 | `python/sglang/srt/managers/hisparse_mha_coordinator.py` | `HiSparseMHACoordinator`：`swap_in_selected_pages`、`req_to_device_buffer`、`map_last_loc_to_buffer` 等，API 面对齐原 `HiSparseCoordinator` 以便 scheduler 复用 |
+| JIT | `python/sglang/jit_kernel/hisparse.py` | `load_cache_to_device_buffer_mha`（`IsMLA=false`） |
+| FA3 适配 | `python/sglang/srt/mem_cache/sparsity/backend/backend_adaptor.py` | `FlashAttentionAdaptor`：`backend_page_size!=1` 直接报错；HiSparse 下 **`page_table` ← hot-buffer 槽**（稀疏 `_write_token_level` / 兜底 `_write_dense_translated`） |
+| 参数校验 | `python/sglang/srt/server_args.py` | `deepseek_nsa` 与 `quest` 分支分别校验；Quest 分支 **`--page-size 1`** 且 `self.page_size = 1` |
+| 装配 | `python/sglang/srt/model_executor/model_runner.py` | `enable_hisparse`：`quest` → `HiSparseMHACoordinator` + `create_sparse_coordinator(..., io_subsystem=mha_coord)`；`deepseek_nsa` → 原 `HiSparseCoordinator` |
+| 算法基类 | `python/sglang/srt/mem_cache/sparsity/algorithms/base_algorithm.py` | `num_pages` / `end_page` 等使用 **ceil_div**，短 prompt 与尾页也能建 bbox |
+| DSA 现状 | `python/sglang/srt/managers/hisparse_coordinator.py` | MLA HiSparse **未**拆成独立 `hisparse_io/` 包；与 MHA 路径并列存在 |
 
 ---
 
@@ -127,20 +132,20 @@ Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，�
 | Prefill/Extend 每层 | `attention_end(...)` | `algorithm.construct_representations(...)`：按页累积 K 的 per-dim min/max，填入 Quest 的 `page_k_min/max`。K buffer 此时仍是完整 KV（因为 prefill 路径）。 |
 | Prefill 结束后 | —（由 scheduler 驱动 `collect_ready_reqs`） | staging 路径下 GPU→host 背景拷贝完成后，`alloc_device_buffer`：把该 req 的 device buffer 压缩到 `device_buffer_size` 大小。**此时算法的 `page_k_min/max` 仍然保留在 GPU 的算法表示池中**（见 §3.2）。 |
 | Decode forward 开始 | `forward_begin(batch)` | `io.wait_for_pending_backup()`：等上一步的 eager backup 完成。 |
-| Decode 每层前 | `attention_begin(q, k, v, layer, batch, meta)` | 1. `topk_logical = algorithm.retrieve_topk(q, layer, req_indices, mask, ...)`<br>2. `device_locs = io.swap_in_selected_pages(req_indices, seq_lens, topk_logical, layer_id)`（调 hisparse.cuh kernel）<br>3. `backend_adaptor.adapt_for_attn_metadata(selected=device_locs, ...)` 写回 FA3 的 `page_table` / `cache_seqlens_int32` / `cu_seqlens_k`。 |
+| Decode 每层前 | `attention_begin(q, k, v, layer, batch, meta)` | 1. `retrieve_topk` → Quest 页级 `selected_indices`。<br>2. 若 **非空选择** 且为 decode：`swap_in_selected_pages`（token 级 `top_k_tokens`）。若 **空选择**（warmup / 尚无 bbox）：**不调** swap-in，由 adaptor 稠密兜底。<br>3. `adapt_for_attn_metadata`：用 `req_to_device_buffer` 等写 FA3 `page_table` / `cache_seqlens_int32` / `cu_seqlens_k`（稀疏时缩短 K 长度；稠密时全长 + hot-buffer 寻址）。 |
 | Decode 每层后 | `attention_end(...)` | `algorithm.update_representations(...)`：为上一步新生成的 token 所在的 page 增量更新 min/max。 |
-| Decode forward 结束 | `forward_end(batch)` | 触发对"上一步新 token"的 eager backup（当前 `HiSparseCoordinator._eager_backup_previous_token` 逻辑），并调用 `map_last_loc_to_buffer` 管理新 token 在 hot buffer 里的槽位。 |
+| Decode forward 结束 | `forward_end(batch)` | 触发对「上一步新 token」的 eager backup（`HiSparseCoordinator` / `HiSparseMHACoordinator` 各自的 `_eager_backup_previous_token`），并调用 `map_last_loc_to_buffer` 管理新 token 在 hot buffer 里的槽位。 |
 | 请求结束 | `on_request_end(req)` | `io.request_finished(req)` + `states.clear(idx)`。 |
 
 ### 3.2 Quest 表示池与 hot buffer 的关系（关键正确性问题）
 
-`QuestAlgorithm._compute_page_representations` 从 `k_buffer[phys_tok]` 读 K 算 min/max；`phys_tok` 来自 `req_to_token_pool.req_to_token`。在非 HiSparse 场景下 K buffer 始终是全量的，这没有问题；**但在 HiSparse 下 GPU 上的 K buffer 只有 hot 区域，历史 K 在 host**。为此必须约定：
+`QuestAlgorithm._compute_page_representations` 从 `k_buffer[phys_tok]` 读 K 算 min/max：先用 `req_to_token` 得到逻辑槽，若 `token_to_kv_pool` 提供 **`_translate_loc_to_hisparse_device`** 则再映射到 **device 上实际存 K 的槽** 再索引 `k_buffer`。在非 HiSparse 场景下 K buffer 通常可视为全量逻辑视图；**在 HiSparse 下历史 K 主要在 host，GPU 上为 hot 区**。为此必须约定：
 
 1. **Quest 的 min/max 表示 (`page_k_min/max`) 在 prefill 阶段一次性计算并长期驻留 GPU**。
-   - Prefill 时 `attention_end` 是在完整 K buffer 上调用的（staging 路径的 prefill 仍然在 GPU 上；direct-to-host 路径 §3.6 会单独讨论），此时 Quest 能拿到完整 K → min/max 一次算齐。
+   - Prefill 时 `attention_end` 是在完整 K buffer 上调用的（staging 路径的 prefill 仍在 GPU 上；PD / direct-to-host 见 §3.7），此时 Quest 能拿到完整 K → min/max 一次算齐。
    - Prefill 结束后即使 KV 被换到 host，`page_k_min/max` 保留在 GPU，不再依赖 K buffer 本体。
-2. **Decode 阶段 `update_representations` 只处理 "新 token 所在的页"**。新 token 此时还在 hot buffer 中（hot buffer 的 `newest_slot` 保存最新 token），因此 `k_buffer[phys_tok]` 对新页合法。对已 swap 到 host 的历史页，不做 update（Quest 的 bbox 本就随 token 增加单调变大，不必回填历史页；即使需要更新也应由 eager_backup 完成后再异步打点，见 §4.3 TODO）。
-3. **Quest 的 `total_num_pages` 对应的物理页空间**：`BaseSparseAlgorithmImpl.initialize_representation_pool` 用 `token_to_kv_pool.get_key_buffer(start_layer).shape[0]` 作为总 token 数，即 GPU 上的 logical 全量池大小（`_size_full = size * host_to_device_ratio`），所以 min/max 池会按 logical 槽位分配，与 `req_to_token` 里记录的 logical 索引对齐，与 hot buffer 的 hisparse 子槽位无关。✅ 这点和现状兼容，不需要改 Quest。
+2. **Decode 阶段 `update_representations` 只处理 "新 token 所在的页"**。新 token 此时还在 hot buffer 中（hot buffer 的 `newest_slot` 保存最新 token），因此 `k_buffer[phys_tok]` 对新页合法。对已 swap 到 host 的历史页，不做 update（Quest 的 bbox 本就随 token 增加单调变大，不必回填历史页；即使需要更新也应由 eager_backup 完成后再异步打点，见 §4.2）。
+3. **Quest 的 `total_num_pages` 对应的页空间**：`BaseSparseAlgorithmImpl.initialize_representation_pool` 用 `token_to_kv_pool.get_key_buffer(start_layer).shape[0]` 等推导池规模；bbox 张量按 **Quest 页数**（与 `N_quest`、ceil_div 后的序列页数）分配，与 §1.4 中 server `--page-size` 独立。
 
 > 副产物：Quest 的 min/max 表示占用 GPU 显存 `O(num_pages × kv_heads × head_dim × 4B × num_layers)`。对 Qwen3-32B GQA（`kv_heads=8, head_dim=128`）在 **`N_quest=16`**、`seq_len=128k` 下，每请求 ≈ 8192 页 × 8 × 128 × 4B × 2 = 64 MB 每层。这需要在文档中明示并让 `top_k` / `hisparse-config` 的 `page_size` / `host_to_device_ratio` 可调（与 server `--page-size` 无关，见 §1.4）。
 
@@ -153,20 +158,20 @@ Qwen2 / Qwen3 属于 MHA 或 GQA，模型本身 **没有** lightning indexer，�
 | 用户 config | `top_k = 2048`（token 数） | `top_k = 2048`（token 数，同语义） |
 | 算法输出 | indexer 直接给 token 级索引 | Quest 给 **Quest 页号**（`num_topk_pages = ⌈top_k / N_quest⌉`） |
 | 喂给 HiSparse kernel | `top_k_tokens`（int32，`[bs, top_k]`，-1 填充） | 同左：`page × N_quest + [0..N_quest)` 展开得到 **逻辑 token 位置** |
-| 喂给 FA3（MVP，§1.4） | （NSA 路径） | `FlashAttentionAdaptor` 在 **`--page-size 1`** 下写 **token 级 hisparse 槽位** 到 `page_table` |
+| 喂给 FA3（MVP，§1.4） | （NSA 路径） | `FlashAttentionAdaptor` 在 **`--page-size 1`** 下写 **token 级 hot-buffer（hisparse device）槽位** 到 `page_table`（来自 `req_to_device_buffer`，而非仅 `req_to_token` + `translate_loc_to_hisparse_device`） |
 
 Quest 路径在 `SparseCoordinator._handle_sparse_retrieve` 里对 `selected_indices`（Quest 页级）展开为 token 级，由 `_expand_selected_pages_to_tokens` 完成（其中的 `page_size` 参数为 **`N_quest`**，来自 `SparseCoordinator.config.page_size`，与 server `--page-size` 解耦）。
 
-> 固定 `num_topk_pages = ⌈top_k / N_quest⌉`、固定输出宽度 `top_k`，**CUDA graph 友好**（在禁用或适配 graph 的前提下）。
+> 固定 `num_topk_pages = ⌈top_k / N_quest⌉`、固定输出宽度，便于 eager 下稳定形状；**与 FA3 CUDA graph 同时启用仍不兼容**（§3.9）。
 
 ### 3.4 Host Pool / Device Pool 的 MHA 版本
 
-新增 `HiSparseMHATokenToKVPool`（与现有 `HiSparseNSATokenToKVPool` 并列）：
+已实现 `HiSparseMHATokenToKVPool`（与 `HiSparseNSATokenToKVPool` 并列，见 `hisparse_mha_memory_pool.py`）：
 
-- Device 侧继承 `MHATokenToKVPool`（有独立 K/V buffer）；提供 `translate_loc_to_hisparse_device` 与 `register_mapping`（与 NSA 版一致的逻辑）。
-- Host 侧使用现有 `MHATokenToKVPoolHost`（`layout="layer_first"`，`page_size=1`）。它内部已经有 `k_data_ptrs` / `v_data_ptrs`（已经是 CUDA 上的指针数组），正好可以喂给 kernel。
+- Device 侧继承 `MHATokenToKVPool`（独立 K/V buffer）；提供 `translate_loc_to_hisparse_device` 与 `register_mapping`（与 NSA 版同一套「logical ↔ hisparse device」思想）。
+- Host 侧使用 `MHATokenToKVPoolHost`（`layout="layer_first"` 等），`k_data_ptrs` / `v_data_ptrs` 供 kernel 使用。
 
-新增 `HiSparseMHATokenToKVPoolAllocator`：几乎镜像 `HiSparseTokenToKVPoolAllocator`，唯一差异是底层 `PagedTokenToKVPoolAllocator` 对应的 KV dtype/形状不同。可以通过将 `HiSparseTokenToKVPoolAllocator` 参数化（或抽共同基类）来避免大面积复制代码。
+`HiSparseMHATokenToKVPoolAllocator` 负责 logical 与 hisparse device 双槽分配及 `full_to_hisparse_device_index_mapping`；**`server_args.page_size == 1`** 时 prefill/decode 均走该 allocator 路径，并与 `map_last_loc_to_buffer` 协同回收 decode 时被覆盖的 transient hisparse 槽。
 
 ### 3.5 Kernel Wrapper（MHA 版）
 
@@ -180,7 +185,7 @@ if constexpr (!IsMLA) {
 }
 ```
 
-因此只需要在 `python/sglang/jit_kernel/hisparse.py` 新增：
+`python/sglang/jit_kernel/hisparse.py` 已提供 `load_cache_to_device_buffer_mha`，接口形如：
 
 ```python
 def load_cache_to_device_buffer_mha(
@@ -208,15 +213,19 @@ def load_cache_to_device_buffer_mha(
 
 `item_size_bytes` 在 MHA 下取单个 token 的 K buffer 字节数（`kv_heads * head_dim * itemsize`），K 和 V 用相同 `item_size`（Qwen 保证 K/V 形状一致）。
 
-`HiSparseIOSubsystem`（MHA 版）的 `swap_in_selected_pages` 传入 `mem_pool_host.k_buffer[layer]` 和 `v_buffer[layer]` 即可。
+`HiSparseMHACoordinator.swap_in_selected_pages` 向 kernel 传入 host 侧 `k_buffer[layer]` / `v_buffer[layer]`（与 JIT 包装一致）。
 
-### 3.6 Prefill 路径与 Backend Adaptor
+### 3.6 Prefill / Decode 与 `FlashAttentionAdaptor`（当前实现）
 
-Qwen 默认走 FA3。FA3 的 `forward_extend` / `forward_decode` 路径里**没有** 类似 NSA 的 `translate_loc_to_hisparse_device(page_table_1)` 改写点。改写职责下放给 `SparseCoordinator.attention_begin → backend_adaptor.adapt_for_attn_metadata`：
+Qwen 默认走 FA3；FA3 本体不在 NSA 那样提前改写 `page_table`。在 **稀疏协调器命中** 时，由 `FlashAttentionAdaptor.adapt_for_attn_metadata` 在 **`--page-size 1`** 下原地改写 `page_table`、`cache_seqlens_int32`、`cu_seqlens_k`、`max_seq_len_k`。
 
-- 复用 `FlashAttentionAdaptor`；它接收 Quest 的 **页级** `selected_indices`（与 §3.3 一致），在 `current_metadata` 上原地改写 `page_table / cache_seqlens_int32 / cu_seqlens_k / max_seq_len_k`。
-- **MVP（§1.4）**：在 **`--page-size 1`** 下，FA3 的 `page_table` 为 **token 级槽位**。Adaptor 将选中 Quest 页展开为逻辑 token 位置，经 `req_to_token` 得到逻辑 KV 槽位，若启用 HiSparse 再经 `translate_loc_to_hisparse_device` 得到 **hisparse device 上的 token 槽位**，写入 `page_table`；`cache_seqlens_int32` 为实际选中的 token 数。这样 **不要求** adaptor 理解「server 级 KV 页」与 Quest 页的倍数关系。
-- **`--page-size > 1` 不作为 MVP**：若未来支持，需要（a）保证 hot buffer 与 swap-in **页对齐** 与 FA3 页表一致，或（b）在 adaptor 中显式写 **FA3 页号** 并维护尾页 token 计数；见 §1.4 非目标。
+**HiSparse 下寻址约定（与早期设计稿的差异）**：
+
+- 写入 `page_table` 的必须是 **K/V 实际驻留的 device 槽**（hot buffer）。**权威映射** 为 `HiSparseMHACoordinator.req_to_device_buffer[req_pool_idx, pos_in_req]`：prefill 压缩进 hot buffer 时由 `alloc_device_buffer` 填好；decode 每步由 `map_last_loc_to_buffer` / `_grow_device_buffers` 维护。
+- **稀疏选中**（Quest 返回有效页）：`_write_token_level` 将页展开为 token 位置，再用 **`req_to_device_buffer`** 取槽写入 `page_table`，并缩短 `cache_seqlens`。
+- **稠密兜底**：若 `sparse_mask` 全 False、或 Quest **空选择**（全 `-1` / 无表示）、或（无 HiSparse 时）仅翻译需求：`page_table` 仍可对全长请求写成 **hot-buffer 槽**（`_write_dense_translated`：用 `req_to_device_buffer` 覆盖 `page_table` 前 `copy_w` 列，`cache_seqlens` 保持全长）。这修复了「仅用 `translate_loc_to_hisparse_device(logical)`，在 mapping 被 `alloc_device_buffer` 清掉后 prefill 槽变 0 → FA3 读空 KV」的问题。
+- **`backend_page_size != 1`**：直接 `ValueError`（与 `server_args` 对 Quest 的锁定一致）。
+- **`--page-size > 1` 不作为 MVP**：见 §1.4 非目标。
 
 ### 3.7 PD disagg 与单机模式
 
@@ -227,78 +236,53 @@ Qwen 默认走 FA3。FA3 的 `forward_extend` / `forward_decode` 路径里**没�
 
 ### 3.8 Server Args 改造
 
-当前 `server_args.py` 对 `--enable-hisparse` 的三处硬断言（模型必须是 DeepSeek-NSA、后端必须是 flashmla_sparse、kv_cache_dtype 必须是 bfloat16）需要改为按算法族 + 模型族决定。
+`check_server_args` 在 `--enable-hisparse` 时按 **`hisparse-config.algorithm`** 分支：
 
-新的语义：
+- **`deepseek_nsa`**：仍要求 DeepSeek-NSA 模型、`flashmla_sparse` NSA 后端、`bfloat16` KV；`page_size` 走 DSA 默认（可与 Quest 路径不同）。
+- **`quest`**：禁止 DSA 模型；`kv_cache_dtype ∈ {bfloat16, float16}`；**强制 `--page-size 1`** 并将 `self.page_size = 1`（理由见 §1.4）。
+
+`--hisparse-config` JSON 常用字段示例：
 
 ```
---enable-hisparse
---hisparse-config='{
-    "algorithm": "quest" | "deepseek_nsa",
-    "backend":   "flashmla_sparse" | "fa3",
+{
+    "algorithm": "quest",
+    "backend": "fa3",
     "top_k": 2048,
     "device_buffer_size": 6144,
-    "host_to_device_ratio": 10
-}'
+    "host_to_device_ratio": 10,
+    "page_size": 16
+}
 ```
 
-**与 DSA HiSparse 完全一致的配置表面**：用户只需给定 `top_k`、`device_buffer_size`、`host_to_device_ratio`；Quest 内部按 `num_topk_pages = ⌈top_k / N_quest⌉` 选页（`N_quest` 为 `hisparse-config` 中的可选 `page_size`，默认与 server `--page-size` 对齐；**MVP 推荐 server 固定为 1，Quest 仍可用 `N_quest>1`**）。不需要也不接受 `sparsity_ratio / num_recent_pages / min_sparse_prompt_len`。
-
-- `algorithm="deepseek_nsa"` 时维持现有 DSA + flashmla_sparse 约束不变（向后兼容）；其 `server_args.page_size` 仍按 DSA 模型默认（如 CUDA 上常为 64），与 Quest MVP 无关。
-- `algorithm="quest"` 时允许 `backend in {"fa3"}`，允许非 MLA 模型；并且 `kv_cache_dtype` 从 `bfloat16/float16` 中选（kernel 的 `item_size_bytes` 动态计算，不强绑 bf16）。
-- **`algorithm="quest"` + FA3 MVP**：建议在 `server_args` 校验或文档中要求 **`--page-size 1`**，与 §1.4 一致。
+- `top_k` / `device_buffer_size` / `host_to_device_ratio` 与 DSA 路径同语义；Quest 用 **`page_size`（`N_quest`）** 做 bbox 与选页粒度，`num_topk_pages = ⌈top_k / N_quest⌉`。
+- **`min_sparse_prompt_len`（可选）**：若省略或为 `0`，`sparse_mask` 对 batch 内所有请求为 True（始终尝试稀疏检索）。若设为 **正整数**，仅当 `prompt_len >= threshold` 的请求参与稀疏；其余请求走 adaptor 的 **稠密 + hot-buffer 寻址** 分支（`sparse_mask` 全 False 时也会翻译 `page_table`，保证 FA3 仍读到正确 KV）。
 
 ### 3.9 CUDA Graph 兼容性
 
-`HiSparseCoordinator` 当前已为 CUDA graph 做了三件事：
-1. 预分配 `top_k_device_locs_buffer`；
-2. 预分配 `req_device_buffer_tokens / _token_locs / lru_slots`；
-3. 通过 `num_real_reqs` 标量让 kernel 里的 padded block early-return。
+MHA HiSparse 侧仍预分配 swap-in 相关 buffer（与 MLA 思路类似）。**但 Quest + FA3 + `FlashAttentionAdaptor` 当前与 CUDA Graph capture 不兼容**：capture 时 FA3 会把依赖 `max_seq_len_k` / `cache_seqlens` 的 `scheduler_metadata` 烘焙进 graph，而 adaptor 每步会改写这些字段；replay 时会触发形状不匹配等错误。`SparseCoordinator._handle_sparse_retrieve` 在 **`get_is_capture_mode()`** 为真时 **直接返回**，让 capture 走稠密路径。
 
-MHA 路径 **完全复用** 这套结构。`QuestAlgorithm.retrieve_topk` 被覆盖为一次 `torch.topk` 的批量版本（`[bs, max_num_pages]` 上一次完成，对非法/越界页用 `-inf` 掩码），输出宽度固定为 `num_topk_pages = ⌈top_k / page_size⌉`；后续的 page→token 展开以及 kernel 调用也都是固定形状，整条链路 CUDA graph 安全。
+**实操**：Quest + HiSparse + FA3 请 **`--disable-cuda-graph`**。在 FA3 侧支持 capture 后重算 `scheduler_metadata` 之前，不要把三者同时打开。
 
 ---
 
-## 4. 最小改动集（MVP 实现清单）
+## 4. 实现状态与后续工作
 
-为了清晰，下面按"新增/修改"列出 MVP 所需的文件变更。
+### 4.1 已落地（摘要）
 
-### 4.1 新增文件
+Quest + HiSparse + FA3 的端到端链路已在 **单机、staging 式 prefill、关闭 CUDA graph** 场景下打通：Quest 选页 → decode 步 `swap_in_selected_pages` → `FlashAttentionAdaptor` 用 **`req_to_device_buffer`** 写 FA3 `page_table`；空选择或 `sparse_mask` 全 False 时走 **稠密兜底** 仍保持正确寻址。`retrieve_topk` 使用批量 `torch.topk` 与固定输出宽度，便于后续 graph 相关工作的基础已具备。
 
-- `python/sglang/srt/mem_cache/hisparse_memory_pool_mha.py`
-  - `HiSparseMHATokenToKVPool(MHATokenToKVPool)`
-  - `HiSparseMHATokenToKVPoolAllocator`（抽公共逻辑到 `_HiSparseAllocatorMixin`）
-- `python/sglang/srt/managers/hisparse_io/`（重构，可选）
-  - `base.py` —— `HiSparseIOSubsystem` 抽象
-  - `mla_io.py` —— 现有 `HiSparseCoordinator` 重命名并切成子类
-  - `mha_io.py` —— 新 MHA 子类
-- `python/sglang/srt/mem_cache/sparsity/algorithms/quest_algorithm.py`（扩展）
-  - 批量版 `retrieve_topk`（覆盖 `BaseSparseAlgorithmImpl.retrieve_topk` 的 Python loop）
+主要文件见 **§2.2**。
 
-### 4.2 关键修改点
+### 4.2 已知限制与开放项
 
-1. `python/sglang/jit_kernel/hisparse.py`：新增 `load_cache_to_device_buffer_mha`。
-2. `python/sglang/srt/mem_cache/sparsity/core/sparse_coordinator.py`：
-   - 填充 `forward_begin` → `io.wait_for_pending_backup()`；
-   - 填充 `forward_end` → `io.map_last_loc_to_buffer(...)` + eager backup；
-   - `_handle_sparse_retrieve` 在拿到 `selected_indices` 后，展开为 token 级、调 `io.swap_in_selected_pages`，再交 backend_adaptor。
-3. `python/sglang/srt/mem_cache/sparsity/factory.py`：根据 `config.algorithm` 与模型类型决定 `io_subsystem` 的具体类型；DSA 走 `HiSparseMLAIO`，Quest 走 `HiSparseMHAIO`（或 Quest+DSA 模型也允许走 MLA）。
-4. `python/sglang/srt/model_executor/model_runner.py`：`enable_hisparse` 时同时构造 `HiSparseIOSubsystem` 与 `SparseCoordinator`；把 `forward_batch.hisparse_coordinator` 的赋值路径推广到 MHA 分支（或通过 `sparse_coordinator` 统一访问）。
-5. `python/sglang/srt/server_args.py`：解除三处硬断言；改为按 `algorithm/backend/model` 交叉校验。
-6. `python/sglang/srt/layers/attention/flashinfer_backend.py` / `fa3_backend.py`（择一，视 Qwen 默认 decode 后端）：**不需要改后端本体**，只要 `SparseCoordinator.attention_begin` 在 `backend_adaptor.adapt_for_attn_metadata` 里写回 metadata 即可；不新增像 NSA 那样的 `translate_loc_to_hisparse_device` 调用点。
-7. `python/sglang/srt/mem_cache/sparsity/backend/backend_adaptor.py`：`FlashAttentionAdaptor.adapt_for_attn_metadata`：MVP 下在 **`--page-size 1`** 路径写 **token 级** hisparse 槽位；若未来支持 `page_size>1`，再维护页级写入分支（见 §1.4）。
-
-### 4.3 显式 TODO / 已知不完善点
-
-| TODO | 说明 |
+| 主题 | 说明 |
 |------|------|
-| 直写 host 路径下 Quest bbox 冷启动 | §3.7 描述，MVP 可先只支持 staging 模式 |
-| Quest `retrieve_topk` 的批量/CUDA-graph 化 | MVP 先禁用 CUDA graph 跑通；之后用 batched `torch.topk` 改写 |
-| `update_representations` 是否需要回填 host 侧页 | 严格来说 decode 步 k 的页已经 backup 到 host，再回读算 min/max 代价较高；Quest 的 bbox 本身单调扩张，**MVP 跳过** |
-| Quest bbox 池显存占用 | §3.2 末尾讨论，给出配置指引；后续可研究 per-layer 共享或 fp16 压缩 |
-| 与 radix cache 的兼容 | 现 HiSparse 要求 `--disable-radix-cache`，MVP 继承该限制 |
-| FA3 + `--page-size > 1` + Quest + HiSparse | 见 §1.4：需 kernel/热区页对齐或 adaptor 页语义扩展；**MVP 不做** |
-| `HiSparseMHATokenToKVPoolAllocator` 与 `--page-size 1` | 当前 `assert page_size > 1`；要落实 §1.4 需 allocator 与分配路径支持 `page_size==1` |
+| PD disagg 下 Quest bbox | §3.7：decode 侧冷启动 bbox 仍属设计级开放项；当前 MVP 以单机 staging 为主。 |
+| CUDA Graph | §3.9：Quest + FA3 + adaptor 与 capture 不兼容；需 **`--disable-cuda-graph`** 或 FA3 侧支持在 adaptor 后重算 `scheduler_metadata`。 |
+| Radix cache | 仍要求 **`--disable-radix-cache`**（与 DSA HiSparse 相同）。 |
+| FA3 `page_size > 1` + Quest + HiSparse | §1.4 非目标；需 kernel / hot buffer 与 FA3 页语义对齐。 |
+| Quest 近似与精度 | bbox 上界选页会偶发漏关键 token；可通过 **`top_k`**、`N_quest`、`min_sparse_prompt_len` 与任务评测调参；小样本准确率会有统计波动。 |
+| `update_representations` 与 host 上历史 K | 当前不回填 host 侧页到 bbox；依赖 bbox 单调性与 hot 区对新 token 的 update。 |
 
 ---
 
@@ -331,23 +315,7 @@ Qwen3 + `top_k=2048`：每步每层 ≈ 2048 × 8 × 128 × 2 × 2 = 8 MB；64 �
 
 ---
 
-## 6. 测试计划
-
-1. **单元测试**（新增 `test/registered/unit/managers/test_hisparse_quest_unit.py`）：
-   - mock `req_to_token_pool` + 小 `MHATokenToKVPool`；
-   - 构造 2 个 req × 3 层的 prefill，随机 K，验证 `QuestAlgorithm.page_k_min/max` 正确；
-   - 构造 decode query，验证 `retrieve_topk` 的 page 与 PyTorch 原生实现一致；
-   - 把 topk 展开为 token 级，调 MHA 版 kernel，验证 `device_buffer` 被正确写入；
-   - 构造 FA3 metadata，验证 `FlashAttentionAdaptor.adapt_for_attn_metadata` 改写后 page_table 指向正确的 hisparse 槽位。
-2. **数值一致性测试**（新增 `test/registered/8-gpu-models/test_qwen_hisparse.py`）：
-   - 小 Qwen 模型（Qwen2.5-1.5B），长上下文，用 `--enable-hisparse --hisparse-config '{"algorithm":"quest", ...}'` 跑 GSM8K / RULER 子集；
-   - 对比：不开 HiSparse 的 baseline vs 开 HiSparse + Quest（sparsity=0.3/0.5）；
-   - 验收：Quest sparsity=0.3 时精度下降 ≤ 2 pp（与 Quest 原论文一致）。
-3. **压力测试**：`bench_serving` 跑 `random` 数据集 `40k input / 20k output / concurrency=200`，验证不 OOM、吞吐与理论估算一致。
-
----
-
-## 7. 对用户的接口（与 §1 的 hisparse_guide.md 相衔接）
+## 6. 对用户的接口（与 `hisparse_guide.md` 相衔接）
 
 Qwen 启动样例：
 
@@ -375,20 +343,47 @@ python3 -m sglang.launch_server \
     }'
 ```
 
-说明：`--page-size 1` 满足 §1.4 MVP（FA3 `page_table` 为 token 级）。`hisparse-config` 里的 `"page_size": 16` 表示 **Quest 稀疏页**为 16 token；与前者独立。
+说明：`--page-size 1` 由 `server_args` 对 Quest 路径 **强制**（§1.4）。`hisparse-config` 里的 `"page_size": 16` 表示 **Quest 稀疏页** `N_quest=16`，与 server 分页无关。可选字段 `"min_sparse_prompt_len": <int>` 见 §3.8。
 
 ---
 
-## 8. 回顾：方案与"直接在 sparse_coordinator.py 里集成算法"的对应
+## 7. 扩展其他非原生稀疏注意力算法
 
-本方案没有把 Quest 的评分逻辑"内嵌"到 `SparseCoordinator`，而是保留 `algorithm: QuestAlgorithm` 作为可替换组件；`SparseCoordinator` 仅作为"指挥层"调用算法与 IO 子系统。这样做有三个好处：
+以下假设新算法仍服务于 **MHA/GQA + HiSparse + FA3** 这一类与 Quest 相同的部署形态；若目标后端或 KV 布局不同，需要额外评估 adaptor 与 IO。
 
-1. **算法可扩展**：未来接入 SnapKV / PQCache / Look-ahead 只需新增一个 `BaseSparseAlgorithmImpl` 子类。
-2. **IO 可扩展**：MLA / MHA / 未来 Gemma MLA 2 等可以各自实现 `HiSparseIOSubsystem` 子类。
-3. **与现有 DSA HiSparse 路径零冲突**：DSA 走 `DeepSeekNSAAlgorithm`（不计算 bbox，topk 由 indexer 给）+ `HiSparseMLAIO`，行为与现状完全一致。
+### 7.1 算法实现（必做）
 
----
+1. **继承 `BaseSparseAlgorithmImpl`**（`base_algorithm.py`），实现与现有生命周期一致的接口：
+   - `initialize_representation_pool` / `construct_representations` / `update_representations`：在 prefill / decode 中维护算法所需的 KV 侧表示（统计量、索引结构等）。
+   - **`retrieve_topk`**：签名与返回值需与协调器、swap-in、adaptor 衔接（见下）。
+2. 在 `python/sglang/srt/mem_cache/sparsity/factory.py` 的 **`_ALGORITHM_REGISTRY`** 中注册名字，例如 `"snapkv": lambda config, device, **kw: SnapKVAlgorithm(...)`，并在 `hisparse-config` 里用 `"algorithm": "<name>"` 选用。
 
-## 9. 致谢
+### 7.2 `retrieve_topk` 与下游的契约（与 Quest 对齐或显式分叉）
 
-本设计复用了 HiSparse 团队的 `hisparse.cuh` kernel（`IsMLA` 模板参数已原生支持 MHA 路径），以及稀疏算法框架已有的 `BaseSparseAlgorithmImpl` / `QuestAlgorithm` / `FlashAttentionAdaptor`。
+当前 `SparseCoordinator._handle_sparse_retrieve` 将 `retrieve_topk` 的返回值视为 **Quest 风格的「稀疏页号」矩阵** `selected_indices`，再用 **`SparseCoordinator.config.page_size`（即 `hisparse-config` 的 `page_size` / `N_quest`）** 通过 `_expand_selected_pages_to_tokens` 展成 **请求内 token 位置**，供 `swap_in_selected_pages` 与 `FlashAttentionAdaptor._write_token_level` 使用。
+
+扩展时二选一：
+
+- **推荐**：沿用同一契约——在配置里令 **`page_size` 等于算法的自然块长**（若算法本质是 **token 级** 选片，可令 **`page_size = 1`**，此时「页号」即 token 下标），这样 **无需改** `_expand_selected_pages_to_tokens` 与 MHA swap-in 的形状假设。
+- **若输出语义不同**（例如直接产出 block id、或非连续 token 列表）：需要改 **`sparse_coordinator.py`** 的展开逻辑，或在新算法内先把结果 **编码成** 当前 pipeline 能消费的 `(selected_indices, valid_lengths)` 格式；必要时为该类算法增加 **专用 adaptor** 分支（见 §7.3）。
+
+**空选择**：若某步无有效 topk，应返回与现实现一致的 **全 `-1` / 空张量** 形态，使协调器 **跳过 swap-in**，由 `FlashAttentionAdaptor` 走 **稠密 + `req_to_device_buffer`** 兜底（§3.6）。
+
+### 7.3 注意力后端适配器
+
+- `_create_backend_adaptor`（`factory.py`）在 **非 `DeepSeekNSAAlgorithm`** 且 `backend in {"fa3", "flashattention"}` 时使用 **`FlashAttentionAdaptor`**。
+- 新算法若仍通过 **改写 FA3 `page_table` / `cache_seqlens` / `cu_seqlens_k`** 表达稀疏 K，通常 **复用** `FlashAttentionAdaptor`；若元数据形状或语义与 Quest 不同（例如需要第二组索引张量），可 **新增 `BackendAdaptor` 子类**，在 `_create_backend_adaptor` 里按 `isinstance(sparse_algorithm, YourAlgo)` 或 `(algorithm_name, backend)` 分发。
+- **MVP 约束**：在 HiSparse + FA3 + 非原生算法路径上，仍应遵守 **`--page-size 1`** 与 **hot-buffer 寻址**（`req_to_device_buffer`）约定（§1.4、§3.6），否则易再现「逻辑槽未写 KV」类错误。
+
+### 7.4 IO 与 `model_runner` / `server_args`
+
+- **复用 `HiSparseMHACoordinator` + `load_cache_to_device_buffer_mha`**：只要稀疏侧最终仍给出 **「请求内 token 位置 + top_k 上限」** 的 swap-in 输入，现有 host→device kernel 与 LRU 逻辑可继续用。
+- **`model_runner.py`**：`algorithm=quest` 分支已示范 **MHA 协调器 + `create_sparse_coordinator(..., io_subsystem=...)`**。新算法若同属 MHA HiSparse，可在同一分支内用 **`parse_hisparse_config` / `create_sparse_coordinator`** 的 `algorithm` 字段区分；若需 **不同 IO**（例如另一套 staging），再增加 `elif _algo == "..."` 并挂接对应 coordinator。
+- **`check_server_args`（`server_args.py`）**：为 `algorithm=<新名>` 增加校验（模型族、KV dtype、`--page-size`、是否禁止 CUDA graph 等），并与文档 **`hisparse_guide.md`** 中的说明同步。
+
+### 7.5 配置与调参
+
+- 算法专有超参建议放在 **`hisparse-config` JSON 的额外键** 中，经 `_parse_sparse_config` 落入 **`SparseConfig.sparse_extra_config`**，在算法 `__init__` 中读取，避免污染全局 `server_args`。
+- **`min_sparse_prompt_len`**、**`top_k`**、**`device_buffer_size`** 等为框架级字段，可直接复用以控制 **何时稀疏**、**每步参与注意力的 token 预算**、**热缓冲大小**。
+
+按上述步骤，新算法以 **「注册名 + 统一 retrieve 契约 +（可选）adaptor/展开逻辑」** 接入即可，无需改动 DSA / `HiSparseCoordinator`（MLA）主路径。
