@@ -1,0 +1,11 @@
+run_dram_cxl2_phased_mirror_req512.sh
+timestamp=20260418_142316
+MODEL_PATH=/data3/yt/models/DeepSeek-V3.2-AWQ MODEL_CLIENT=deepseek-ai/DeepSeek-V3.2
+TP=8 DP_SIZE=8 PORT=30000
+NUM_REQUESTS=512 PH2_REQUESTS_MULT=8
+NUM_REQUESTS_P3_2K=256 NUM_REQUESTS_P3_4K=256 NUM_REQUESTS_P3_8K=128
+CXL_DEV_PATH=/dev/dax0.0 CXL_DEV_PATH_2=/dev/dax1.0
+CXL_MAP_BYTES=274877906944 CXL_MAP_BYTES_PER_DEVICE=274877906944
+TOTAL_CASES=96 (dram+cxl2 mirror p1-3=44 each; p4=8)
+RESULTS_DIR=./exp-new/dc_0417
+PYTHON_BIN=/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python

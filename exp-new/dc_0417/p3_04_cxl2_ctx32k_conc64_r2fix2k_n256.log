@@ -1,0 +1,60 @@
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+Token indices sequence length is longer than the specified maximum sequence length for this model (614791 > 131072). Running this sequence through the model will result in indexing errors
+Loading tokenizer...
+Building 1 unique synthetic prompts (~32768 tokens in, 2048 out)...
+  Server dp_size: 8
+  Unique prompts: 1
+  Round 1 requests: 8 (1 unique x 8 copies for 8 DP ranks)
+  Round 2 requests: 256 (repeat_mode=interleaved)
+  Round 2 output tokens: fixed at 2048
+  Prompt length: min=32768 max=32768 mean=32768 tokens
+  Output length: min=2048 max=2048 mean=2048 tokens
+Request rate: 0.0 req/s  |  Max concurrency: 64
+
+############################################################
+  ROUND 1: Warmup (8 requests, max_concurrency=8)
+############################################################
+
+============================================================
+  Round 1: Warmup
+============================================================
+  Requests:       8/8 succeeded
+  Duration:       140.9 s
+  Input tokens:   262144
+  Output tokens:  16384
+
+  TTFT    mean=52412.5ms  p50=53122.1ms  p99=53123.7ms
+  TBT     mean=43.2ms  p50=42.5ms  p99=46.8ms
+  TPOT    mean=43.2ms  p50=42.9ms  p99=44.2ms
+  E2E     mean=140825.3ms  p50=140876.5ms  p99=140879.0ms
+  Throughput: 116.3 tok/s  0.06 req/s
+
+Pausing 3.0s between rounds...
+
+############################################################
+  ROUND 2: Measurement (repeated requests on warm cache)
+############################################################
+
+============================================================
+  Round 2: Warm Measurement
+============================================================
+  Requests:       256/256 succeeded
+  Duration:       537.5 s
+  Input tokens:   8388608
+  Output tokens:  523535
+
+  TTFT    mean=1198.5ms  p50=1014.7ms  p99=2191.7ms
+  TBT     mean=65.1ms  p50=63.3ms  p99=87.5ms
+  TPOT    mean=65.1ms  p50=65.2ms  p99=66.7ms
+  E2E     mean=134354.0ms  p50=134321.8ms  p99=137040.1ms
+  Throughput: 974.1 tok/s  0.48 req/s
+
+============================================================
+  COMPARISON: Round 2 vs Round 1
+============================================================
+  Note: Round 1 is unique-only warmup, Round 2 is full repeated-load measurement; throughput is not directly comparable.
+  TTFT speedup:      43.73x  (52412.5 -> 1198.5 ms)
+  TBT speedup:       0.66x  (43.2 -> 65.1 ms)
+  E2E speedup:       1.05x  (140825.3 -> 134354.0 ms)
+
+Results saved to exp-new/dc_0417/p3_04_cxl2_ctx32k_conc64_r2fix2k_n256.json
