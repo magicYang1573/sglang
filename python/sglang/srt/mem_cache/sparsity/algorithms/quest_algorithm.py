@@ -247,22 +247,79 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             < (tok_start + self.page_size).clamp(max=seq_lens.unsqueeze(1)).unsqueeze(2)
         ) & pg_mask.unsqueeze(2)
 
-        phys_tok = req_to_token[
-            reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
-            tok_pos.clamp(0, req_to_token.shape[1] - 1),
-        ]
-
-        # Under HiSparse, K is physically stored at *hisparse device* slots
-        # (see HiSparseMHATokenToKVPool.set_kv_buffer which translates the
-        # logical loc before writing).  req_to_token however still keeps
-        # *logical* slots, so we must translate once more here before
-        # indexing k_buffer; otherwise Quest would read garbage for its
-        # bounding-box representations.
-        translate = getattr(
-            self.token_to_kv_pool, "_translate_loc_to_hisparse_device", None
+        # Resolve the physical K slot for each (req, token_pos_in_req) cell.
+        #
+        # Under HiSparse we have TWO sources of truth for the mapping
+        # "token position in request" -> "physical k_buffer slot":
+        #
+        # 1. ``req_to_token[req, pos] -> logical_slot``, followed by
+        #    ``full_to_hisparse_device_index_mapping[logical_slot] ->
+        #    hisparse_slot`` (i.e. ``_translate_loc_to_hisparse_device``).
+        #    This path is **only valid before ``alloc_device_buffer``**
+        #    runs: after prefill transitions into the decode hot buffer,
+        #    ``alloc_device_buffer`` *clears* the logical->hisparse
+        #    mapping and ``translate`` returns 0 for prefill tokens.
+        #
+        # 2. ``io_subsystem.req_to_device_buffer[req, pos_in_req] ->
+        #    hot_buffer_slot``.  The HiSparse MHA coordinator maintains
+        #    this table for the full request lifetime: ``alloc_device_
+        #    buffer`` seeds it with the reclaimed prefill hisparse slots,
+        #    and ``_grow_device_buffers`` / ``map_last_loc_to_buffer``
+        #    append fresh slots for every new decode token.
+        #
+        # During the *prefill* ``attention_end`` call we still have to
+        # use path 1 because ``req_to_device_buffer`` hasn't been
+        # populated yet (``alloc_device_buffer`` runs on the next
+        # scheduler tick, after staging DMA acks).  During *decode*
+        # ``update_representations`` we MUST use path 2, otherwise we
+        # would read ``k_buffer[0]`` (garbage) for every historical
+        # token in the tail page and overwrite the correct bounding
+        # box computed during prefill with random values -- which in
+        # turn makes Quest's criticality scores meaningless and causes
+        # the model to read zero / wrong KV through the adapter.
+        #
+        # Heuristic: prefer the coordinator table when it is attached
+        # AND the request has a live device buffer for this position
+        # (``req_to_device_buffer[req, pos] > 0``).  Fall back to the
+        # legacy translate path otherwise (prefill-time bbox build and
+        # non-HiSparse standalone tests).
+        io_subsystem = getattr(self, "_sparse_io_subsystem", None)
+        r2db = (
+            io_subsystem.req_to_device_buffer
+            if io_subsystem is not None
+            else None
         )
-        if translate is not None:
-            phys_tok = translate(phys_tok.to(torch.int64))
+        if r2db is not None:
+            r2db_width = r2db.shape[1]
+            tok_pos_in_req = tok_pos.clamp(0, r2db_width - 1).to(torch.int64)
+            reqs_expand = reqs.view(n, 1, 1).expand(n, max_pages, self.page_size)
+            hot_slot = r2db[reqs_expand, tok_pos_in_req]  # int64
+            # For positions beyond the currently-resident prefix the
+            # coordinator stores 0 (never written).  Fall back to the
+            # translate path for those cells to preserve the original
+            # prefill semantics (where mapping is still valid).
+            phys_tok_legacy = req_to_token[
+                reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
+                tok_pos.clamp(0, req_to_token.shape[1] - 1),
+            ]
+            translate = getattr(
+                self.token_to_kv_pool, "_translate_loc_to_hisparse_device", None
+            )
+            if translate is not None:
+                phys_tok_legacy = translate(phys_tok_legacy.to(torch.int64))
+            phys_tok_legacy = phys_tok_legacy.to(torch.int64)
+            phys_tok = torch.where(hot_slot > 0, hot_slot, phys_tok_legacy)
+        else:
+            phys_tok = req_to_token[
+                reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
+                tok_pos.clamp(0, req_to_token.shape[1] - 1),
+            ]
+            translate = getattr(
+                self.token_to_kv_pool, "_translate_loc_to_hisparse_device", None
+            )
+            if translate is not None:
+                phys_tok = translate(phys_tok.to(torch.int64))
+
         phys_tok = phys_tok.to(torch.int64).clamp(0, k_buffer.shape[0] - 1)
 
         keys = k_buffer[phys_tok].to(torch.float32)

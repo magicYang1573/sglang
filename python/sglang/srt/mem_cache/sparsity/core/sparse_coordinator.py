@@ -212,6 +212,15 @@ class SparseCoordinator:
             self.req_to_token_pool,
             self.states,
         )
+        # Expose the HiSparse IO subsystem to the algorithm so that
+        # ``_compute_page_representations`` can resolve the *current*
+        # "request-local token position -> physical k_buffer slot"
+        # through ``req_to_device_buffer`` during decode.  Without this,
+        # any layer that calls ``update_representations`` after the
+        # logical->hisparse mapping has been cleared by
+        # ``alloc_device_buffer`` would read ``k_buffer[0]`` (garbage)
+        # and overwrite the correct prefill-time bbox for the tail page.
+        self.algorithm._sparse_io_subsystem = self.io_subsystem
 
         logger.info(
             "SparseCoordinator initialized with sparse algorithm=%s, io_subsystem=%s",

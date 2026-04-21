@@ -86,6 +86,41 @@ class FlashAttentionAdaptor(BackendAdaptor):
             "cu_seqlens_k": metadata.cu_seqlens_k.clone(),
             "max_seq_len_k": metadata.max_seq_len_k,
         }
+        # ``scheduler_metadata`` is precomputed in ``init_forward_metadata``
+        # from the *original* ``cache_seqlens_int32`` / ``max_seq_len_k``.
+        # Every adapter rewrite below mutates those fields, which means the
+        # precomputed scheduler tile plan is stale: FA3 will dispatch
+        # workers for the original (longer) sequence length and read past
+        # the compacted ``page_table`` into the zero-padded tail, which
+        # contaminates the softmax with slot-0 KV and destroys accuracy
+        # (observed as "...\n.\n.\n..." degeneration on 20-shot GSM8K).
+        #
+        # Clearing ``metadata.scheduler_metadata`` forces FA3's
+        # ``flash_attn_with_kvcache`` to recompute the work plan on every
+        # layer from the *current* ``cache_seqlens_int32`` we just wrote.
+        # This is strictly correct and costs an extra per-layer kernel
+        # launch; acceptable for the eager-mode (``--disable-cuda-graph``)
+        # Quest + FA3 MVP path.
+        had_sched = (
+            hasattr(metadata, "scheduler_metadata")
+            and metadata.scheduler_metadata is not None
+        )
+        if hasattr(metadata, "scheduler_metadata"):
+            metadata.scheduler_metadata = None
+
+        left = getattr(self, "_debug_save_left", 6)
+        if left > 0:
+            self._debug_save_left = left - 1
+            import logging as _logging
+            _logging.getLogger("hisparse.debug").warning(
+                "[HS-DBG save_meta] cleared_scheduler_metadata=%s "
+                "original_max_seq_len_k=%s original_cache_seqlens[:4]=%s",
+                bool(had_sched),
+                int(self._original_metadata["max_seq_len_k"]),
+                self._original_metadata["cache_seqlens_int32"][:4].tolist()
+                if self._original_metadata["cache_seqlens_int32"].numel()
+                else [],
+            )
 
     def adapt_for_attn_metadata(
         self,
@@ -227,6 +262,13 @@ class FlashAttentionAdaptor(BackendAdaptor):
         current_metadata.cache_seqlens_int32.copy_(
             self._original_metadata["cache_seqlens_int32"]
         )
+        # Restore cu_seqlens_k / max_seq_len_k too, in case a previous
+        # decode step (or another adapter call) left them shrunk.  FA3
+        # doesn't consult them for `flash_attn_with_kvcache` but keeping
+        # the metadata self-consistent avoids surprises for downstream
+        # consumers (e.g. profilers / debuggers).
+        current_metadata.cu_seqlens_k = self._original_metadata["cu_seqlens_k"].clone()
+        current_metadata.max_seq_len_k = self._original_metadata["max_seq_len_k"]
 
         io_subsystem = getattr(forward_batch, "hisparse_coordinator", None)
         if io_subsystem is None:
