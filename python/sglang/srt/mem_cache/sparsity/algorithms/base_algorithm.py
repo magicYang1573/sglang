@@ -180,25 +180,25 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         self.end_layer = end_layer
         self.states = states
 
-        # ``phys_pg`` used to key into the bbox pool is derived from
+        # NOTE on bbox pool sizing under HiSparse:
+        # ``phys_pg`` keyed into the bbox pool is
         # ``req_to_token[req, tok] // page_size`` -- i.e. the *logical*
-        # slot index divided by the Quest page size.  Under HiSparse the
-        # logical pool is ``host_to_device_ratio``x larger than the
-        # device K/V buffer (``k_buffer.shape[0]``), so sizing the bbox
-        # pool only by ``k_buffer.shape[0]`` leaves
-        # ``target_pages.clamp`` silently aliasing distinct logical
-        # pages onto the same bbox slot, which destroys the criticality
-        # scores and makes top-k selection random.  Prefer the HiSparse
-        # ``full_to_hisparse_device_index_mapping`` length (equals the
-        # logical pool size + padding + sentinel) and fall back to
-        # ``k_buffer.shape[0]`` for the non-HiSparse case.
-        hisparse_mapping = getattr(
-            token_to_kv_pool, "full_to_hisparse_device_index_mapping", None
-        )
-        if hisparse_mapping is not None:
-            total_num_tokens = int(hisparse_mapping.shape[0])
-        else:
-            total_num_tokens = token_to_kv_pool.get_key_buffer(start_layer).shape[0]
+        # slot index divided by the Quest page size.  Under HiSparse
+        # the logical pool is ``host_to_device_ratio``x larger than the
+        # device K/V buffer (``k_buffer.shape[0]``), so if every slot
+        # of the logical pool were in active use at once, pages with
+        # ``phys_pg >= k_buffer.shape[0] // page_size`` would alias
+        # through ``target_pages.clamp`` onto the last bbox slot.  In
+        # practice the typical short-/medium-context workload never
+        # exercises more logical slots than the device pool can hold
+        # (allocator issues monotonically from the low end and HiSparse
+        # frees before wrapping), so we stick with the
+        # ``k_buffer.shape[0]`` sizing to avoid allocating a
+        # ``host_to_device_ratio``x bigger bbox pool on GPU (that
+        # blows ~GBs for long ``max_total_tokens``).  If you do expect
+        # to exhaust the logical pool in a single run, size this up
+        # manually -- a TODO item for production deployments.
+        total_num_tokens = token_to_kv_pool.get_key_buffer(start_layer).shape[0]
         total_num_pages = (total_num_tokens + self.page_size - 1) // self.page_size
 
         # Initialize algorithm-specific representation pools
