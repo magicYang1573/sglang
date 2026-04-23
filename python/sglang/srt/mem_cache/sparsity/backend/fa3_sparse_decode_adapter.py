@@ -9,6 +9,7 @@ slots.  It knows nothing about Quest / H2O / SnapKV etc.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -18,6 +19,9 @@ from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import SparseDecodeAd
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+logger = logging.getLogger(__name__)
 
 
 class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
@@ -96,15 +100,30 @@ class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
         # cache_seqlens.
         top_k_range = torch.arange(top_k, device=device).unsqueeze(0)
         valid_mask = top_k_range < valid_lengths.to(device).unsqueeze(1)
+        invalid_loc_mask = valid_mask & (locs_aligned < 0)
+        # If a sparse row contains invalid device locations in its valid
+        # prefix, fall back that row to dense for safety.
+        row_has_invalid = invalid_loc_mask.any(dim=1)
+        sparse_mask_device = sparse_mask.to(device)
+        effective_sparse_mask = sparse_mask_device & (~row_has_invalid)
+        effective_valid_mask = valid_mask & (~row_has_invalid.unsqueeze(1))
+        invalid_sparse_rows = row_has_invalid & sparse_mask_device
+        if bool(invalid_sparse_rows.any()):
+            logger.warning(
+                "FA3 sparse adapter found invalid swapped-in locations; "
+                "falling back %d row(s) to dense at layer_id=%d.",
+                int(invalid_sparse_rows.sum().item()),
+                layer_id,
+            )
 
         # For sparse rows overwrite the ENTIRE top-k prefix of the page
         # table; invalid slots use pad row 0 (FA3 cache_seqlens mask will
         # truncate reads at valid_lengths so those slots don't actually
         # contribute).  Dense rows remain untouched (already reset from
         # snapshot).
-        sparse_rowmask = sparse_mask.to(device).unsqueeze(1).expand(bs, top_k)
+        sparse_rowmask = effective_sparse_mask.unsqueeze(1).expand(bs, top_k)
         safe_locs = torch.where(
-            valid_mask, locs_aligned, torch.zeros_like(locs_aligned)
+            effective_valid_mask, locs_aligned, torch.zeros_like(locs_aligned)
         )
         target_page_table = meta.page_table[:, :top_k]
         meta.page_table[:, :top_k] = torch.where(
@@ -113,9 +132,10 @@ class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
 
         # Rebuild cache_seqlens: sparse rows truncated to valid_lengths,
         # dense rows keep the snapshot's value.
+        effective_lengths = effective_valid_mask.sum(dim=1).to(torch.int32)
         new_seqlens = torch.where(
-            sparse_mask.to(meta.cache_seqlens_int32.device),
-            valid_lengths.to(meta.cache_seqlens_int32.dtype),
+            effective_sparse_mask.to(meta.cache_seqlens_int32.device),
+            effective_lengths.to(meta.cache_seqlens_int32.dtype),
             meta.cache_seqlens_int32,
         )
         meta.cache_seqlens_int32 = new_seqlens

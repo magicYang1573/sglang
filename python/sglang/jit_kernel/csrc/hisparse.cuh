@@ -189,6 +189,14 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
+    if (token_idx < 0 || token_idx >= seq_len) {
+      // Padding / invalid entries are ignored by marking them as already-hit.
+      // This prevents them from entering miss handling where host_cache_locs[token]
+      // would otherwise index with -1 or an out-of-range position.
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_top_k_device_locs[i] = 0;
+      continue;
+    }
     if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
@@ -336,7 +344,9 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  // Keep total_misses from the miss-compaction pass above.
+  // Re-deriving it from counters can be wrong when top_k includes padding
+  // entries or repeated newest-token entries.
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
