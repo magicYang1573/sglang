@@ -50,6 +50,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _sparse_decode_mha_kv_multiplier(mr: "ModelRunner") -> int:
+    """HiSparseMHATokenToKVPool packs logical + hot-buffer rows in one tensor.
+
+    Physical row count is ``max_total_num_tokens * (host_to_device_ratio + 1)``
+    (see ``HiSparseMHATokenToKVPool``).  The default pool sizing model assumes
+    one physical row per logical token; scale the per-token byte cost when
+    sparse-decode will actually use that pool.
+    """
+    if not getattr(mr.server_args, "enable_sparse_decode", False):
+        return 1
+    if mr.is_hybrid_swa or mr.mambaish_config is not None:
+        return 1
+    if mr.use_mla_backend:
+        return 1
+    if is_float4_e2m1fn_x2(mr.kv_cache_dtype):
+        return 1
+    from sglang.srt.mem_cache.sparsity import parse_sparse_decode_config
+
+    cfg = parse_sparse_decode_config(mr.server_args)
+    return int(cfg.host_to_device_ratio) + 1
+
+
 class MemoryPoolConfigurator:
     """Base class for memory pool configurators.
 
@@ -109,6 +131,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
                 )
+
+        sd_mult = _sparse_decode_mha_kv_multiplier(mr)
+        if sd_mult > 1:
+            self._cell_size *= sd_mult
 
     def _compute_cell_size(self, mr: ModelRunner, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""

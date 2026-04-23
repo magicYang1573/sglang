@@ -164,6 +164,37 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    def test_sparse_decode_mha_physical_rows_fit_budget(self):
+        """HiSparseMHATokenToKVPool uses (ratio+1) physical rows per logical token."""
+        available = 12_000_000
+        mr_base = _make_model_runner(page_size=1)
+        mr_base.server_args.enable_sparse_decode = False
+
+        mr_sd = _make_model_runner(page_size=1)
+        mr_sd.server_args.enable_sparse_decode = True
+        mr_sd.server_args.sparse_decode_config = '{"host_to_device_ratio": 2}'
+
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg_base = create_memory_pool_configurator(mr_base)
+            cfg_sd = create_memory_pool_configurator(mr_sd)
+            config_base = cfg_base.calculate_pool_sizes(available, 1)
+            config_sd = cfg_sd.calculate_pool_sizes(available, 1)
+
+        ratio_plus_1 = 3
+        logical_bytes_sd = (
+            config_sd.max_total_num_tokens * ratio_plus_1 * _full_per_token(mr_sd) * 32
+        )
+        self.assertLessEqual(logical_bytes_sd, available)
+        self.assertGreater(
+            config_base.max_total_num_tokens,
+            config_sd.max_total_num_tokens * 2,
+            "sparse decode should reserve fewer logical tokens for same GPU bytes",
+        )
+
 
 class TestHybridSWAConfigurator(unittest.TestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
