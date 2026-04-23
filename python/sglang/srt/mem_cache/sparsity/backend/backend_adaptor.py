@@ -46,6 +46,32 @@ class BackendAdaptor(ABC):
         pass
 
 
+class SparseDecodeAdapter(BackendAdaptor):
+    """Common base for adapters that operate on **physical device-buffer
+    slots** (as returned by ``HiSparseCoordinator.swap_in_selected_pages``)
+    rather than on logical pages.
+
+    Subclasses override :meth:`adapt_for_attn_metadata` to rewrite their
+    backend-specific metadata object.  The ``selected_indices`` tensor in the
+    base signature is interpreted as ``top_k_device_locs``: the physical
+    hot-buffer row indices already populated by the HiSparse swap-in kernel.
+    """
+
+    @abstractmethod
+    def adapt_for_attn_metadata(
+        self,
+        selected_indices: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        current_metadata: Any,
+        forward_batch: "ForwardBatch",
+        req_to_token: torch.Tensor,
+        page_size: int,
+        layer_id: int,
+        **kwargs,
+    ) -> Any: ...
+
+
 class NSABackendAdaptor(BackendAdaptor):
     """Adaptor for NSA (Native Sparse Attention) backend."""
 

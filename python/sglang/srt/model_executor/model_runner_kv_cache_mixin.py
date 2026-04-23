@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
+    HiSparseMHATokenToKVPool,
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
@@ -546,6 +547,31 @@ class ModelRunnerKVCacheMixin:
                             self.server_args.speculative_algorithm is not None
                         ),
                     )
+                elif getattr(self.server_args, "enable_sparse_decode", False):
+                    from sglang.srt.mem_cache.sparsity import (
+                        parse_sparse_decode_config,
+                    )
+
+                    sparse_cfg = parse_sparse_decode_config(self.server_args)
+                    self.token_to_kv_pool = HiSparseMHATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        host_to_device_ratio=sparse_cfg.host_to_device_ratio,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
                 else:
                     self.token_to_kv_pool = MHATokenToKVPool(
                         self.max_total_num_tokens,
@@ -633,6 +659,24 @@ class ModelRunnerKVCacheMixin:
                                 kvcache=self.token_to_kv_pool,
                                 need_sort=need_sort,
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            )
+                        )
+                    elif getattr(self.server_args, "enable_sparse_decode", False):
+                        from sglang.srt.mem_cache.sparsity import (
+                            parse_sparse_decode_config,
+                        )
+
+                        sparse_cfg = parse_sparse_decode_config(self.server_args)
+                        self.token_to_kv_pool_allocator = (
+                            HiSparseTokenToKVPoolAllocator(
+                                self.max_total_num_tokens,
+                                page_size=self.page_size,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=self.token_to_kv_pool,
+                                need_sort=need_sort,
+                                host_to_device_ratio=sparse_cfg.host_to_device_ratio,
+                                sparse_decode_mode=True,
                             )
                         )
                     elif self.page_size == 1:

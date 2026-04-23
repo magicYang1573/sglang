@@ -1,15 +1,33 @@
+"""Inner controller that couples a sparse algorithm with a backend adapter.
+
+Historical note
+---------------
+The file used to host a ``SparseCoordinator`` class that was designed to run
+side-by-side with ``HiSparseCoordinator`` as a second, parallel protocol.
+The new sparse-decode path collapses that split: ``HiSparseCoordinator``
+remains the single external entry point for hierarchical sparse attention,
+and the algorithm / adapter logic is injected through a
+:class:`SparseAlgorithmController` instance held by the coordinator.
+
+For backward compatibility the module keeps the ``SparseConfig`` and
+``RequestTrackers`` dataclasses (they are reused by the factory parser).
+"""
+
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -38,8 +56,6 @@ class RequestTrackers:
             max_pool_size, dtype=torch.int64, device=device
         )
 
-        # TODO: Add more trackers for hierarchical KVCache management
-
     def register(self, idx: int, prompt_len: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
@@ -62,214 +78,238 @@ class SparseConfig:
     backend: Optional[str] = None
     page_size: Optional[int] = None
     min_sparse_prompt_len: Optional[int] = None
-    sparse_extra_config: dict = field(
-        default_factory=dict
-    )  # Algorithm-specific config, parsed by each algorithm
+    sparse_extra_config: dict = field(default_factory=dict)
 
 
-class SparseCoordinator:
-    """
-    Coordinator for sparse attention with retrievable KV cache compression.
+class SparseAlgorithmController:
+    """Inner module of :class:`HiSparseCoordinator` that composes
+    ``(sparse algorithm, backend adapter)`` for non-native sparse decode.
 
-    This coordinator framework is designed for decode-phase retrievable algorithms
-    (e.g., Quest, PQCache, SnapKV) that dynamically select important KV cache entries
-    based on current queries. It manages the lifecycle of sparse attention including
-    representation construction, sparse retrieval, and token offloading.
+    The controller does NOT own the host pool, the device hot buffer, or the
+    swap-in kernel; those live on the parent ``HiSparseCoordinator`` and are
+    reached through :attr:`io`.
 
-    Request Lifecycle and API Calls:
-        1. Request Start:
-           - on_request_begin(req) -> Register request and initialize state
+    Public hooks are called in three groups:
 
-        2. Prefill Phase:
-           - attention_end(...)    -> Construct representations
-
-        3. Decode Phase:
-           - forward_begin(batch)  -> Wait for pending KVCache offloading
-           - attention_begin(...)  -> Identify important KV, load offloaded KVCache, adapt attention metadata
-           - attention_end(...)    -> Construct/update representations
-           - forward_end(batch)    -> Trigger KVCache offloading
-
-        4. Request End:
-           - on_request_end(req) -> Clean up state and resources
+    * forward lifecycle: :meth:`before_decode_step`
+    * per-layer lifecycle: :meth:`begin_layer_decode` / :meth:`end_layer_decode`
+    * request lifecycle: :meth:`on_request_begin` / :meth:`on_prefill_finished`
+      / :meth:`on_request_end`
     """
 
     def __init__(
         self,
         config: SparseConfig,
         algorithm: BaseSparseAlgorithm,
-        backend_adaptor: Optional[BackendAdaptor],
+        adapter: BackendAdaptor,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: KVCache,
+        device: torch.device,
         start_layer: int,
         end_layer: int,
-        device: torch.device,
     ):
         self.config = config
         self.algorithm = algorithm
-        self.backend_adaptor = backend_adaptor
+        self.adapter = adapter
         self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool = token_to_kv_pool
+        self.device = device
         self.start_layer = start_layer
         self.end_layer = end_layer
-        self.device = device
-        self.page_size = config.page_size
 
+        # Will be bound later by HiSparseCoordinator.__init__.
+        self.io: Optional["HiSparseCoordinator"] = None
+
+        max_pool_size = req_to_token_pool.req_to_token.shape[0]
+        max_context_len = req_to_token_pool.max_context_len
         self.states = RequestTrackers(
-            req_to_token_pool.req_to_token.shape[0],
-            device,
-            end_layer - start_layer + 1,
-            self.config.min_sparse_prompt_len,
-            self.req_to_token_pool.max_context_len,
+            max_pool_size=max_pool_size,
+            device=device,
+            num_layers=end_layer - start_layer,
+            min_sparse_prompt_len=(config.min_sparse_prompt_len or 0),
+            max_context_len=max_context_len,
         )
 
-        # Initialize algorithm representation pool and context
+    def bind_io(self, io: "HiSparseCoordinator") -> None:
+        """Called once by :class:`HiSparseCoordinator` after construction."""
+        self.io = io
+        # The algorithm's representation pool is sized against the device KV
+        # pool held by the coordinator (same physical rows that FA3 sees
+        # during prefill).
         self.algorithm.initialize_representation_pool(
-            start_layer,
-            end_layer,
-            self.token_to_kv_pool,
-            self.req_to_token_pool,
-            self.states,
-        )
-
-        logger.info(
-            f"SparseCoordinator initialized with sparse algorithm={type(algorithm).__name__}"
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            token_to_kv_pool=io.mem_pool_device,
+            req_to_token_pool=self.req_to_token_pool,
+            states=self.states,
         )
 
     def on_request_begin(self, req: "Req") -> None:
-        """
-        Handle request begin event. Called when a new request is created.
-
-        Registers the request in the state tracker to enable sparse attention processing.
-        """
-        if req.req_pool_idx is not None:
-            self.states.register(req.req_pool_idx, len(req.origin_input_ids))
-
-    def on_request_end(self, req: "Req") -> None:
-        """
-        Handle request end event. Called when a request is completed or aborted.
-        Cleans up request-specific state and releases resources.
-        """
         if req.req_pool_idx is None:
             return
+        self.states.register(req.req_pool_idx, len(req.origin_input_ids))
 
+    def on_prefill_finished(self, req: "Req") -> None:
+        """Invoked by :meth:`HiSparseCoordinator.admit_request_from_gpu` after
+        the coordinator has migrated full KV to the host pool.
+
+        The algorithm representations for this request should already be
+        populated by :meth:`construct_representations` (triggered inside
+        :meth:`HiSparseCoordinator.admit_request_from_gpu`); extra bookkeeping
+        by subclasses (e.g. caching min/max in GPU) can happen here.
+        """
+        return
+
+    def on_request_end(self, req: "Req") -> None:
+        if req.req_pool_idx is None:
+            return
         self.states.clear(req.req_pool_idx)
 
-        # TODO: Implement request end handling
-        # - Release host indices if any were allocated for offloading
+    def before_decode_step(self, forward_batch: "ForwardBatch") -> None:
+        """Per-decode-step pre-forward hook.  Currently a no-op."""
+        return
 
-    def forward_begin(self, forward_batch: "ForwardBatch") -> None:
-        """
-        Handle forward pass begin event. Called before each forward pass starts.
-
-        Wait for pending KVCache offloading operations to complete before forward pass.
-        Ensures memory consistency for subsequent sparse attention operations.
-        """
-        # TODO: Implement forward begin handling
-        # - Check if there are pending offloading operations
-        pass
-
-    def forward_end(self, forward_batch: "ForwardBatch") -> None:
-        """
-        Handle forward pass end event. Called after each forward pass completes.
-
-        Trigger async KVCache offloading operations.
-        """
-        # TODO: Implement forward end handling
-        # - Identify tokens to offload
-        # - Trigger async offloading operations
-        pass
-
-    def attention_begin(
+    def begin_layer_decode(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        q: torch.Tensor,
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
-        attn_metadata: Optional[Any],
-        **kwargs,
-    ) -> Optional[Any]:
-        """
-        Handle attention begin event. Called before each attention pass starts.
+        attn_metadata: Any,
+    ) -> Any:
+        """Called by :class:`Fa3SparseDecodeBackend.forward_decode` at the
+        beginning of every decode layer.
 
-        Identify important KV entries via sparse algorithm, load offloaded KVCache if needed,
-        and adapt attention metadata for the attention backend.
+        1. On the first layer of the step, saves a snapshot of the dense
+           metadata so later layers can revert.
+        2. Asks the algorithm for token-level top-k indices.
+        3. Delegates to :meth:`HiSparseCoordinator.swap_in_selected_pages` to
+           fetch those tokens into the device hot buffer.
+        4. Asks the adapter to rewrite the attention metadata so that FA3
+           reads only the newly swapped-in slots.
         """
+        if self.io is None:
+            raise RuntimeError(
+                "SparseAlgorithmController is not bound to a HiSparseCoordinator"
+            )
+
         if layer.layer_id == self.start_layer:
-            self.backend_adaptor.save_original_metadata(attn_metadata)
+            self.adapter.save_original_metadata(attn_metadata)
 
-        return self._handle_sparse_retrieve(
-            query, layer, forward_batch, attn_metadata, **kwargs
-        )
+        sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
 
-    def attention_end(
-        self,
-        output: torch.Tensor,
-        layer: "RadixAttention",
-        forward_batch: "ForwardBatch",
-    ) -> None:
-        """
-        Handle attention end event. Called after each attention pass completes.
-
-        Maybe construct and update sparse representations.
-        """
-        layer_id = layer.layer_id
-
-        # Maybe construct representations
-        self.algorithm.construct_representations(
-            layer_id=layer_id,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-            forward_batch=forward_batch,
-        )
-
-        # Maybe update representations
-        self.algorithm.update_representations(
-            layer_id=layer_id,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-            forward_batch=forward_batch,
-        )
-
-    def _handle_sparse_retrieve(
-        self,
-        query: torch.Tensor,
-        layer: "RadixAttention",
-        forward_batch: "ForwardBatch",
-        attn_metadata: Optional[Any],
-        **kwargs,
-    ) -> Optional[torch.Tensor]:
-        req_pool_indices = forward_batch.req_pool_indices
-        # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices)
-        selected_indices, valid_lengths = self.algorithm.retrieve_topk(
-            queries=query,
+        top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
+            queries=q,
             layer_id=layer.layer_id,
-            req_pool_indices=req_pool_indices,
+            req_pool_indices=forward_batch.req_pool_indices,
             sparse_mask=sparse_mask,
             forward_batch=forward_batch,
             attn_metadata=attn_metadata,
-            **kwargs,
         )
 
-        # Adapt Attention Metadata
-        return self.backend_adaptor.adapt_for_attn_metadata(
-            selected_indices=selected_indices,
+        top_k_device_locs = self.io.swap_in_selected_pages(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            top_k_result=top_k_tokens,
+            layer_id=layer.layer_id,
+        )
+
+        return self.adapter.adapt_for_attn_metadata(
+            selected_indices=top_k_device_locs,
             valid_lengths=valid_lengths,
             sparse_mask=sparse_mask,
             current_metadata=attn_metadata,
             forward_batch=forward_batch,
             req_to_token=self.req_to_token_pool.req_to_token,
-            page_size=self.page_size,
+            page_size=(self.config.page_size or 1),
             layer_id=layer.layer_id,
         )
 
-    def _compute_sparse_mask(self, req_pool_indices):
-        mask = (
+    def end_layer_decode(
+        self,
+        o: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+    ) -> None:
+        """Called after ``super().forward_decode`` for each decode layer.
+
+        The algorithm updates its representation pool with the new token
+        (decoded in the previous step) if necessary.  The K buffer used here
+        must cover the logical rows of the active request; see
+        :meth:`_k_buffer_for_update` for the resolution.
+        """
+        if self.io is None:
+            return
+        layer_id = layer.layer_id
+        k_buffer = self._k_buffer_for_update(layer_id)
+        self.algorithm.update_representations(
+            layer_id=layer_id,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            k_buffer=k_buffer,
+            forward_batch=forward_batch,
+        )
+
+    def construct_prefill_representations(
+        self,
+        req: "Req",
+        prefill_seq_lens: torch.Tensor,
+        prefill_req_pool_indices: torch.Tensor,
+    ) -> None:
+        """Trigger one-shot, per-layer representation construction for a
+        request that just finished prefill.
+
+        Called by :meth:`HiSparseCoordinator.admit_request_from_gpu` BEFORE
+        the logical rows are migrated to host.
+        """
+        if self.io is None:
+            return
+
+        class _FakeFwdBatch:
+            """Minimal stand-in for ForwardBatch used by algorithm code."""
+
+            def __init__(self, seq_lens: torch.Tensor):
+                from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+                self.forward_mode = ForwardMode.EXTEND
+                self.seq_lens = seq_lens
+
+        fake_fb = _FakeFwdBatch(prefill_seq_lens)
+        for layer_id in range(self.start_layer, self.end_layer):
+            k_buffer = self.io.mem_pool_device.get_key_buffer(layer_id)
+            self.algorithm.construct_representations(
+                layer_id=layer_id,
+                req_pool_indices=prefill_req_pool_indices,
+                seq_lens=prefill_seq_lens,
+                k_buffer=k_buffer,
+                forward_batch=fake_fb,
+            )
+
+    def _compute_sparse_mask(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
+        if self.config.min_sparse_prompt_len is None:
+            # All requests get sparse treatment.
+            return torch.ones(
+                req_pool_indices.shape,
+                dtype=torch.bool,
+                device=req_pool_indices.device,
+            )
+        return (
             self.states.prompt_lens[req_pool_indices]
             >= self.config.min_sparse_prompt_len
         )
 
-        return mask
+    def _k_buffer_for_update(self, layer_id: int) -> torch.Tensor:
+        """Resolve where the K buffer lives for incremental representation
+        updates during decode.
+
+        In sparse-decode mode the *full* KV is on host after admit; but for
+        the update step the algorithm only cares about pages that still have
+        valid keys on GPU (recent tail).  HiSparseCoordinator keeps those in
+        the hot buffer, whose backing tensor is the same physical
+        ``HiSparseMHATokenToKVPool`` object.  We therefore return the full
+        pool's K buffer and let the algorithm skip out-of-range pages via
+        its own ``last_constructed_page`` state.
+        """
+        if self.io is None:
+            raise RuntimeError("controller.io not bound")
+        return self.io.mem_pool_device.get_key_buffer(layer_id)
+
+
+__all__ = ["RequestTrackers", "SparseConfig", "SparseAlgorithmController"]

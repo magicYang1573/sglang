@@ -90,7 +90,9 @@ class SchedulerOutputProcessorMixin:
             req.check_finished()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if self.enable_hisparse:
+                if (self.enable_hisparse or self.enable_sparse_decode) and (
+                    self.hisparse_coordinator is not None
+                ):
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 
@@ -197,6 +199,10 @@ class SchedulerOutputProcessorMixin:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
+                        elif self.enable_sparse_decode:
+                            # Single-instance path: migrate the full GPU KV to
+                            # host and allocate the hot buffer in one shot.
+                            self.hisparse_coordinator.admit_request_from_gpu(req)
 
                     self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -560,7 +566,9 @@ class SchedulerOutputProcessorMixin:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if self.enable_hisparse:
+                if (self.enable_hisparse or self.enable_sparse_decode) and (
+                    self.hisparse_coordinator is not None
+                ):
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
 

@@ -353,6 +353,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_sparse_decode = getattr(
+            server_args, "enable_sparse_decode", False
+        )
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -682,24 +685,49 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
-        # Init hisparse coordinator (must happen before CUDA graph capture)
-        if self.enable_hisparse:
+        # Init hisparse coordinator (must happen before CUDA graph capture).
+        # Handles both the legacy DSA path (``--enable-hisparse``) and the new
+        # sparse-decode path (``--enable-sparse-decode``).
+        if self.enable_hisparse or self.enable_sparse_decode:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-            hisparse_cfg = parse_hisparse_config(self.server_args)
+            if self.enable_hisparse:
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                algorithm_controller = None
+                mode = "dsa_native"
+            else:
+                from sglang.srt.mem_cache.sparsity import (
+                    build_sparse_algorithm_controller,
+                    parse_sparse_decode_config,
+                )
+
+                hisparse_cfg = parse_sparse_decode_config(self.server_args)
+                algorithm_controller = build_sparse_algorithm_controller(
+                    config=hisparse_cfg,
+                    device=torch.device(self.device),
+                    req_to_token_pool=self.req_to_token_pool,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+                mode = "sparse_decode"
+
+            tp_group = (
+                self.attention_tp_group.cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_group.cpu_group
+            )
             self.hisparse_coordinator = HiSparseCoordinator(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 top_k=hisparse_cfg.top_k,
                 device_buffer_size=hisparse_cfg.device_buffer_size,
                 device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
+                tp_group=tp_group,
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                mode=mode,
+                algorithm_controller=algorithm_controller,
             )
 
         # Init routed experts capturer

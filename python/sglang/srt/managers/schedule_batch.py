@@ -1677,6 +1677,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
 
+            # Notify the sparse-decode controller that the request has a
+            # valid req_pool_idx (needed for its per-request bookkeeping).
+            if (
+                self.hisparse_coordinator is not None
+                and self.hisparse_coordinator.algorithm_controller is not None
+                and pre_len == 0
+            ):
+                self.hisparse_coordinator.algorithm_controller.on_request_begin(req)
+
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates

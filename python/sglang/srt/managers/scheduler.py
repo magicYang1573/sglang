@@ -386,6 +386,9 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_sparse_decode = getattr(
+            server_args, "enable_sparse_decode", False
+        )
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
         # Distributed rank info
@@ -895,10 +898,11 @@ class Scheduler(
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
 
-        if self.enable_hisparse:
+        if self.enable_hisparse or self.enable_sparse_decode:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
         if (
             server_args.disaggregation_mode == "decode"

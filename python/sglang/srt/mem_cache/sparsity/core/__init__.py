@@ -1,11 +1,11 @@
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     RequestTrackers,
+    SparseAlgorithmController,
     SparseConfig,
-    SparseCoordinator,
 )
 
 __all__ = [
     "RequestTrackers",
     "SparseConfig",
-    "SparseCoordinator",
+    "SparseAlgorithmController",
 ]

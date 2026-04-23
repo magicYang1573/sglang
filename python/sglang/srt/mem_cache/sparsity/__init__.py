@@ -5,12 +5,15 @@ from sglang.srt.mem_cache.sparsity.algorithms import (
     QuestAlgorithm,
 )
 from sglang.srt.mem_cache.sparsity.backend import BackendAdaptor, FlashAttentionAdaptor
-from sglang.srt.mem_cache.sparsity.core import SparseConfig, SparseCoordinator
+from sglang.srt.mem_cache.sparsity.core import (
+    RequestTrackers,
+    SparseAlgorithmController,
+    SparseConfig,
+)
 from sglang.srt.mem_cache.sparsity.factory import (
-    create_sparse_coordinator,
-    get_sparse_coordinator,
+    build_sparse_algorithm_controller,
     parse_hisparse_config,
-    register_sparse_coordinator,
+    parse_sparse_decode_config,
 )
 
 __all__ = [
@@ -21,9 +24,9 @@ __all__ = [
     "BackendAdaptor",
     "FlashAttentionAdaptor",
     "SparseConfig",
-    "SparseCoordinator",
-    "create_sparse_coordinator",
-    "get_sparse_coordinator",
+    "SparseAlgorithmController",
+    "RequestTrackers",
+    "build_sparse_algorithm_controller",
     "parse_hisparse_config",
-    "register_sparse_coordinator",
+    "parse_sparse_decode_config",
 ]

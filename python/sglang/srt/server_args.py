@@ -585,6 +585,9 @@ class ServerArgs:
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
+    # Non-native sparse decode (e.g. Qwen + Quest + FA3)
+    enable_sparse_decode: bool = False
+    sparse_decode_config: Optional[str] = None
 
     # LMCache
     enable_lmcache: bool = False
@@ -5682,6 +5685,23 @@ class ServerArgs:
             'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
         )
 
+        parser.add_argument(
+            "--enable-sparse-decode",
+            action="store_true",
+            help="Enable the non-native sparse decode path (e.g. Qwen + Quest + FA3). "
+            "Mutually exclusive with --enable-hisparse.",
+        )
+
+        parser.add_argument(
+            "--sparse-decode-config",
+            type=str,
+            default=ServerArgs.sparse_decode_config,
+            help="JSON string configuring the non-native sparse decode path. "
+            'Example: \'{"algorithm": "quest", "top_k": 2048, '
+            '"device_buffer_size": 4096, "min_sparse_prompt_len": 4096, '
+            '"sparse_extra_config": {"sparsity_ratio": 0.5, "num_recent_pages": 8}}\'.',
+        )
+
         # LMCache
         parser.add_argument(
             "--enable-lmcache",
@@ -6521,6 +6541,13 @@ class ServerArgs:
             if self.decode_attention_backend
             else self.attention_backend
         )
+        # Non-native sparse decode: force the hybrid (fa3 prefill + sparse
+        # fa3 decode) arrangement so ModelRunner's existing HybridAttnBackend
+        # path auto-composes both halves.
+        if self.enable_sparse_decode:
+            if prefill_attention_backend_str is None:
+                prefill_attention_backend_str = "fa3"
+            decode_attention_backend_str = "fa3_sparse_decode"
         return prefill_attention_backend_str, decode_attention_backend_str
 
     def use_mla_backend(self):
@@ -6678,6 +6705,54 @@ class ServerArgs:
                     f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
                     f"Please use --kv-cache-dtype=bfloat16."
                 )
+
+        # Non-native sparse decode guards
+        if self.enable_sparse_decode:
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--enable-hisparse (native DSA path) and --enable-sparse-decode "
+                    "(non-native sparse path) are mutually exclusive."
+                )
+            if self.kv_cache_dtype != "bfloat16":
+                raise ValueError(
+                    "--enable-sparse-decode currently requires --kv-cache-dtype=bfloat16 "
+                    f"(got {self.kv_cache_dtype})."
+                )
+            if self.page_size != 1:
+                raise ValueError(
+                    "--enable-sparse-decode currently requires --page-size=1 "
+                    f"(got {self.page_size})."
+                )
+            if not self.disable_radix_cache:
+                raise ValueError(
+                    "--enable-sparse-decode currently requires --disable-radix-cache."
+                )
+            try:
+                hf_config = self.get_model_config().hf_config
+            except Exception:
+                hf_config = None
+            if hf_config is not None:
+                arch_list = getattr(hf_config, "architectures", []) or []
+                if not any(
+                    arch.startswith(("Qwen2", "Qwen3")) for arch in arch_list
+                ):
+                    logger.warning(
+                        "--enable-sparse-decode has only been validated on Qwen2/Qwen3 "
+                        "text-only models; architecture %s is experimental.",
+                        arch_list,
+                    )
+            if self.attention_backend not in (None, "fa3"):
+                raise ValueError(
+                    "--enable-sparse-decode requires --attention-backend=fa3 (or unset)."
+                )
+            # CUDA Graph has Python for-loops in QuestAlgorithm.retrieve_topk,
+            # first release disables CUDA Graph for safety.
+            if not self.disable_cuda_graph:
+                logger.warning(
+                    "--enable-sparse-decode: auto-disabling CUDA Graph because "
+                    "QuestAlgorithm currently contains Python for-loops."
+                )
+                self.disable_cuda_graph = True
 
         assert (
             self.schedule_conservativeness >= 0

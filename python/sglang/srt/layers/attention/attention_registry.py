@@ -157,6 +157,27 @@ def create_flashattention_v4_backend(runner):
     return FlashAttentionBackend(runner, fa_impl_ver=4)
 
 
+@register_attention_backend("fa3_sparse_decode")
+def create_fa3_sparse_decode_backend(runner):
+    """Thin FA3 wrapper used as the decode half of the HybridAttnBackend when
+    ``--enable-sparse-decode`` is set.  ModelRunner never imports this class.
+    """
+    major, minor = get_device_capability()
+    assert not runner.use_mla_backend, (
+        "fa3_sparse_decode is the non-native sparse path and targets MHA/GQA "
+        "models; MLA models should continue to use the NSA / HiSparse path."
+    )
+    if not _is_musa:
+        assert major == 8 or major == 9, (
+            "fa3_sparse_decode requires SM>=80 and SM<=90 (same constraints as fa3)."
+        )
+    from sglang.srt.layers.attention.fa3_sparse_decode_backend import (
+        Fa3SparseDecodeBackend,
+    )
+
+    return Fa3SparseDecodeBackend(runner)
+
+
 @register_attention_backend("cutlass_mla")
 def create_cutlass_mla_backend(runner):
     from sglang.srt.layers.attention.cutlass_mla_backend import CutlassMLABackend

@@ -1,22 +1,39 @@
-# to be combined with the sparse coordinator class and sparse algorithm family
+# Unified coordinator for both native sparse attention (DSA/NSA MLA) and the
+# non-native sparse-decode path (MHA/GQA + pluggable sparse algorithms like
+# Quest).  The class exposes a single external entry point; algorithm/adapter
+# logic lives in the optional :class:`SparseAlgorithmController` injected at
+# construction time.
 
 import logging
-from typing import List, NamedTuple
+from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Type
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
+    HiSparseMHATokenToKVPool,
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
+)
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse import (
+    load_cache_to_device_buffer_mha,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
+        SparseAlgorithmController,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -44,24 +61,52 @@ class HiSparseCoordinator:
         device: str,
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
+        mode: Literal["dsa_native", "sparse_decode"] = "dsa_native",
+        algorithm_controller: Optional["SparseAlgorithmController"] = None,
+        host_pool_class: Optional[Type[HostKVCache]] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
+        self.mode = mode
 
-        self.mem_pool_device: HiSparseNSATokenToKVPool = (
-            self.token_to_kv_pool_allocator.get_kvcache()
-        )
-        self.mem_pool_host = MLATokenToKVPoolHost(
-            device_pool=self.mem_pool_device,
-            host_to_device_ratio=host_to_device_ratio,
-            host_size=0,
-            page_size=1,  # for simplicity, we set page size to 1 to enable backup one token at a time
-            layout="layer_first",
-            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
-        )
+        self.mem_pool_device = self.token_to_kv_pool_allocator.get_kvcache()
+        # Host pool: layout and class differ between the DSA (MLA) and
+        # sparse-decode (MHA) paths.
+        if host_pool_class is None:
+            host_pool_class = (
+                MHATokenToKVPoolHost
+                if mode == "sparse_decode"
+                else MLATokenToKVPoolHost
+            )
+
+        if mode == "sparse_decode":
+            assert isinstance(self.mem_pool_device, HiSparseMHATokenToKVPool), (
+                "sparse_decode mode requires HiSparseMHATokenToKVPool, got "
+                f"{type(self.mem_pool_device).__name__}"
+            )
+            self.mem_pool_host = host_pool_class(
+                device_pool=self.mem_pool_device,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                page_size=1,
+                layout="layer_first",
+            )
+        else:
+            assert isinstance(self.mem_pool_device, HiSparseNSATokenToKVPool), (
+                "dsa_native mode requires HiSparseNSATokenToKVPool, got "
+                f"{type(self.mem_pool_device).__name__}"
+            )
+            self.mem_pool_host = host_pool_class(
+                device_pool=self.mem_pool_device,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                page_size=1,
+                layout="layer_first",
+                override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+            )
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -128,6 +173,19 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
+
+        # Sparse-decode controller (non-DSA path).  Bound here so the
+        # algorithm's representation pool can be initialized against the
+        # coordinator-owned device pool.
+        self.algorithm_controller: Optional["SparseAlgorithmController"] = (
+            algorithm_controller
+        )
+        if self.algorithm_controller is not None:
+            if self.mode != "sparse_decode":
+                raise ValueError(
+                    "algorithm_controller is only valid when mode='sparse_decode'"
+                )
+            self.algorithm_controller.bind_io(self)
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
@@ -621,6 +679,9 @@ class HiSparseCoordinator:
             self._backup_done_event.wait(device_module.current_stream())
             self._has_pending_backup = False
 
+        if self.algorithm_controller is not None:
+            self.algorithm_controller.on_request_end(req)
+
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
         buffer_indices = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
@@ -673,22 +734,138 @@ class HiSparseCoordinator:
         top_k_indices.fill_(-1)
         # todo, adjustable for performance
         block_size = 1024
-        load_cache_to_device_buffer_mla(
-            top_k_tokens=top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
-            host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
-            top_k_device_locs=top_k_indices,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            lru_slots=self.lru_slots[layer_id],
-            item_size_bytes=self.mem_pool_host.token_stride_size,
-            num_top_k=self.top_k,
-            hot_buffer_size=self.device_buffer_size,
-            page_size=1,
-            block_size=block_size,
-            num_real_reqs=self.num_real_reqs,
-        )
+
+        if self.mode == "sparse_decode":
+            load_cache_to_device_buffer_mha(
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                host_k_cache=self.mem_pool_host.k_buffer[layer_id],
+                host_v_cache=self.mem_pool_host.v_buffer[layer_id],
+                device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
+                device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
+                top_k_device_locs=top_k_indices,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                lru_slots=self.lru_slots[layer_id],
+                item_size_bytes=self.mem_pool_host.token_stride_size,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=block_size,
+                num_real_reqs=self.num_real_reqs,
+            )
+        else:
+            load_cache_to_device_buffer_mla(
+                top_k_tokens=top_k_result,
+                device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+                host_cache_locs=self.req_to_host_pool,
+                device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=top_k_indices,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                lru_slots=self.lru_slots[layer_id],
+                item_size_bytes=self.mem_pool_host.token_stride_size,
+                num_top_k=self.top_k,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=block_size,
+                num_real_reqs=self.num_real_reqs,
+            )
         return top_k_indices
+
+    def admit_request_from_gpu(self, req: Req) -> None:
+        """Single-instance counterpart of :meth:`admit_request_into_staging`.
+
+        In the sparse-decode path the prefill runs dense on the local GPU (no
+        staging / RDMA).  After prefill finishes this method:
+
+          1. Triggers one-shot per-layer representation construction on the
+             still-GPU-resident full KV (the algorithm needs the raw K to
+             compute page min/max).
+          2. Copies the full logical KV rows of ``req`` to the host pool.
+          3. Reserves a device hot buffer via :meth:`alloc_device_buffer` and
+             migrates the tail tokens into it.
+          4. Frees the logical rows so subsequent requests can reuse them.
+          5. Marks the request ready for decode.
+        """
+        if self.mode != "sparse_decode":
+            raise RuntimeError(
+                "admit_request_from_gpu is only valid in sparse_decode mode; "
+                "use admit_request_into_staging for the DSA path."
+            )
+        if self.algorithm_controller is None:
+            raise RuntimeError(
+                "sparse_decode mode requires an algorithm_controller to be "
+                "bound to HiSparseCoordinator."
+            )
+
+        kv_len = int(req.kv_allocated_len)
+        if kv_len <= 0:
+            return
+
+        logical_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_len
+        ].to(device=self.device, dtype=torch.int64)
+
+        # 1. Algorithm representation construction.  At this point the
+        # request's KV still lives in the logical rows of the
+        # HiSparseMHATokenToKVPool and is GPU-visible via get_key_buffer.
+        seq_lens_tensor = torch.tensor([kv_len], dtype=torch.int64, device=self.device)
+        req_pool_indices_tensor = torch.tensor(
+            [req.req_pool_idx], dtype=torch.int64, device=self.device
+        )
+        self.algorithm_controller.construct_prefill_representations(
+            req=req,
+            prefill_seq_lens=seq_lens_tensor,
+            prefill_req_pool_indices=req_pool_indices_tensor,
+        )
+
+        # 2. Allocate host rows and backup full KV.
+        host_indices = self.mem_pool_host.alloc(kv_len)
+        if host_indices is None:
+            raise RuntimeError(
+                f"HiSparse(host) alloc failed for {kv_len} tokens (req {req.rid})"
+            )
+        host_indices = host_indices.to(device=self.device)
+        self.req_to_host_pool[req.req_pool_idx, :kv_len] = host_indices
+
+        self.mem_pool_host.backup_from_device_all_layer(
+            self.mem_pool_device,
+            host_indices,
+            logical_indices,
+            io_backend="kernel",
+        )
+
+        # 3. Allocate the device hot buffer and populate it with the tail of
+        # the request's tokens (so the very first decode step has valid data
+        # without waiting for the swap-in kernel).  The hot buffer slots are
+        # DISTINCT physical rows from the prefill-time logical rows, since
+        # ``HiSparseMHATokenToKVPool`` is sized ``size*ratio`` and the two
+        # sub-allocators carve non-overlapping ranges.
+        self.alloc_device_buffer(req)
+        if kv_len <= self.device_buffer_size:
+            self._preload_to_device_buffer(req)
+        else:
+            # Long sequence: mark hot buffer empty so every first-step lookup
+            # becomes a miss and flows through the swap-in kernel.
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = -1
+
+        # NOTE: We intentionally do NOT free the logical rows here.  The
+        # scheduler later calls ``tree_cache.cache_finished_req`` which
+        # reads ``req_to_token`` and frees ALL allocated logical rows
+        # (prefill + decode) at request end via
+        # ``HiSparseTokenToKVPoolAllocator.free``.  Freeing here would
+        # double-free on request completion.  The memory cost is bounded
+        # because the physical tensor is sized ``size * host_to_device_ratio``
+        # to accommodate both roles simultaneously.
+
+        req.hisparse_staging = False
+        self._skip_first_backup[req.req_pool_idx] = True
+        self.algorithm_controller.on_prefill_finished(req)
+        logger.debug("HiSparse: admitted request %s from GPU (len=%d)", req.rid, kv_len)
