@@ -6753,6 +6753,20 @@ class ServerArgs:
                     "QuestAlgorithm currently contains Python for-loops."
                 )
                 self.disable_cuda_graph = True
+            # Piecewise CUDA Graph captures attention kernels with their
+            # metadata pointers.  The sparse-decode path rewrites FA3
+            # metadata per layer (page_table / cache_seqlens / cu_seqlens_k)
+            # from Python, so replay would read stale or unrelated memory
+            # and hit ``cudaErrorIllegalAddress``.  Disable it here for
+            # safety until the pipeline is fully graph-capture-compatible.
+            if not self.disable_piecewise_cuda_graph:
+                logger.warning(
+                    "--enable-sparse-decode: auto-disabling Piecewise CUDA "
+                    "Graph because the sparse decode path mutates FA3 "
+                    "attention metadata from Python between captured "
+                    "kernels."
+                )
+                self.disable_piecewise_cuda_graph = True
 
         assert (
             self.schedule_conservativeness >= 0

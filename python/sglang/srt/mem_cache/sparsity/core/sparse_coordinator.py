@@ -55,16 +55,23 @@ class RequestTrackers:
         self.last_constructed_page = torch.zeros(
             max_pool_size, dtype=torch.int64, device=device
         )
+        # CPU mirror of ``prompt_lens`` keyed by req_pool_idx.  Used by the
+        # decode hot path to decide sparse-vs-dense without syncing GPU state
+        # (see ``SparseAlgorithmController.compute_all_dense_flag``).  Kept in
+        # sync by :meth:`register` / :meth:`clear`.
+        self.prompt_lens_cpu: dict = {}
 
     def register(self, idx: int, prompt_len: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
         self.last_constructed_page[idx] = 0
+        self.prompt_lens_cpu[int(idx)] = int(prompt_len)
 
     def clear(self, idx: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
         self.last_constructed_page[idx] = 0
+        self.prompt_lens_cpu.pop(int(idx), None)
 
 
 @dataclass
@@ -167,6 +174,27 @@ class SparseAlgorithmController:
         """Per-decode-step pre-forward hook.  Currently a no-op."""
         return
 
+    def compute_all_dense_flag(self, req_pool_indices_cpu) -> bool:
+        """Return True if no request in the batch needs sparse attention.
+
+        Purely CPU-side (reads ``RequestTrackers.prompt_lens_cpu``) so that
+        the decode hot path can short-circuit the sparse pipeline without
+        triggering a GPU sync.  Called once per decode step by
+        :meth:`HiSparseCoordinator.map_last_loc_to_buffer` and cached on the
+        coordinator for every attention layer's
+        :meth:`begin_layer_decode`.
+        """
+        min_len = self.config.min_sparse_prompt_len
+        if min_len is None:
+            # No threshold configured → every request goes through sparse.
+            return False
+        prompt_lens_cpu = self.states.prompt_lens_cpu
+        for req_idx in req_pool_indices_cpu:
+            prompt_len = prompt_lens_cpu.get(int(req_idx), 0)
+            if prompt_len >= min_len:
+                return False
+        return True
+
     def begin_layer_decode(
         self,
         q: torch.Tensor,
@@ -192,6 +220,14 @@ class SparseAlgorithmController:
 
         if layer.layer_id == self.start_layer:
             self.adapter.save_original_metadata(attn_metadata)
+
+        # Fast path: every request in this decode batch stays dense
+        # (e.g. all sequences shorter than ``min_sparse_prompt_len``).
+        # Skip retrieve_topk + swap_in + metadata rewrite entirely; FA3 will
+        # see the unchanged dense metadata.  The flag is populated once per
+        # step by :meth:`HiSparseCoordinator.map_last_loc_to_buffer`.
+        if getattr(self.io, "_all_dense_this_step", False):
+            return attn_metadata
 
         sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
 
@@ -236,6 +272,11 @@ class SparseAlgorithmController:
         :meth:`_k_buffer_for_update` for the resolution.
         """
         if self.io is None:
+            return
+        # Paired with the short-circuit in :meth:`begin_layer_decode`: when
+        # the whole batch stayed dense we also skip representation updates
+        # (nothing selected this step, nothing new to track).
+        if getattr(self.io, "_all_dense_this_step", False):
             return
         layer_id = layer.layer_id
         k_buffer = self._k_buffer_for_update(layer_id)

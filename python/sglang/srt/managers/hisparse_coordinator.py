@@ -187,6 +187,14 @@ class HiSparseCoordinator:
                 )
             self.algorithm_controller.bind_io(self)
 
+        # Per-decode-step "every request stays dense" flag.  Refreshed once
+        # per step in :meth:`map_last_loc_to_buffer` and consumed in
+        # :meth:`SparseAlgorithmController.begin_layer_decode` to skip the
+        # retrieve / swap-in / metadata rewrite path when none of the active
+        # requests is long enough to trigger sparse attention.  Defaults to
+        # False so the first call behaves like the old code path.
+        self._all_dense_this_step: bool = False
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -460,6 +468,21 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
             reserved_buffer_loc
         )
+
+        # Refresh the "every request stays dense" flag once per step.  It is
+        # consumed by :meth:`SparseAlgorithmController.begin_layer_decode` to
+        # skip the sparse pipeline entirely (retrieve_topk / swap_in_kernel /
+        # metadata rewrite) when no request in this batch is long enough to
+        # trigger sparse attention.  Staying on CPU avoids a GPU sync in the
+        # decode hot path.
+        if self.algorithm_controller is not None:
+            self._all_dense_this_step = (
+                self.algorithm_controller.compute_all_dense_flag(
+                    req_pool_indices_cpu.tolist()
+                )
+            )
+        else:
+            self._all_dense_this_step = False
 
     def _eager_backup_previous_token(
         self,
