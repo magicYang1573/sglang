@@ -1,0 +1,10 @@
+run_rdma_2nic_phased_req512.sh
+timestamp=20260423_234412
+MODEL_PATH=/data3/yt/models/DeepSeek-V3.2-AWQ MODEL_CLIENT=deepseek-ai/DeepSeek-V3.2
+TP=8 DP_SIZE=8 PORT=40088
+NUM_REQUESTS_RDMA=512 PH2_REQUESTS_MULT=8
+NUM_REQUESTS_RDMA_P3_2K=256 NUM_REQUESTS_RDMA_P3_4K=256 NUM_REQUESTS_RDMA_P3_8K=128
+IB_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+TOTAL_CASES=44 (p1=4 p2=28 p3=12)
+RESULTS_DIR=./exp-new/rdma_0417
+PYTHON_BIN=/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python

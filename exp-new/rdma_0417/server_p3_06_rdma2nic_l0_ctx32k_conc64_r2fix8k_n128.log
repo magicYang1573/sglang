@@ -1,0 +1,1327 @@
+/data2/ljr/a/sglang/python/sglang/launch_server.py:51: UserWarning: 'python -m sglang.launch_server' is still supported, but 'sglang serve' is the recommended entrypoint.
+  Example: sglang serve --model-path <model> [options]
+  warnings.warn(
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 03:17:10] INFO awq.py:291: The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 03:17:10] WARNING server_args.py:1536: Set dense attention kv len threshold to model index_topk=2048 for DeepSeek with DSA.
+[2026-04-24 03:17:10] INFO server_args.py:1541: Use nsa attention backend for DeepSeek with DSA.
+[2026-04-24 03:17:10] WARNING server_args.py:1587: Setting page size to 64 for DeepSeek DSA.
+[2026-04-24 03:17:10] WARNING server_args.py:1438: Setting KV cache dtype to bfloat16 for DeepSeek DSA on SM9 device.
+[2026-04-24 03:17:10] WARNING server_args.py:1458: HiSparse enabled: using flashmla_sparse NSA backends (prefill=flashmla_sparse, decode=flashmla_sparse).
+[2026-04-24 03:17:10] WARNING server_args.py:2645: DP attention is enabled. The chunked prefill size is adjusted to 1024 to avoid MoE kernel issues. 
+/data2/ljr/a/sglang/python/sglang/srt/entrypoints/http_server.py:172: FastAPIDeprecationWarning: ORJSONResponse is deprecated, FastAPI now serializes data directly to JSON bytes via Pydantic when a return type or response model is set, which is faster and doesn't need a custom response class. Read more in the FastAPI docs: https://fastapi.tiangolo.com/advanced/custom-response/#orjson-or-response-model and https://fastapi.tiangolo.com/tutorial/response-model/
+  from sglang.srt.utils.json_response import (
+[2026-04-24 03:17:11] HiSparse with radix cache enabled (prefix caching mode). Prefix KV will be shared in the host pool via reference counting.
+[2026-04-24 03:17:11] server_args=ServerArgs(model_path='/data3/yt/models/DeepSeek-V3.2-AWQ', tokenizer_path='/data3/yt/models/DeepSeek-V3.2-AWQ', tokenizer_mode='auto', tokenizer_worker_num=1, skip_tokenizer_init=False, load_format='auto', model_loader_extra_config='{}', trust_remote_code=True, context_length=None, is_embedding=False, enable_multimodal=None, revision=None, model_impl='auto', host='127.0.0.1', port=40088, fastapi_root_path='', grpc_mode=False, skip_server_warmup=False, warmups=None, nccl_port=None, checkpoint_engine_wait_weights_before_ready=False, ssl_keyfile=None, ssl_certfile=None, ssl_ca_certs=None, ssl_keyfile_password=None, enable_ssl_refresh=False, dtype='bfloat16', quantization=None, quantization_param_path=None, kv_cache_dtype='bfloat16', enable_fp32_lm_head=False, modelopt_quant=None, modelopt_checkpoint_restore_path=None, modelopt_checkpoint_save_path=None, modelopt_export_path=None, quantize_and_serve=False, rl_quant_profile=None, mem_fraction_static=0.85, max_running_requests=None, max_queued_requests=None, max_total_tokens=200000, chunked_prefill_size=1024, enable_dynamic_chunking=False, max_prefill_tokens=16384, prefill_max_requests=None, schedule_policy='fcfs', enable_priority_scheduling=False, disable_priority_preemption=False, default_priority_value=None, abort_on_priority_when_disabled=False, schedule_low_priority_values_first=False, priority_scheduling_preemption_threshold=10, schedule_conservativeness=0.3, page_size=64, swa_full_tokens_ratio=0.8, disable_hybrid_swa_memory=False, radix_eviction_policy='lru', enable_prefill_delayer=False, prefill_delayer_max_delay_passes=30, prefill_delayer_token_usage_low_watermark=None, prefill_delayer_forward_passes_buckets=None, prefill_delayer_wait_seconds_buckets=None, device='cuda', tp_size=8, pp_size=1, pp_max_micro_batch_size=None, pp_async_batch_depth=0, stream_interval=1, incremental_streaming_output=False, enable_streaming_session=False, random_seed=904927550, constrained_json_whitespace_pattern=None, constrained_json_disable_any_whitespace=False, watchdog_timeout=300, soft_watchdog_timeout=None, dist_timeout=None, download_dir=None, model_checksum=None, base_gpu_id=0, gpu_id_step=1, sleep_on_idle=False, use_ray=False, custom_sigquit_handler=None, log_level='info', log_level_http=None, log_requests=False, log_requests_level=2, log_requests_format='text', log_requests_target=None, uvicorn_access_log_exclude_prefixes=[], crash_dump_folder=None, show_time_cost=False, enable_metrics=False, enable_mfu_metrics=False, enable_metrics_for_all_schedulers=False, tokenizer_metrics_custom_labels_header='x-custom-labels', tokenizer_metrics_allowed_custom_labels=None, extra_metric_labels=None, bucket_time_to_first_token=None, bucket_inter_token_latency=None, bucket_e2e_request_latency=None, collect_tokens_histogram=False, prompt_tokens_buckets=None, generation_tokens_buckets=None, gc_warning_threshold_secs=0.0, decode_log_interval=40, enable_request_time_stats_logging=False, kv_events_config=None, enable_trace=False, otlp_traces_endpoint='localhost:4317', export_metrics_to_file=False, export_metrics_to_file_dir=None, api_key=None, admin_api_key=None, served_model_name='/data3/yt/models/DeepSeek-V3.2-AWQ', weight_version='default', chat_template=None, hf_chat_template_name=None, completion_template=None, file_storage_path='sglang_storage', enable_cache_report=False, reasoning_parser=None, tool_call_parser=None, tool_server=None, sampling_defaults='model', dp_size=8, load_balance_method='round_robin', attn_cp_size=1, moe_dp_size=1, dist_init_addr=None, nnodes=1, node_rank=0, json_model_override_args='{}', preferred_sampling_params=None, enable_lora=None, enable_lora_overlap_loading=None, max_lora_rank=None, lora_target_modules=None, lora_paths=None, max_loaded_loras=None, max_loras_per_batch=8, lora_eviction_policy='lru', lora_backend='csgmv', max_lora_chunk_size=16, experts_shared_outer_loras=None, attention_backend='nsa', decode_attention_backend=None, prefill_attention_backend=None, sampling_backend='flashinfer', grammar_backend='xgrammar', mm_attention_backend=None, fp8_gemm_runner_backend='auto', fp4_gemm_runner_backend='auto', nsa_prefill_backend='flashmla_sparse', nsa_decode_backend='flashmla_sparse', disable_flashinfer_autotune=False, mamba_backend='triton', speculative_algorithm=None, speculative_draft_model_path=None, speculative_draft_model_revision=None, speculative_draft_load_format=None, speculative_num_steps=None, speculative_eagle_topk=None, speculative_num_draft_tokens=None, speculative_accept_threshold_single=1.0, speculative_accept_threshold_acc=1.0, speculative_token_map=None, speculative_attention_mode='prefill', speculative_draft_attention_backend=None, speculative_moe_runner_backend='auto', speculative_moe_a2a_backend=None, speculative_draft_model_quantization=None, speculative_ngram_min_match_window_size=1, speculative_ngram_max_match_window_size=12, speculative_ngram_min_bfs_breadth=1, speculative_ngram_max_bfs_breadth=10, speculative_ngram_match_type='BFS', speculative_ngram_max_trie_depth=18, speculative_ngram_capacity=10000000, enable_multi_layer_eagle=False, ep_size=1, moe_a2a_backend='none', moe_runner_backend='auto', flashinfer_mxfp4_moe_precision='default', enable_flashinfer_allreduce_fusion=False, enforce_disable_flashinfer_allreduce_fusion=False, enable_aiter_allreduce_fusion=False, deepep_mode='auto', ep_num_redundant_experts=0, ep_dispatch_algorithm=None, init_expert_location='trivial', enable_eplb=False, eplb_algorithm='auto', eplb_rebalance_num_iterations=1000, eplb_rebalance_layers_per_chunk=None, eplb_min_rebalancing_utilization_threshold=1.0, expert_distribution_recorder_mode=None, expert_distribution_recorder_buffer_size=1000, enable_expert_distribution_metrics=False, deepep_config=None, moe_dense_tp_size=None, elastic_ep_backend=None, enable_elastic_expert_backup=False, mooncake_ib_device=None, max_mamba_cache_size=None, mamba_ssm_dtype=None, mamba_full_memory_ratio=0.9, mamba_scheduler_strategy='no_buffer', mamba_track_interval=256, linear_attn_backend='triton', linear_attn_decode_backend=None, linear_attn_prefill_backend=None, enable_hierarchical_cache=False, hicache_ratio=2.0, hicache_size=0, hicache_write_policy='write_through', hicache_io_backend='kernel', hicache_mem_layout='layer_first', hicache_storage_backend=None, hicache_storage_prefetch_policy='best_effort', hicache_storage_backend_extra_config=None, enable_hisparse=True, hisparse_config='{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1"]}}', enable_lmcache=False, kt_weight_path=None, kt_method='AMXINT4', kt_cpuinfer=None, kt_threadpool_count=2, kt_num_gpu_experts=None, kt_max_deferred_experts_per_token=None, dllm_algorithm=None, dllm_algorithm_config=None, enable_double_sparsity=False, ds_channel_config_path=None, ds_heavy_channel_num=32, ds_heavy_token_num=256, ds_heavy_channel_type='qk', ds_sparse_decode_threshold=4096, cpu_offload_gb=0, offload_group_size=-1, offload_num_in_group=1, offload_prefetch_step=1, offload_mode='cpu', multi_item_scoring_delimiter=None, disable_radix_cache=False, cuda_graph_max_bs=512, cuda_graph_bs=[1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], disable_cuda_graph=False, disable_cuda_graph_padding=False, enable_profile_cuda_graph=False, enable_cudagraph_gc=False, enable_layerwise_nvtx_marker=False, enable_nccl_nvls=False, enable_symm_mem=False, disable_flashinfer_cutlass_moe_fp4_allgather=False, enable_tokenizer_batch_encode=False, disable_tokenizer_batch_decode=False, disable_outlines_disk_cache=False, disable_custom_all_reduce=False, enable_mscclpp=False, enable_torch_symm_mem=False, pre_warm_nccl=False, disable_overlap_schedule=False, enable_mixed_chunk=False, enable_dp_attention=True, enable_dp_lm_head=False, enable_two_batch_overlap=False, enable_single_batch_overlap=False, tbo_token_distribution_threshold=0.48, enable_torch_compile=False, disable_piecewise_cuda_graph=True, enforce_piecewise_cuda_graph=False, enable_torch_compile_debug_mode=False, torch_compile_max_bs=32, piecewise_cuda_graph_max_tokens=2048, piecewise_cuda_graph_tokens=[4, 8, 12, 16, 20, 24, 28, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 416, 448, 480, 512, 576, 640, 704, 768, 832, 896, 960, 1024, 1280, 1536, 1792, 2048], piecewise_cuda_graph_compiler='eager', torchao_config='', enable_nan_detection=False, enable_p2p_check=False, triton_attention_reduce_in_fp32=False, triton_attention_num_kv_splits=8, triton_attention_split_tile_size=None, num_continuous_decode_steps=1, delete_ckpt_after_loading=False, enable_memory_saver=False, enable_weights_cpu_backup=False, enable_draft_weights_cpu_backup=False, allow_auto_truncate=True, enable_custom_logit_processor=False, flashinfer_mla_disable_ragged=False, disable_shared_experts_fusion=False, disable_chunked_prefix_cache=False, disable_fast_image_processor=False, keep_mm_feature_on_device=False, enable_return_hidden_states=False, enable_return_routed_experts=False, scheduler_recv_interval=1, numa_node=None, enable_deterministic_inference=False, rl_on_policy_target=None, enable_attn_tp_input_scattered=False, gc_threshold=None, enable_nsa_prefill_context_parallel=False, nsa_prefill_cp_mode='round-robin-split', enable_fused_qk_norm_rope=False, enable_precise_embedding_interpolation=False, enable_fused_moe_sum_all_reduce=False, enable_prefill_context_parallel=False, prefill_cp_mode='in-seq-split', enable_dynamic_batch_tokenizer=False, dynamic_batch_tokenizer_batch_size=32, dynamic_batch_tokenizer_batch_timeout=0.002, debug_tensor_dump_output_folder=None, debug_tensor_dump_layers=None, debug_tensor_dump_input_file=None, debug_tensor_dump_inject=False, disaggregation_mode='null', disaggregation_transfer_backend='mooncake', disaggregation_bootstrap_port=8998, disaggregation_ib_device=None, disaggregation_decode_enable_offload_kvcache=False, num_reserved_decode_tokens=512, disaggregation_decode_polling_interval=1, encoder_only=False, language_only=False, encoder_transfer_backend='zmq_to_scheduler', encoder_urls=[], enable_adaptive_dispatch_to_encoder=False, custom_weight_loader=[], weight_loader_disable_mmap=False, remote_instance_weight_loader_seed_instance_ip=None, remote_instance_weight_loader_seed_instance_service_port=None, remote_instance_weight_loader_send_weights_group_ports=None, remote_instance_weight_loader_backend='nccl', remote_instance_weight_loader_start_seed_via_transfer_engine=False, engine_info_bootstrap_port=6789, modelexpress_config=None, enable_pdmux=False, pdmux_config_path=None, sm_group_num=8, enable_broadcast_mm_inputs_process=False, enable_prefix_mm_cache=False, mm_enable_dp_encoder=False, mm_process_config={}, limit_mm_data_per_request=None, enable_mm_global_cache=False, decrypted_config_file=None, decrypted_draft_config_file=None, forward_hooks=None)
+[2026-04-24 03:17:11] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[2026-04-24 03:17:11] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:11] Using default HuggingFace chat template with detected content format: string
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6389937_4025761.sh (script='#!/bin/sh\nexec numactl --cpunodebind=0 --membind=0 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6407638_4023843.sh (script='#!/bin/sh\nexec numactl --cpunodebind=0 --membind=0 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6421282_2437638.sh (script='#!/bin/sh\nexec numactl --cpunodebind=0 --membind=0 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6878781_9763550.sh (script='#!/bin/sh\nexec numactl --cpunodebind=0 --membind=0 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6891887_7213413.sh (script='#!/bin/sh\nexec numactl --cpunodebind=1 --membind=1 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6904309_9501673.sh (script='#!/bin/sh\nexec numactl --cpunodebind=1 --membind=1 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6918871_9576654.sh (script='#!/bin/sh\nexec numactl --cpunodebind=1 --membind=1 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:18] mp.set_executable /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python -> /tmp/sglang_temp_file_1776971838.6932125_3094454.sh (script='#!/bin/sh\nexec numactl --cpunodebind=1 --membind=1 /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python "$@"')
+[2026-04-24 03:17:18] mp.set_executable revert to /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python
+[2026-04-24 03:17:19] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:29 DP7 TP7] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+[2026-04-24 03:17:29 DP7 TP7] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1457, in from_pretrained
+    config_class = CONFIG_MAPPING[config_dict["model_type"]]
+                   ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1160, in __getitem__
+    raise KeyError(key)
+KeyError: 'deepseek_v32'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 514, in get_config
+    config = AutoConfig.from_pretrained(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1459, in from_pretrained
+    raise ValueError(
+ValueError: The checkpoint you are trying to load has model type `deepseek_v32` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+
+You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 362, in __init__
+    self.init_model_config()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 437, in init_model_config
+    self.model_config = ModelConfig.from_server_args(self.server_args)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/configs/model_config.py", line 261, in from_server_args
+    return ModelConfig(
+           ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/configs/model_config.py", line 139, in __init__
+    self.hf_config = get_config(
+                     ^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/common.py", line 3156, in wrapper
+    result = func(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 520, in get_config
+    config = _load_deepseek_v32_model(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 281, in _load_deepseek_v32_model
+    with open(unique_path, "w") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: '/tmp/_tmp_config_folder/deepseek_v32_850943'
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/entrypoints/engine.py", line 1293, in _wait_for_scheduler_ready
+    data = scheduler_pipe_readers[i].recv()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/connection.py", line 250, in recv
+    buf = self._recv_bytes()
+          ^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/connection.py", line 430, in _recv_bytes
+    buf = self._recv(4)
+          ^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/connection.py", line 399, in _recv
+    raise EOFError
+EOFError
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/data2/ljr/a/sglang/python/sglang/launch_server.py", line 62, in <module>
+    run_server(server_args)
+  File "/data2/ljr/a/sglang/python/sglang/launch_server.py", line 47, in run_server
+    launch_server(server_args)
+  File "/data2/ljr/a/sglang/python/sglang/srt/entrypoints/http_server.py", line 2166, in launch_server
+    ) = Engine._launch_subprocesses(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/entrypoints/engine.py", line 745, in _launch_subprocesses
+    scheduler_init_result.wait_for_ready()
+  File "/data2/ljr/a/sglang/python/sglang/srt/entrypoints/engine.py", line 599, in wait_for_ready
+    infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/entrypoints/engine.py", line 1295, in _wait_for_scheduler_ready
+    raise _scheduler_died_error(i, scheduler_procs[i])
+RuntimeError: Rank 0 scheduler died during initialization (exit code: -3). If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. Run `dmesg -T | grep -i oom` to check.
+[2026-04-24 03:17:30 DP5 TP5] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 03:17:30 DP5 TP5] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[2026-04-24 03:17:31 DP6 TP6] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+[2026-04-24 03:17:31 DP4 TP4] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+[2026-04-24 03:17:31 DP6 TP6] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1457, in from_pretrained
+    config_class = CONFIG_MAPPING[config_dict["model_type"]]
+                   ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1160, in __getitem__
+    raise KeyError(key)
+KeyError: 'deepseek_v32'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 514, in get_config
+    config = AutoConfig.from_pretrained(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1459, in from_pretrained
+    raise ValueError(
+ValueError: The checkpoint you are trying to load has model type `deepseek_v32` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+
+You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 362, in __init__
+    self.init_model_config()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 437, in init_model_config
+    self.model_config = ModelConfig.from_server_args(self.server_args)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/configs/model_config.py", line 261, in from_server_args
+    return ModelConfig(
+           ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/configs/model_config.py", line 139, in __init__
+    self.hf_config = get_config(
+                     ^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/common.py", line 3156, in wrapper
+    result = func(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 520, in get_config
+    config = _load_deepseek_v32_model(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 281, in _load_deepseek_v32_model
+    with open(unique_path, "w") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: '/tmp/_tmp_config_folder/deepseek_v32_850942'
+
+Process Process-1:7:
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1457, in from_pretrained
+    config_class = CONFIG_MAPPING[config_dict["model_type"]]
+                   ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1160, in __getitem__
+    raise KeyError(key)
+KeyError: 'deepseek_v32'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 514, in get_config
+    config = AutoConfig.from_pretrained(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1459, in from_pretrained
+    raise ValueError(
+ValueError: The checkpoint you are trying to load has model type `deepseek_v32` but Transformers does not recognize this architecture. This could be because of an issue with the checkpoint, or because your version of Transformers is out of date.
+
+You can update Transformers with the command `pip install --upgrade transformers`. If this does not work, and the checkpoint is very new, then there may not be a release version that supports this model yet. In this case, you can get the most up-to-date code by installing Transformers from source with the command `pip install git+https://github.com/huggingface/transformers.git`
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 362, in __init__
+    self.init_model_config()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 437, in init_model_config
+    self.model_config = ModelConfig.from_server_args(self.server_args)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/configs/model_config.py", line 261, in from_server_args
+    return ModelConfig(
+           ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/configs/model_config.py", line 139, in __init__
+    self.hf_config = get_config(
+                     ^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/common.py", line 3156, in wrapper
+    result = func(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 520, in get_config
+    config = _load_deepseek_v32_model(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/hf_transformers_utils.py", line 281, in _load_deepseek_v32_model
+    with open(unique_path, "w") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 13] Permission denied: '/tmp/_tmp_config_folder/deepseek_v32_850942'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1273, in _send_signal
+    os.kill(pid, sig)
+PermissionError: [Errno 1] Operation not permitted
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3584, in run_scheduler_process
+    parent_process.send_signal(signal.SIGQUIT)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1291, in send_signal
+    self._send_signal(sig)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1282, in _send_signal
+    raise AccessDenied(pid, name) from err
+psutil.AccessDenied: (pid=1)
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 03:17:31 DP4 TP4] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[2026-04-24 03:17:31 DP2 TP2] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+[2026-04-24 03:17:31 DP3 TP3] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+[2026-04-24 03:17:31 DP0 TP0] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 03:17:31 DP2 TP2] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 03:17:31 DP3 TP3] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 03:17:31 DP0 TP0] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[2026-04-24 03:17:31 DP1 TP1] NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration.
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 03:17:31 DP1 TP1] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+You are using a model of type `deepseek_v32` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+[2026-04-24 03:17:31 DP5 TP5] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:31 DP5 TP5] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 03:17:31 DP5 TP5] Init torch distributed begin.
+[2026-04-24 03:17:31 DP4 TP4] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:31 DP4 TP4] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 03:17:31 DP4 TP4] Init torch distributed begin.
+[2026-04-24 03:17:32 DP2 TP2] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:32 DP3 TP3] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:32 DP2 TP2] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 03:17:32 DP0 TP0] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:32 DP3 TP3] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 03:17:32 DP2 TP2] Init torch distributed begin.
+[2026-04-24 03:17:32 DP3 TP3] Init torch distributed begin.
+[2026-04-24 03:17:32 DP0 TP0] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 03:17:32 DP0 TP0] Init torch distributed begin.
+[2026-04-24 03:17:32 DP1 TP1] Fixing v5 tokenizer component mismatch for /data3/yt/models/DeepSeek-V3.2-AWQ: pre_tokenizer Metaspace -> Sequence, decoder Sequence -> ByteLevel
+[2026-04-24 03:17:32 DP1 TP1] The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 03:17:32 DP1 TP1] Init torch distributed begin.
+[2026-04-24 03:27:34 DP0 TP0] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1716, in init_distributed_environment
+    torch.distributed.init_process_group(
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 81, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1762, in init_process_group
+    store, rank, world_size = next(rendezvous_iterator)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/rendezvous.py", line 230, in _tcp_rendezvous_handler
+    store = _create_c10d_store(
+            ^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/rendezvous.py", line 198, in _create_c10d_store
+    return TCPStore(
+           ^^^^^^^^^
+torch.distributed.DistStoreError: Timed out after 601 seconds waiting for clients. 6/8 clients joined.
+
+Process Process-1:1:
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1716, in init_distributed_environment
+    torch.distributed.init_process_group(
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 81, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1762, in init_process_group
+    store, rank, world_size = next(rendezvous_iterator)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/rendezvous.py", line 230, in _tcp_rendezvous_handler
+    store = _create_c10d_store(
+            ^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/rendezvous.py", line 198, in _create_c10d_store
+    return TCPStore(
+           ^^^^^^^^^
+torch.distributed.DistStoreError: Timed out after 601 seconds waiting for clients. 6/8 clients joined.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1273, in _send_signal
+    os.kill(pid, sig)
+PermissionError: [Errno 1] Operation not permitted
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3584, in run_scheduler_process
+    parent_process.send_signal(signal.SIGQUIT)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1291, in send_signal
+    self._send_signal(sig)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1282, in _send_signal
+    raise AccessDenied(pid, name) from err
+psutil.AccessDenied: (pid=1)
+[rank5]:[W424 03:27:34.240365328 TCPStore.cpp:138] [c10d] recvValueWithTimeout failed on SocketImpl(fd=108, addr=[localhost]:37058, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7f3aae57cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7f3a913fc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffdc0d (0x7f3a913fdc0d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe2c9 (0x7f3a913fe2c9 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::doWait(c10::ArrayRef<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::chrono::duration<long, std::ratio<1l, 1000l> >) + 0x1c6 (0x7f3a913f9576 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::TCPStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x206 (0x7f3a913f9846 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #6: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f3a913a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #7: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f3a913a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #8: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f3a913a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #9: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f3a913a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #10: gloo::rendezvous::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x109 (0x7f3a93912179 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #11: gloo::transport::tcp::Context::createAndConnectAllPairs(std::shared_ptr<gloo::IStore>) + 0xa18 (0x7f3a9392f678 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #12: gloo::rendezvous::Context::connectFullMesh(std::shared_ptr<gloo::rendezvous::Store>, std::shared_ptr<gloo::transport::Device>&) + 0x5c (0x7f3a9390ef3c in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #13: c10d::ProcessGroupGloo::ProcessGroupGloo(c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store> > const&, int, int, c10::intrusive_ptr<c10d::ProcessGroupGloo::Options, c10::detail::intrusive_target_default_null_type<c10d::ProcessGroupGloo::Options> >) + 0x430 (0x7f3a913d1a80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #14: <unknown function> + 0xd7784a (0x7f3aa0b7784a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #15: <unknown function> + 0xdaba6d (0x7f3aa0baba6d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #16: <unknown function> + 0x3cc7ad (0x7f3aa01cc7ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #17: <unknown function> + 0x1fd066 (0x55ce9c9e7066 in sglang::scheduler_DP5_TP5)
+frame #18: _PyObject_MakeTpCall + 0x24b (0x55ce9c9c322b in sglang::scheduler_DP5_TP5)
+frame #19: <unknown function> + 0x22ce7e (0x55ce9ca16e7e in sglang::scheduler_DP5_TP5)
+frame #20: _PyObject_Call + 0x12b (0x55ce9ca01b0b in sglang::scheduler_DP5_TP5)
+frame #21: <unknown function> + 0x21533f (0x55ce9c9ff33f in sglang::scheduler_DP5_TP5)
+frame #22: <unknown function> + 0x1d9543 (0x55ce9c9c3543 in sglang::scheduler_DP5_TP5)
+frame #23: <unknown function> + 0x3cae9b (0x7f3aa01cae9b in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #24: _PyObject_MakeTpCall + 0x24b (0x55ce9c9c322b in sglang::scheduler_DP5_TP5)
+frame #25: _PyEval_EvalFrameDefault + 0x60d (0x55ce9c9d156d in sglang::scheduler_DP5_TP5)
+frame #26: _PyFunction_Vectorcall + 0x165 (0x55ce9c9f7465 in sglang::scheduler_DP5_TP5)
+frame #27: PyObject_Call + 0x136 (0x55ce9ca018a6 in sglang::scheduler_DP5_TP5)
+frame #28: _PyEval_EvalFrameDefault + 0x478f (0x55ce9c9d56ef in sglang::scheduler_DP5_TP5)
+frame #29: _PyFunction_Vectorcall + 0x165 (0x55ce9c9f7465 in sglang::scheduler_DP5_TP5)
+frame #30: <unknown function> + 0x215013 (0x55ce9c9ff013 in sglang::scheduler_DP5_TP5)
+frame #31: _PyObject_MakeTpCall + 0x223 (0x55ce9c9c3203 in sglang::scheduler_DP5_TP5)
+frame #32: _PyEval_EvalFrameDefault + 0x60d (0x55ce9c9d156d in sglang::scheduler_DP5_TP5)
+frame #33: _PyFunction_Vectorcall + 0x165 (0x55ce9c9f7465 in sglang::scheduler_DP5_TP5)
+frame #34: <unknown function> + 0x215013 (0x55ce9c9ff013 in sglang::scheduler_DP5_TP5)
+frame #35: <unknown function> + 0x1d9543 (0x55ce9c9c3543 in sglang::scheduler_DP5_TP5)
+frame #36: PyObject_Call + 0xbe (0x55ce9ca0182e in sglang::scheduler_DP5_TP5)
+frame #37: _PyEval_EvalFrameDefault + 0x478f (0x55ce9c9d56ef in sglang::scheduler_DP5_TP5)
+frame #38: _PyFunction_Vectorcall + 0x165 (0x55ce9c9f7465 in sglang::scheduler_DP5_TP5)
+frame #39: <unknown function> + 0x215013 (0x55ce9c9ff013 in sglang::scheduler_DP5_TP5)
+frame #40: <unknown function> + 0x1d9543 (0x55ce9c9c3543 in sglang::scheduler_DP5_TP5)
+frame #41: PyObject_Call + 0xbe (0x55ce9ca0182e in sglang::scheduler_DP5_TP5)
+frame #42: _PyEval_EvalFrameDefault + 0x478f (0x55ce9c9d56ef in sglang::scheduler_DP5_TP5)
+frame #43: _PyFunction_Vectorcall + 0x165 (0x55ce9c9f7465 in sglang::scheduler_DP5_TP5)
+frame #44: <unknown function> + 0x214f3c (0x55ce9c9fef3c in sglang::scheduler_DP5_TP5)
+frame #45: _PyObject_MakeTpCall + 0x223 (0x55ce9c9c3203 in sglang::scheduler_DP5_TP5)
+frame #46: _PyEval_EvalFrameDefault + 0x60d (0x55ce9c9d156d in sglang::scheduler_DP5_TP5)
+frame #47: _PyFunction_Vectorcall + 0x165 (0x55ce9c9f7465 in sglang::scheduler_DP5_TP5)
+frame #48: _PyEval_EvalFrameDefault + 0x478f (0x55ce9c9d56ef in sglang::scheduler_DP5_TP5)
+frame #49: <unknown function> + 0x2a3935 (0x55ce9ca8d935 in sglang::scheduler_DP5_TP5)
+frame #50: PyEval_EvalCode + 0x9d (0x55ce9ca8d07d in sglang::scheduler_DP5_TP5)
+frame #51: <unknown function> + 0x2c098a (0x55ce9caaa98a in sglang::scheduler_DP5_TP5)
+frame #52: <unknown function> + 0x2bc6a3 (0x55ce9caa66a3 in sglang::scheduler_DP5_TP5)
+frame #53: PyRun_StringFlags + 0x62 (0x55ce9ca9bf92 in sglang::scheduler_DP5_TP5)
+frame #54: PyRun_SimpleStringFlags + 0x3c (0x55ce9ca9bd4c in sglang::scheduler_DP5_TP5)
+frame #55: Py_RunMain + 0x30f (0x55ce9cab5a1f in sglang::scheduler_DP5_TP5)
+frame #56: Py_BytesMain + 0x37 (0x55ce9ca7cea7 in sglang::scheduler_DP5_TP5)
+frame #57: <unknown function> + 0x29d90 (0x7f3c31829d90 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #58: __libc_start_main + 0x80 (0x7f3c31829e40 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #59: _start + 0x2e (0x55ce9ca7cd2e in sglang::scheduler_DP5_TP5)
+
+[rank2]:[W424 03:27:34.240332513 TCPStore.cpp:138] [c10d] recvValueWithTimeout failed on SocketImpl(fd=108, addr=[localhost]:37054, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7f26cc17cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7f26b5bfc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffdc0d (0x7f26b5bfdc0d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe2c9 (0x7f26b5bfe2c9 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::doWait(c10::ArrayRef<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::chrono::duration<long, std::ratio<1l, 1000l> >) + 0x1c6 (0x7f26b5bf9576 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::TCPStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x206 (0x7f26b5bf9846 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #6: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f26b5ba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #7: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f26b5ba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #8: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f26b5ba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #9: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7f26b5ba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #10: gloo::rendezvous::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x109 (0x7f26b8112179 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #11: gloo::transport::tcp::Context::createAndConnectAllPairs(std::shared_ptr<gloo::IStore>) + 0xa18 (0x7f26b812f678 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #12: gloo::rendezvous::Context::connectFullMesh(std::shared_ptr<gloo::rendezvous::Store>, std::shared_ptr<gloo::transport::Device>&) + 0x5c (0x7f26b810ef3c in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #13: c10d::ProcessGroupGloo::ProcessGroupGloo(c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store> > const&, int, int, c10::intrusive_ptr<c10d::ProcessGroupGloo::Options, c10::detail::intrusive_target_default_null_type<c10d::ProcessGroupGloo::Options> >) + 0x430 (0x7f26b5bd1a80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #14: <unknown function> + 0xd7784a (0x7f26c537784a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #15: <unknown function> + 0xdaba6d (0x7f26c53aba6d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #16: <unknown function> + 0x3cc7ad (0x7f26c49cc7ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #17: <unknown function> + 0x1fd066 (0x56335db8b066 in sglang::scheduler_DP2_TP2)
+frame #18: _PyObject_MakeTpCall + 0x24b (0x56335db6722b in sglang::scheduler_DP2_TP2)
+frame #19: <unknown function> + 0x22ce7e (0x56335dbbae7e in sglang::scheduler_DP2_TP2)
+frame #20: _PyObject_Call + 0x12b (0x56335dba5b0b in sglang::scheduler_DP2_TP2)
+frame #21: <unknown function> + 0x21533f (0x56335dba333f in sglang::scheduler_DP2_TP2)
+frame #22: <unknown function> + 0x1d9543 (0x56335db67543 in sglang::scheduler_DP2_TP2)
+frame #23: <unknown function> + 0x3cae9b (0x7f26c49cae9b in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #24: _PyObject_MakeTpCall + 0x24b (0x56335db6722b in sglang::scheduler_DP2_TP2)
+frame #25: _PyEval_EvalFrameDefault + 0x60d (0x56335db7556d in sglang::scheduler_DP2_TP2)
+frame #26: _PyFunction_Vectorcall + 0x165 (0x56335db9b465 in sglang::scheduler_DP2_TP2)
+frame #27: PyObject_Call + 0x136 (0x56335dba58a6 in sglang::scheduler_DP2_TP2)
+frame #28: _PyEval_EvalFrameDefault + 0x478f (0x56335db796ef in sglang::scheduler_DP2_TP2)
+frame #29: _PyFunction_Vectorcall + 0x165 (0x56335db9b465 in sglang::scheduler_DP2_TP2)
+frame #30: <unknown function> + 0x215013 (0x56335dba3013 in sglang::scheduler_DP2_TP2)
+frame #31: _PyObject_MakeTpCall + 0x223 (0x56335db67203 in sglang::scheduler_DP2_TP2)
+frame #32: _PyEval_EvalFrameDefault + 0x60d (0x56335db7556d in sglang::scheduler_DP2_TP2)
+frame #33: _PyFunction_Vectorcall + 0x165 (0x56335db9b465 in sglang::scheduler_DP2_TP2)
+frame #34: <unknown function> + 0x215013 (0x56335dba3013 in sglang::scheduler_DP2_TP2)
+frame #35: <unknown function> + 0x1d9543 (0x56335db67543 in sglang::scheduler_DP2_TP2)
+frame #36: PyObject_Call + 0xbe (0x56335dba582e in sglang::scheduler_DP2_TP2)
+frame #37: _PyEval_EvalFrameDefault + 0x478f (0x56335db796ef in sglang::scheduler_DP2_TP2)
+frame #38: _PyFunction_Vectorcall + 0x165 (0x56335db9b465 in sglang::scheduler_DP2_TP2)
+frame #39: <unknown function> + 0x215013 (0x56335dba3013 in sglang::scheduler_DP2_TP2)
+frame #40: <unknown function> + 0x1d9543 (0x56335db67543 in sglang::scheduler_DP2_TP2)
+frame #41: PyObject_Call + 0xbe (0x56335dba582e in sglang::scheduler_DP2_TP2)
+frame #42: _PyEval_EvalFrameDefault + 0x478f (0x56335db796ef in sglang::scheduler_DP2_TP2)
+frame #43: _PyFunction_Vectorcall + 0x165 (0x56335db9b465 in sglang::scheduler_DP2_TP2)
+frame #44: <unknown function> + 0x214f3c (0x56335dba2f3c in sglang::scheduler_DP2_TP2)
+frame #45: _PyObject_MakeTpCall + 0x223 (0x56335db67203 in sglang::scheduler_DP2_TP2)
+frame #46: _PyEval_EvalFrameDefault + 0x60d (0x56335db7556d in sglang::scheduler_DP2_TP2)
+frame #47: _PyFunction_Vectorcall + 0x165 (0x56335db9b465 in sglang::scheduler_DP2_TP2)
+frame #48: _PyEval_EvalFrameDefault + 0x478f (0x56335db796ef in sglang::scheduler_DP2_TP2)
+frame #49: <unknown function> + 0x2a3935 (0x56335dc31935 in sglang::scheduler_DP2_TP2)
+frame #50: PyEval_EvalCode + 0x9d (0x56335dc3107d in sglang::scheduler_DP2_TP2)
+frame #51: <unknown function> + 0x2c098a (0x56335dc4e98a in sglang::scheduler_DP2_TP2)
+frame #52: <unknown function> + 0x2bc6a3 (0x56335dc4a6a3 in sglang::scheduler_DP2_TP2)
+frame #53: PyRun_StringFlags + 0x62 (0x56335dc3ff92 in sglang::scheduler_DP2_TP2)
+frame #54: PyRun_SimpleStringFlags + 0x3c (0x56335dc3fd4c in sglang::scheduler_DP2_TP2)
+frame #55: Py_RunMain + 0x30f (0x56335dc59a1f in sglang::scheduler_DP2_TP2)
+frame #56: Py_BytesMain + 0x37 (0x56335dc20ea7 in sglang::scheduler_DP2_TP2)
+frame #57: <unknown function> + 0x29d90 (0x7f2855e29d90 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #58: __libc_start_main + 0x80 (0x7f2855e29e40 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #59: _start + 0x2e (0x56335dc20d2e in sglang::scheduler_DP2_TP2)
+
+[rank4]:[W424 03:27:34.240366211 TCPStore.cpp:138] [c10d] recvValueWithTimeout failed on SocketImpl(fd=107, addr=[localhost]:37042, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7febbcd7cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7feb9fbfc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffdc0d (0x7feb9fbfdc0d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe2c9 (0x7feb9fbfe2c9 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::doWait(c10::ArrayRef<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::chrono::duration<long, std::ratio<1l, 1000l> >) + 0x1c6 (0x7feb9fbf9576 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::TCPStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x206 (0x7feb9fbf9846 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #6: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7feb9fba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #7: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7feb9fba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #8: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7feb9fba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #9: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7feb9fba753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #10: gloo::rendezvous::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x109 (0x7feba2112179 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #11: gloo::transport::tcp::Context::createAndConnectAllPairs(std::shared_ptr<gloo::IStore>) + 0xa18 (0x7feba212f678 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #12: gloo::rendezvous::Context::connectFullMesh(std::shared_ptr<gloo::rendezvous::Store>, std::shared_ptr<gloo::transport::Device>&) + 0x5c (0x7feba210ef3c in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #13: c10d::ProcessGroupGloo::ProcessGroupGloo(c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store> > const&, int, int, c10::intrusive_ptr<c10d::ProcessGroupGloo::Options, c10::detail::intrusive_target_default_null_type<c10d::ProcessGroupGloo::Options> >) + 0x430 (0x7feb9fbd1a80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #14: <unknown function> + 0xd7784a (0x7febaf37784a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #15: <unknown function> + 0xdaba6d (0x7febaf3aba6d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #16: <unknown function> + 0x3cc7ad (0x7febae9cc7ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #17: <unknown function> + 0x1fd066 (0x55f1ed988066 in sglang::scheduler_DP4_TP4)
+frame #18: _PyObject_MakeTpCall + 0x24b (0x55f1ed96422b in sglang::scheduler_DP4_TP4)
+frame #19: <unknown function> + 0x22ce7e (0x55f1ed9b7e7e in sglang::scheduler_DP4_TP4)
+frame #20: _PyObject_Call + 0x12b (0x55f1ed9a2b0b in sglang::scheduler_DP4_TP4)
+frame #21: <unknown function> + 0x21533f (0x55f1ed9a033f in sglang::scheduler_DP4_TP4)
+frame #22: <unknown function> + 0x1d9543 (0x55f1ed964543 in sglang::scheduler_DP4_TP4)
+frame #23: <unknown function> + 0x3cae9b (0x7febae9cae9b in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #24: _PyObject_MakeTpCall + 0x24b (0x55f1ed96422b in sglang::scheduler_DP4_TP4)
+frame #25: _PyEval_EvalFrameDefault + 0x60d (0x55f1ed97256d in sglang::scheduler_DP4_TP4)
+frame #26: _PyFunction_Vectorcall + 0x165 (0x55f1ed998465 in sglang::scheduler_DP4_TP4)
+frame #27: PyObject_Call + 0x136 (0x55f1ed9a28a6 in sglang::scheduler_DP4_TP4)
+frame #28: _PyEval_EvalFrameDefault + 0x478f (0x55f1ed9766ef in sglang::scheduler_DP4_TP4)
+frame #29: _PyFunction_Vectorcall + 0x165 (0x55f1ed998465 in sglang::scheduler_DP4_TP4)
+frame #30: <unknown function> + 0x215013 (0x55f1ed9a0013 in sglang::scheduler_DP4_TP4)
+frame #31: _PyObject_MakeTpCall + 0x223 (0x55f1ed964203 in sglang::scheduler_DP4_TP4)
+frame #32: _PyEval_EvalFrameDefault + 0x60d (0x55f1ed97256d in sglang::scheduler_DP4_TP4)
+frame #33: _PyFunction_Vectorcall + 0x165 (0x55f1ed998465 in sglang::scheduler_DP4_TP4)
+frame #34: <unknown function> + 0x215013 (0x55f1ed9a0013 in sglang::scheduler_DP4_TP4)
+frame #35: <unknown function> + 0x1d9543 (0x55f1ed964543 in sglang::scheduler_DP4_TP4)
+frame #36: PyObject_Call + 0xbe (0x55f1ed9a282e in sglang::scheduler_DP4_TP4)
+frame #37: _PyEval_EvalFrameDefault + 0x478f (0x55f1ed9766ef in sglang::scheduler_DP4_TP4)
+frame #38: _PyFunction_Vectorcall + 0x165 (0x55f1ed998465 in sglang::scheduler_DP4_TP4)
+frame #39: <unknown function> + 0x215013 (0x55f1ed9a0013 in sglang::scheduler_DP4_TP4)
+frame #40: <unknown function> + 0x1d9543 (0x55f1ed964543 in sglang::scheduler_DP4_TP4)
+frame #41: PyObject_Call + 0xbe (0x55f1ed9a282e in sglang::scheduler_DP4_TP4)
+frame #42: _PyEval_EvalFrameDefault + 0x478f (0x55f1ed9766ef in sglang::scheduler_DP4_TP4)
+frame #43: _PyFunction_Vectorcall + 0x165 (0x55f1ed998465 in sglang::scheduler_DP4_TP4)
+frame #44: <unknown function> + 0x214f3c (0x55f1ed99ff3c in sglang::scheduler_DP4_TP4)
+frame #45: _PyObject_MakeTpCall + 0x223 (0x55f1ed964203 in sglang::scheduler_DP4_TP4)
+frame #46: _PyEval_EvalFrameDefault + 0x60d (0x55f1ed97256d in sglang::scheduler_DP4_TP4)
+frame #47: _PyFunction_Vectorcall + 0x165 (0x55f1ed998465 in sglang::scheduler_DP4_TP4)
+frame #48: _PyEval_EvalFrameDefault + 0x478f (0x55f1ed9766ef in sglang::scheduler_DP4_TP4)
+frame #49: <unknown function> + 0x2a3935 (0x55f1eda2e935 in sglang::scheduler_DP4_TP4)
+frame #50: PyEval_EvalCode + 0x9d (0x55f1eda2e07d in sglang::scheduler_DP4_TP4)
+frame #51: <unknown function> + 0x2c098a (0x55f1eda4b98a in sglang::scheduler_DP4_TP4)
+frame #52: <unknown function> + 0x2bc6a3 (0x55f1eda476a3 in sglang::scheduler_DP4_TP4)
+frame #53: PyRun_StringFlags + 0x62 (0x55f1eda3cf92 in sglang::scheduler_DP4_TP4)
+frame #54: PyRun_SimpleStringFlags + 0x3c (0x55f1eda3cd4c in sglang::scheduler_DP4_TP4)
+frame #55: Py_RunMain + 0x30f (0x55f1eda56a1f in sglang::scheduler_DP4_TP4)
+frame #56: Py_BytesMain + 0x37 (0x55f1eda1dea7 in sglang::scheduler_DP4_TP4)
+frame #57: <unknown function> + 0x29d90 (0x7fed40029d90 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #58: __libc_start_main + 0x80 (0x7fed40029e40 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #59: _start + 0x2e (0x55f1eda1dd2e in sglang::scheduler_DP4_TP4)
+
+[rank3]:[W424 03:27:34.240348816 TCPStore.cpp:138] [c10d] recvValueWithTimeout failed on SocketImpl(fd=108, addr=[localhost]:37064, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7fa5b657cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7fa5993fc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffdc0d (0x7fa5993fdc0d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe2c9 (0x7fa5993fe2c9 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::doWait(c10::ArrayRef<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::chrono::duration<long, std::ratio<1l, 1000l> >) + 0x1c6 (0x7fa5993f9576 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::TCPStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x206 (0x7fa5993f9846 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #6: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fa5993a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #7: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fa5993a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #8: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fa5993a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #9: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fa5993a753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #10: gloo::rendezvous::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x109 (0x7fa59b912179 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #11: gloo::transport::tcp::Context::createAndConnectAllPairs(std::shared_ptr<gloo::IStore>) + 0xa18 (0x7fa59b92f678 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #12: gloo::rendezvous::Context::connectFullMesh(std::shared_ptr<gloo::rendezvous::Store>, std::shared_ptr<gloo::transport::Device>&) + 0x5c (0x7fa59b90ef3c in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #13: c10d::ProcessGroupGloo::ProcessGroupGloo(c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store> > const&, int, int, c10::intrusive_ptr<c10d::ProcessGroupGloo::Options, c10::detail::intrusive_target_default_null_type<c10d::ProcessGroupGloo::Options> >) + 0x430 (0x7fa5993d1a80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #14: <unknown function> + 0xd7784a (0x7fa5a8b7784a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #15: <unknown function> + 0xdaba6d (0x7fa5a8baba6d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #16: <unknown function> + 0x3cc7ad (0x7fa5a81cc7ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #17: <unknown function> + 0x1fd066 (0x558ec328f066 in sglang::scheduler_DP3_TP3)
+frame #18: _PyObject_MakeTpCall + 0x24b (0x558ec326b22b in sglang::scheduler_DP3_TP3)
+frame #19: <unknown function> + 0x22ce7e (0x558ec32bee7e in sglang::scheduler_DP3_TP3)
+frame #20: _PyObject_Call + 0x12b (0x558ec32a9b0b in sglang::scheduler_DP3_TP3)
+frame #21: <unknown function> + 0x21533f (0x558ec32a733f in sglang::scheduler_DP3_TP3)
+frame #22: <unknown function> + 0x1d9543 (0x558ec326b543 in sglang::scheduler_DP3_TP3)
+frame #23: <unknown function> + 0x3cae9b (0x7fa5a81cae9b in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #24: _PyObject_MakeTpCall + 0x24b (0x558ec326b22b in sglang::scheduler_DP3_TP3)
+frame #25: _PyEval_EvalFrameDefault + 0x60d (0x558ec327956d in sglang::scheduler_DP3_TP3)
+frame #26: _PyFunction_Vectorcall + 0x165 (0x558ec329f465 in sglang::scheduler_DP3_TP3)
+frame #27: PyObject_Call + 0x136 (0x558ec32a98a6 in sglang::scheduler_DP3_TP3)
+frame #28: _PyEval_EvalFrameDefault + 0x478f (0x558ec327d6ef in sglang::scheduler_DP3_TP3)
+frame #29: _PyFunction_Vectorcall + 0x165 (0x558ec329f465 in sglang::scheduler_DP3_TP3)
+frame #30: <unknown function> + 0x215013 (0x558ec32a7013 in sglang::scheduler_DP3_TP3)
+frame #31: _PyObject_MakeTpCall + 0x223 (0x558ec326b203 in sglang::scheduler_DP3_TP3)
+frame #32: _PyEval_EvalFrameDefault + 0x60d (0x558ec327956d in sglang::scheduler_DP3_TP3)
+frame #33: _PyFunction_Vectorcall + 0x165 (0x558ec329f465 in sglang::scheduler_DP3_TP3)
+frame #34: <unknown function> + 0x215013 (0x558ec32a7013 in sglang::scheduler_DP3_TP3)
+frame #35: <unknown function> + 0x1d9543 (0x558ec326b543 in sglang::scheduler_DP3_TP3)
+frame #36: PyObject_Call + 0xbe (0x558ec32a982e in sglang::scheduler_DP3_TP3)
+frame #37: _PyEval_EvalFrameDefault + 0x478f (0x558ec327d6ef in sglang::scheduler_DP3_TP3)
+frame #38: _PyFunction_Vectorcall + 0x165 (0x558ec329f465 in sglang::scheduler_DP3_TP3)
+frame #39: <unknown function> + 0x215013 (0x558ec32a7013 in sglang::scheduler_DP3_TP3)
+frame #40: <unknown function> + 0x1d9543 (0x558ec326b543 in sglang::scheduler_DP3_TP3)
+frame #41: PyObject_Call + 0xbe (0x558ec32a982e in sglang::scheduler_DP3_TP3)
+frame #42: _PyEval_EvalFrameDefault + 0x478f (0x558ec327d6ef in sglang::scheduler_DP3_TP3)
+frame #43: _PyFunction_Vectorcall + 0x165 (0x558ec329f465 in sglang::scheduler_DP3_TP3)
+frame #44: <unknown function> + 0x214f3c (0x558ec32a6f3c in sglang::scheduler_DP3_TP3)
+frame #45: _PyObject_MakeTpCall + 0x223 (0x558ec326b203 in sglang::scheduler_DP3_TP3)
+frame #46: _PyEval_EvalFrameDefault + 0x60d (0x558ec327956d in sglang::scheduler_DP3_TP3)
+frame #47: _PyFunction_Vectorcall + 0x165 (0x558ec329f465 in sglang::scheduler_DP3_TP3)
+frame #48: _PyEval_EvalFrameDefault + 0x478f (0x558ec327d6ef in sglang::scheduler_DP3_TP3)
+frame #49: <unknown function> + 0x2a3935 (0x558ec3335935 in sglang::scheduler_DP3_TP3)
+frame #50: PyEval_EvalCode + 0x9d (0x558ec333507d in sglang::scheduler_DP3_TP3)
+frame #51: <unknown function> + 0x2c098a (0x558ec335298a in sglang::scheduler_DP3_TP3)
+frame #52: <unknown function> + 0x2bc6a3 (0x558ec334e6a3 in sglang::scheduler_DP3_TP3)
+frame #53: PyRun_StringFlags + 0x62 (0x558ec3343f92 in sglang::scheduler_DP3_TP3)
+frame #54: PyRun_SimpleStringFlags + 0x3c (0x558ec3343d4c in sglang::scheduler_DP3_TP3)
+frame #55: Py_RunMain + 0x30f (0x558ec335da1f in sglang::scheduler_DP3_TP3)
+frame #56: Py_BytesMain + 0x37 (0x558ec3324ea7 in sglang::scheduler_DP3_TP3)
+frame #57: <unknown function> + 0x29d90 (0x7fa739829d90 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #58: __libc_start_main + 0x80 (0x7fa739829e40 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #59: _start + 0x2e (0x558ec3324d2e in sglang::scheduler_DP3_TP3)
+
+[rank1]:[W424 03:27:34.240411658 TCPStore.cpp:138] [c10d] recvValueWithTimeout failed on SocketImpl(fd=108, addr=[localhost]:42872, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7fd9ef57cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7fd9d8ffc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffdc0d (0x7fd9d8ffdc0d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe2c9 (0x7fd9d8ffe2c9 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::doWait(c10::ArrayRef<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > >, std::chrono::duration<long, std::ratio<1l, 1000l> >) + 0x1c6 (0x7fd9d8ff9576 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::TCPStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x206 (0x7fd9d8ff9846 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #6: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fd9d8fa753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #7: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fd9d8fa753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #8: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fd9d8fa753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #9: c10d::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x2f (0x7fd9d8fa753f in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #10: gloo::rendezvous::PrefixStore::wait(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&, std::chrono::duration<long, std::ratio<1l, 1000l> > const&) + 0x109 (0x7fd9db512179 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #11: gloo::transport::tcp::Context::createAndConnectAllPairs(std::shared_ptr<gloo::IStore>) + 0xa18 (0x7fd9db52f678 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #12: gloo::rendezvous::Context::connectFullMesh(std::shared_ptr<gloo::rendezvous::Store>, std::shared_ptr<gloo::transport::Device>&) + 0x5c (0x7fd9db50ef3c in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #13: c10d::ProcessGroupGloo::ProcessGroupGloo(c10::intrusive_ptr<c10d::Store, c10::detail::intrusive_target_default_null_type<c10d::Store> > const&, int, int, c10::intrusive_ptr<c10d::ProcessGroupGloo::Options, c10::detail::intrusive_target_default_null_type<c10d::ProcessGroupGloo::Options> >) + 0x430 (0x7fd9d8fd1a80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #14: <unknown function> + 0xd7784a (0x7fd9e877784a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #15: <unknown function> + 0xdaba6d (0x7fd9e87aba6d in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #16: <unknown function> + 0x3cc7ad (0x7fd9e7dcc7ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #17: <unknown function> + 0x1fd066 (0x5616cbd57066 in sglang::scheduler_DP1_TP1)
+frame #18: _PyObject_MakeTpCall + 0x24b (0x5616cbd3322b in sglang::scheduler_DP1_TP1)
+frame #19: <unknown function> + 0x22ce7e (0x5616cbd86e7e in sglang::scheduler_DP1_TP1)
+frame #20: _PyObject_Call + 0x12b (0x5616cbd71b0b in sglang::scheduler_DP1_TP1)
+frame #21: <unknown function> + 0x21533f (0x5616cbd6f33f in sglang::scheduler_DP1_TP1)
+frame #22: <unknown function> + 0x1d9543 (0x5616cbd33543 in sglang::scheduler_DP1_TP1)
+frame #23: <unknown function> + 0x3cae9b (0x7fd9e7dcae9b in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_python.so)
+frame #24: _PyObject_MakeTpCall + 0x24b (0x5616cbd3322b in sglang::scheduler_DP1_TP1)
+frame #25: _PyEval_EvalFrameDefault + 0x60d (0x5616cbd4156d in sglang::scheduler_DP1_TP1)
+frame #26: _PyFunction_Vectorcall + 0x165 (0x5616cbd67465 in sglang::scheduler_DP1_TP1)
+frame #27: PyObject_Call + 0x136 (0x5616cbd718a6 in sglang::scheduler_DP1_TP1)
+frame #28: _PyEval_EvalFrameDefault + 0x478f (0x5616cbd456ef in sglang::scheduler_DP1_TP1)
+frame #29: _PyFunction_Vectorcall + 0x165 (0x5616cbd67465 in sglang::scheduler_DP1_TP1)
+frame #30: <unknown function> + 0x215013 (0x5616cbd6f013 in sglang::scheduler_DP1_TP1)
+frame #31: _PyObject_MakeTpCall + 0x223 (0x5616cbd33203 in sglang::scheduler_DP1_TP1)
+frame #32: _PyEval_EvalFrameDefault + 0x60d (0x5616cbd4156d in sglang::scheduler_DP1_TP1)
+frame #33: _PyFunction_Vectorcall + 0x165 (0x5616cbd67465 in sglang::scheduler_DP1_TP1)
+frame #34: <unknown function> + 0x215013 (0x5616cbd6f013 in sglang::scheduler_DP1_TP1)
+frame #35: <unknown function> + 0x1d9543 (0x5616cbd33543 in sglang::scheduler_DP1_TP1)
+frame #36: PyObject_Call + 0xbe (0x5616cbd7182e in sglang::scheduler_DP1_TP1)
+frame #37: _PyEval_EvalFrameDefault + 0x478f (0x5616cbd456ef in sglang::scheduler_DP1_TP1)
+frame #38: _PyFunction_Vectorcall + 0x165 (0x5616cbd67465 in sglang::scheduler_DP1_TP1)
+frame #39: <unknown function> + 0x215013 (0x5616cbd6f013 in sglang::scheduler_DP1_TP1)
+frame #40: <unknown function> + 0x1d9543 (0x5616cbd33543 in sglang::scheduler_DP1_TP1)
+frame #41: PyObject_Call + 0xbe (0x5616cbd7182e in sglang::scheduler_DP1_TP1)
+frame #42: _PyEval_EvalFrameDefault + 0x478f (0x5616cbd456ef in sglang::scheduler_DP1_TP1)
+frame #43: _PyFunction_Vectorcall + 0x165 (0x5616cbd67465 in sglang::scheduler_DP1_TP1)
+frame #44: <unknown function> + 0x214f3c (0x5616cbd6ef3c in sglang::scheduler_DP1_TP1)
+frame #45: _PyObject_MakeTpCall + 0x223 (0x5616cbd33203 in sglang::scheduler_DP1_TP1)
+frame #46: _PyEval_EvalFrameDefault + 0x60d (0x5616cbd4156d in sglang::scheduler_DP1_TP1)
+frame #47: _PyFunction_Vectorcall + 0x165 (0x5616cbd67465 in sglang::scheduler_DP1_TP1)
+frame #48: _PyEval_EvalFrameDefault + 0x478f (0x5616cbd456ef in sglang::scheduler_DP1_TP1)
+frame #49: <unknown function> + 0x2a3935 (0x5616cbdfd935 in sglang::scheduler_DP1_TP1)
+frame #50: PyEval_EvalCode + 0x9d (0x5616cbdfd07d in sglang::scheduler_DP1_TP1)
+frame #51: <unknown function> + 0x2c098a (0x5616cbe1a98a in sglang::scheduler_DP1_TP1)
+frame #52: <unknown function> + 0x2bc6a3 (0x5616cbe166a3 in sglang::scheduler_DP1_TP1)
+frame #53: PyRun_StringFlags + 0x62 (0x5616cbe0bf92 in sglang::scheduler_DP1_TP1)
+frame #54: PyRun_SimpleStringFlags + 0x3c (0x5616cbe0bd4c in sglang::scheduler_DP1_TP1)
+frame #55: Py_RunMain + 0x30f (0x5616cbe25a1f in sglang::scheduler_DP1_TP1)
+frame #56: Py_BytesMain + 0x37 (0x5616cbdecea7 in sglang::scheduler_DP1_TP1)
+frame #57: <unknown function> + 0x29d90 (0x7fdb79229d90 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #58: __libc_start_main + 0x80 (0x7fdb79229e40 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #59: _start + 0x2e (0x5616cbdecd2e in sglang::scheduler_DP1_TP1)
+
+[rank5]:[W424 03:27:34.254852594 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=108, addr=[localhost]:37058, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7f3aae57cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7f3a913fc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffd9ad (0x7f3a913fd9ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe55a (0x7f3a913fe55a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7f3a913f927e in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x3c8 (0x7f3a4fe55868 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xdf0e6 (0x7f3c2e4ea0e6 in /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/../lib/libstdc++.so.6)
+frame #7: <unknown function> + 0x94ac3 (0x7f3c31894ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x1268d0 (0x7f3c319268d0 in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank4]:[W424 03:27:34.254851968 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=107, addr=[localhost]:37042, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7febbcd7cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7feb9fbfc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffd9ad (0x7feb9fbfd9ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe55a (0x7feb9fbfe55a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7feb9fbf927e in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x3c8 (0x7feb5e655868 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xdf0e6 (0x7fed3ccea0e6 in /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/../lib/libstdc++.so.6)
+frame #7: <unknown function> + 0x94ac3 (0x7fed40094ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x1268d0 (0x7fed401268d0 in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank2]:[W424 03:27:34.254855341 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=108, addr=[localhost]:37054, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7f26cc17cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7f26b5bfc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffd9ad (0x7f26b5bfd9ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe55a (0x7f26b5bfe55a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7f26b5bf927e in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x3c8 (0x7f2674655868 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xdf0e6 (0x7f2852cea0e6 in /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/../lib/libstdc++.so.6)
+frame #7: <unknown function> + 0x94ac3 (0x7f2855e94ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x1268d0 (0x7f2855f268d0 in /lib/x86_64-linux-gnu/libc.so.6)
+
+[2026-04-24 03:27:34 DP3 TP3] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+Process Process-1:4:
+[rank3]:[W424 03:27:34.255327070 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=108, addr=[localhost]:37064, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7fa5b657cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7fa5993fc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffd9ad (0x7fa5993fd9ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe55a (0x7fa5993fe55a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7fa5993f927e in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x3c8 (0x7fa557e55868 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xdf0e6 (0x7fa7364ea0e6 in /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/../lib/libstdc++.so.6)
+frame #7: <unknown function> + 0x94ac3 (0x7fa739894ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x1268d0 (0x7fa7399268d0 in /lib/x86_64-linux-gnu/libc.so.6)
+
+[rank1]:[W424 03:27:34.255417594 TCPStore.cpp:125] [c10d] recvValue failed on SocketImpl(fd=108, addr=[localhost]:42872, remote=[localhost]:36125): Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+Exception raised from recvBytes at /pytorch/torch/csrc/distributed/c10d/Utils.hpp:682 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x80 (0x7fd9ef57cb80 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libc10.so)
+frame #1: <unknown function> + 0x5ffc5b1 (0x7fd9d8ffc5b1 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #2: <unknown function> + 0x5ffd9ad (0x7fd9d8ffd9ad in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #3: <unknown function> + 0x5ffe55a (0x7fd9d8ffe55a in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #4: c10d::TCPStore::check(std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > > const&) + 0x31e (0x7fd9d8ff927e in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cpu.so)
+frame #5: c10d::ProcessGroupNCCL::HeartbeatMonitor::runLoop() + 0x3c8 (0x7fd997a55868 in /data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0xdf0e6 (0x7fdb760ea0e6 in /data2/ljr/a/downloads/miniconda3/envs/sgl/bin/../lib/libstdc++.so.6)
+frame #7: <unknown function> + 0x94ac3 (0x7fdb79294ac3 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #8: <unknown function> + 0x1268d0 (0x7fdb793268d0 in /lib/x86_64-linux-gnu/libc.so.6)
+
+[2026-04-24 03:27:34 DP1 TP1] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+Process Process-1:2:
+Traceback (most recent call last):
+[rank4]:[W424 03:27:34.260804776 ProcessGroupNCCL.cpp:1771] [PG ID 0 PG GUID 0 Rank 4] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+[rank3]:[W424 03:27:34.260806942 ProcessGroupNCCL.cpp:1771] [PG ID 0 PG GUID 0 Rank 3] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+[rank1]:[W424 03:27:34.260808818 ProcessGroupNCCL.cpp:1771] [PG ID 0 PG GUID 0 Rank 1] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+[rank2]:[W424 03:27:34.260809858 ProcessGroupNCCL.cpp:1771] [PG ID 0 PG GUID 0 Rank 2] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+[rank5]:[W424 03:27:34.260886073 ProcessGroupNCCL.cpp:1771] [PG ID 0 PG GUID 0 Rank 5] Failed to check the "should dump" flag on TCPStore, (maybe TCPStore server has shut down too early), with error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1273, in _send_signal
+    os.kill(pid, sig)
+PermissionError: [Errno 1] Operation not permitted
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3584, in run_scheduler_process
+    parent_process.send_signal(signal.SIGQUIT)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1291, in send_signal
+    self._send_signal(sig)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1282, in _send_signal
+    raise AccessDenied(pid, name) from err
+psutil.AccessDenied: (pid=1)
+[2026-04-24 03:27:34 DP4 TP4] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+Process Process-1:5:
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1273, in _send_signal
+    os.kill(pid, sig)
+PermissionError: [Errno 1] Operation not permitted
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3584, in run_scheduler_process
+    parent_process.send_signal(signal.SIGQUIT)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1291, in send_signal
+    self._send_signal(sig)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1282, in _send_signal
+    raise AccessDenied(pid, name) from err
+psutil.AccessDenied: (pid=1)
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1273, in _send_signal
+    os.kill(pid, sig)
+PermissionError: [Errno 1] Operation not permitted
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3584, in run_scheduler_process
+    parent_process.send_signal(signal.SIGQUIT)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1291, in send_signal
+    self._send_signal(sig)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1282, in _send_signal
+    raise AccessDenied(pid, name) from err
+psutil.AccessDenied: (pid=1)
+[2026-04-24 03:27:34 DP5 TP5] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+Process Process-1:6:
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+[2026-04-24 03:27:34 DP2 TP2] Scheduler hit an exception: Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1273, in _send_signal
+    os.kill(pid, sig)
+PermissionError: [Errno 1] Operation not permitted
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+Process Process-1:3:
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3584, in run_scheduler_process
+    parent_process.send_signal(signal.SIGQUIT)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1291, in send_signal
+    self._send_signal(sig)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1282, in _send_signal
+    raise AccessDenied(pid, name) from err
+psutil.AccessDenied: (pid=1)
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3563, in run_scheduler_process
+    scheduler = Scheduler(
+                ^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 384, in __init__
+    self.init_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 628, in init_model_worker
+    self.init_tp_model_worker()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 596, in init_tp_model_worker
+    self.tp_worker = TpModelWorker(**worker_kwargs)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 261, in __init__
+    self._init_model_runner()
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/tp_worker.py", line 344, in _init_model_runner
+    self._model_runner = ModelRunner(
+                         ^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 402, in __init__
+    pre_model_load_memory = self.init_torch_distributed()
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/model_executor/model_runner.py", line 952, in init_torch_distributed
+    init_distributed_environment(
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1742, in init_distributed_environment
+    _WORLD = init_world_group(ranks, local_rank, backend)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 1418, in init_world_group
+    return GroupCoordinator(
+           ^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/distributed/parallel_state.py", line 302, in __init__
+    cpu_group = torch.distributed.new_group(
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/c10d_logger.py", line 95, in wrapper
+    func_return = func(*args, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5276, in new_group
+    return _new_group_with_tag(
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 5366, in _new_group_with_tag
+    pg, pg_store = _new_process_group_helper(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 1996, in _new_process_group_helper
+    backend_class = ProcessGroupGloo(
+                    ^^^^^^^^^^^^^^^^^
+torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1273, in _send_signal
+    os.kill(pid, sig)
+PermissionError: [Errno 1] Operation not permitted
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/data2/ljr/a/sglang/python/sglang/srt/managers/scheduler.py", line 3584, in run_scheduler_process
+    parent_process.send_signal(signal.SIGQUIT)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1291, in send_signal
+    self._send_signal(sig)
+  File "/data2/ljr/a/downloads/miniconda3/envs/sgl/lib/python3.11/site-packages/psutil/__init__.py", line 1282, in _send_signal
+    raise AccessDenied(pid, name) from err
+psutil.AccessDenied: (pid=1)

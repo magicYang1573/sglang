@@ -1,0 +1,44 @@
+/data2/ljr/a/sglang/python/sglang/launch_server.py:51: UserWarning: 'python -m sglang.launch_server' is still supported, but 'sglang serve' is the recommended entrypoint.
+  Example: sglang serve --model-path <model> [options]
+  warnings.warn(
+`rope_parameters`'s factor field must be a float >= 1, got 40
+`rope_parameters`'s beta_fast field must be a float, got 32
+`rope_parameters`'s beta_slow field must be a float, got 1
+[2026-04-24 04:27:58] INFO awq.py:291: The model is convertible to awq_marlin during runtime. Using awq_marlin kernel.
+[2026-04-24 04:28:46] WARNING server_args.py:1536: Set dense attention kv len threshold to model index_topk=2048 for DeepSeek with DSA.
+[2026-04-24 04:28:46] INFO server_args.py:1541: Use nsa attention backend for DeepSeek with DSA.
+[2026-04-24 04:28:46] WARNING server_args.py:1587: Setting page size to 64 for DeepSeek DSA.
+[2026-04-24 04:28:46] WARNING server_args.py:1438: Setting KV cache dtype to bfloat16 for DeepSeek DSA on SM9 device.
+[2026-04-24 04:28:46] WARNING server_args.py:1458: HiSparse enabled: using flashmla_sparse NSA backends (prefill=flashmla_sparse, decode=flashmla_sparse).
+[2026-04-24 04:28:46] WARNING server_args.py:2645: DP attention is enabled. The chunked prefill size is adjusted to 1024 to avoid MoE kernel issues. 
+/data2/ljr/a/sglang/python/sglang/srt/entrypoints/http_server.py:172: FastAPIDeprecationWarning: ORJSONResponse is deprecated, FastAPI now serializes data directly to JSON bytes via Pydantic when a return type or response model is set, which is faster and doesn't need a custom response class. Read more in the FastAPI docs: https://fastapi.tiangolo.com/advanced/custom-response/#orjson-or-response-model and https://fastapi.tiangolo.com/tutorial/response-model/
+  from sglang.srt.utils.json_response import (
+[2026-04-24 04:28:47] HiSparse with radix cache enabled (prefix caching mode). Prefix KV will be shared in the host pool via reference counting.
+[2026-04-24 04:28:49] port 40324 is in use. Waiting for 15 seconds for rpc_port to be available. rpc_port is used by a process already. process.name()='python'' process.cmdline()=['/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python', '-m', 'sglang.launch_server', '--model', '/data3/yt/models/DeepSeek-V3.2-AWQ', '--tp', '8', '--dp-size', '8', '--enable-dp-attention', '--trust-remote-code', '--dtype', 'bfloat16', '--enable-hisparse', '--allow-auto-truncate', '--hisparse-config', '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1"]}}', '--mem-fraction-static', '0.85', '--max-total-tokens', '200000', '--port', '40088'] process.status()='running' pid=958420
+[2026-04-24 04:28:49] port 40324 is in use. Waiting for 20 seconds for rpc_port to be available. rpc_port is used by a process already. process.name()='python'' process.cmdline()=['/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python', '-m', 'sglang.launch_server', '--model', '/data3/yt/models/DeepSeek-V3.2-AWQ', '--tp', '8', '--dp-size', '8', '--enable-dp-attention', '--trust-remote-code', '--dtype', 'bfloat16', '--enable-hisparse', '--allow-auto-truncate', '--hisparse-config', '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1"]}}', '--mem-fraction-static', '0.85', '--max-total-tokens', '200000', '--port', '40088'] process.status()='running' pid=958420
+[2026-04-24 04:28:50] port 40324 is in use. Waiting for 25 seconds for rpc_port to be available. rpc_port is used by a process already. process.name()='python'' process.cmdline()=['/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python', '-m', 'sglang.launch_server', '--model', '/data3/yt/models/DeepSeek-V3.2-AWQ', '--tp', '8', '--dp-size', '8', '--enable-dp-attention', '--trust-remote-code', '--dtype', 'bfloat16', '--enable-hisparse', '--allow-auto-truncate', '--hisparse-config', '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1"]}}', '--mem-fraction-static', '0.85', '--max-total-tokens', '200000', '--port', '40088'] process.status()='running' pid=958420
+[2026-04-24 04:28:50] Port is already in use. dist_init_port=40321 port_base=40322 detokenizer_port=40323 nccl_port=35559 scheduler_input_port=40326
+Traceback (most recent call last):
+  File "/data2/ljr/a/sglang/python/sglang/srt/server_args.py", line 6626, in init_new
+    wait_port_available(rpc_port, "rpc_port")
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/network.py", line 74, in wait_port_available
+    raise ValueError(
+ValueError: rpc_port at 40324 is not available in 30 seconds. rpc_port is used by a process already. process.name()='python'' process.cmdline()=['/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python', '-m', 'sglang.launch_server', '--model', '/data3/yt/models/DeepSeek-V3.2-AWQ', '--tp', '8', '--dp-size', '8', '--enable-dp-attention', '--trust-remote-code', '--dtype', 'bfloat16', '--enable-hisparse', '--allow-auto-truncate', '--hisparse-config', '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1"]}}', '--mem-fraction-static', '0.85', '--max-total-tokens', '200000', '--port', '40088'] process.status()='running' pid=958420
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/data2/ljr/a/sglang/python/sglang/launch_server.py", line 62, in <module>
+    run_server(server_args)
+  File "/data2/ljr/a/sglang/python/sglang/launch_server.py", line 47, in run_server
+    launch_server(server_args)
+  File "/data2/ljr/a/sglang/python/sglang/srt/entrypoints/http_server.py", line 2166, in launch_server
+    ) = Engine._launch_subprocesses(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/entrypoints/engine.py", line 647, in _launch_subprocesses
+    port_args = PortArgs.init_new(server_args)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/data2/ljr/a/sglang/python/sglang/srt/server_args.py", line 6626, in init_new
+    wait_port_available(rpc_port, "rpc_port")
+  File "/data2/ljr/a/sglang/python/sglang/srt/utils/network.py", line 74, in wait_port_available
+    raise ValueError(
+ValueError: rpc_port at 40324 is not available in 30 seconds. rpc_port is used by a process already. process.name()='python'' process.cmdline()=['/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python', '-m', 'sglang.launch_server', '--model', '/data3/yt/models/DeepSeek-V3.2-AWQ', '--tp', '8', '--dp-size', '8', '--enable-dp-attention', '--trust-remote-code', '--dtype', 'bfloat16', '--enable-hisparse', '--allow-auto-truncate', '--hisparse-config', '{"top_k":2048,"device_buffer_size":4096,"rdma_pool":{"enabled":true,"local_ratio":0.0,"ib_devs":["mlx5_0","mlx5_1"]}}', '--mem-fraction-static', '0.85', '--max-total-tokens', '200000', '--port', '40088'] process.status()='running' pid=958420
