@@ -55,43 +55,48 @@
 
 ### 2.1 模块分层
 
-本设计把稀疏 decode 的能力拆成四层，并把"算法接入层"收纳为 `HiSparseCoordinator` 的一个内部模块：
+本设计把 `HiSparseCoordinator` 作为稀疏 decode 的**统一管理根节点**。从大模块关系上看，它下面分成一块共享的 HiSparse IO/KV 管理能力，以及两条互斥的 sparse attention 路径：原生 DSA/NSA 路径直接复用现有模型 indexer；非原生 sparse decode 路径额外挂一个算法接入模块。
 
+```text
+                   Scheduler / ModelRunner / ForwardBatch
+                                  │
+                                  ▼
+              ┌──────────────────────────────────────┐
+              │          HiSparseCoordinator          │
+              │  唯一外部入口；管理请求生命周期和 IO  │
+              └──────────────────────────────────────┘
+                         │                    │
+                         │                    │ optional, sparse_decode only
+                         │                    ▼
+                         │      ┌────────────────────────────────┐
+                         │      │   SparseAlgorithmController     │
+                         │      │   算法 + backend adapter 组合   │
+                         │      └────────────────────────────────┘
+                         │                    │
+                         │        ┌───────────┴───────────┐
+                         │        ▼                       ▼
+                         │  Quest / H2O / SnapKV     FA3 Sparse Adapter
+                         │  产出 token top-k          改写 attention metadata
+                         │        │                       │
+                         ▼        ▼                       ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │                 共享 HiSparse IO / KV 层                 │
+        │ host pool / device hot buffer / LRU / backup / swap-in   │
+        │ HiSparseNSATokenToKVPool 或 HiSparseMHATokenToKVPool     │
+        └─────────────────────────────────────────────────────────┘
+                         ▲                        │
+                         │                        ▼
+        ┌──────────────────────────┐   ┌──────────────────────────┐
+        │ 原生 DSA / NSA 路径       │   │ 非原生 sparse_decode 路径 │
+        │ 模型内置 indexer          │   │ Fa3SparseDecodeBackend    │
+        │ flashmla_sparse backend   │   │ flash_attn_with_kvcache   │
+        └──────────────────────────┘   └──────────────────────────┘
 ```
-┌──────────────────────────────────────────────────────────────┐
-│  算法层 (unchanged API)                                      │
-│   BaseSparseAlgorithm / QuestAlgorithm / H2OAlgorithm ...    │
-│   - retrieve_topk(queries, layer_id, ...) -> token indices   │
-│   - construct/update_representations(...)                    │
-└──────────────────────────────────────────────────────────────┘
-                          ▲ 产出 top-k token 索引
-                          │
-┌──────────────────────────────────────────────────────────────┐
-│  算法接入层 (new, 内部模块)                                  │
-│   SparseAlgorithmController                                  │
-│   - algorithm + adapter 组合                                 │
-│   - 不持有 host pool / device buffer                         │
-│   - 只做「算法 retrieve → adapter 改 metadata」              │
-└──────────────────────────────────────────────────────────────┘
-                          ▲ 持有并驱动
-                          │
-┌──────────────────────────────────────────────────────────────┐
-│  IO 层 + 统一协调 (reuse & extend, 外部唯一入口)             │
-│   HiSparseCoordinator                                        │
-│   - host pool + device buffer + swap_in kernel               │
-│   - 请求生命周期 (admit / finish / retract)                  │
-│   - 每步 decode 的 backup / grow / map                       │
-│   - 组合一个 SparseAlgorithmController (可选, 非 DSA 时启用) │
-└──────────────────────────────────────────────────────────────┘
-                          ▲ 通过 Backend adapter
-                          │
-┌──────────────────────────────────────────────────────────────┐
-│  Attention backend 层                                        │
-│   Fa3SparseDecodeBackend (new, 极薄子类, 仅通过注册表接入)   │
-│   Fa3SparseDecodeAdapter (new, 通用, 与算法无关)             │
-│   HiSparseMHATokenToKVPool (new, 同时承担 full/device 角色)  │
-└──────────────────────────────────────────────────────────────┘
-```
+
+对应到当前实现：
+
+- **DSA/NSA 原生路径**：`--enable-hisparse` 时 `ModelRunner` 创建 `HiSparseCoordinator(mode="dsa_native", algorithm_controller=None)`，device pool 是 `HiSparseNSATokenToKVPool`，host pool 是 `MLATokenToKVPoolHost`，top-k 来源仍是模型/NSA backend 自带 indexer。
+- **非原生 sparse decode 路径**：`--enable-sparse-decode` 时先由 `build_sparse_algorithm_controller()` 创建 `SparseAlgorithmController(algorithm=QuestAlgorithm, adapter=Fa3SparseDecodeAdapter)`，再注入 `HiSparseCoordinator(mode="sparse_decode", algorithm_controller=...)`；controller 只驱动算法与 metadata adapter，不拥有 host pool、device hot buffer 或 swap-in kernel。
 
 ### 2.2 与原 HiSparse 的关系
 
