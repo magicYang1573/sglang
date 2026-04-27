@@ -110,6 +110,8 @@ def _summarize(values: List[float]) -> Dict[str, float]:
 
 def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
     manifest_by_rid = _load_manifest(manifest_path)
+    expected_rids = set(manifest_by_rid)
+    found_rids: set[str] = set()
     per_layer_rows: List[Dict[str, Any]] = []
     per_request_rows: List[Dict[str, Any]] = []
 
@@ -127,10 +129,13 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
         records = records[records["mode"] == 1]
         if len(records) == 0:
             continue
+        found_rids.add(rid)
 
         request_union: set[int] = set()
+        layer_decode_steps: List[int] = []
         for layer_id in sorted(int(x) for x in np.unique(records["layer_id"])):
             layer_records = records[records["layer_id"] == layer_id]
+            layer_decode_steps.append(len(layer_records))
             in_prompt = (layer_records["topk"] >= 0) & (layer_records["topk"] < prompt_len)
             counts_in_prompt = np.sum(in_prompt, axis=1).astype(np.float64)
             mean_step_ratio = float(np.mean(counts_in_prompt / denom))
@@ -160,6 +165,12 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
             )
 
         union_any = len(request_union)
+        expected_layer_steps = output_len if output_len > 0 else None
+        layers_with_expected_steps = (
+            sum(1 for steps in layer_decode_steps if steps == expected_layer_steps)
+            if expected_layer_steps is not None
+            else 0
+        )
         per_request_rows.append(
             {
                 "rid": rid,
@@ -168,6 +179,12 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
                 "output_len": output_len,
                 "num_layers": len(set(int(x) for x in records["layer_id"])),
                 "decode_steps_total": len(records),
+                "min_decode_steps_per_layer": min(layer_decode_steps) if layer_decode_steps else 0,
+                "max_decode_steps_per_layer": max(layer_decode_steps) if layer_decode_steps else 0,
+                "mean_decode_steps_per_layer": _safe_float(mean(layer_decode_steps))
+                if layer_decode_steps
+                else _safe_float(0.0),
+                "layers_with_expected_decode_steps": layers_with_expected_steps,
                 "unique_kv_slots_used_any_layer_union": union_any,
                 "kv_union_used_to_total_prompt_any_layer": _safe_float(union_any / denom),
             }
@@ -196,10 +213,39 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
         "output_len",
         "num_layers",
         "decode_steps_total",
+        "min_decode_steps_per_layer",
+        "max_decode_steps_per_layer",
+        "mean_decode_steps_per_layer",
+        "layers_with_expected_decode_steps",
         "unique_kv_slots_used_any_layer_union",
         "kv_union_used_to_total_prompt_any_layer",
     ]
     _write_csv(output_dir / "per_request.csv", per_request_rows, per_request_fields)
+
+    missing_rids = sorted(expected_rids - found_rids)
+    extra_rids = sorted(found_rids - expected_rids)
+    completeness_rows = [
+        {
+            "expected_requests": len(expected_rids),
+            "found_requests": len(found_rids),
+            "missing_requests": len(missing_rids),
+            "extra_requests": len(extra_rids),
+            "missing_rids": " ".join(missing_rids),
+            "extra_rids": " ".join(extra_rids),
+        }
+    ]
+    _write_csv(
+        output_dir / "completeness.csv",
+        completeness_rows,
+        [
+            "expected_requests",
+            "found_requests",
+            "missing_requests",
+            "extra_requests",
+            "missing_rids",
+            "extra_rids",
+        ],
+    )
 
     summary_layer_fields = [
         "length_label",
@@ -300,6 +346,11 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
 
     print(f"Wrote analysis CSVs to {output_dir}")
     print(f"Per-length slices: {by_len_root}/len_<label>/")
+    print(
+        "Completeness: "
+        f"expected={len(expected_rids)} found={len(found_rids)} "
+        f"missing={len(missing_rids)} extra={len(extra_rids)}"
+    )
 
 
 def main() -> None:

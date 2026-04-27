@@ -82,6 +82,7 @@ echo "Top-k logs:    ${run_dir}/topk_logs"
 if [[ "${START_SERVER:-1}" == "1" ]]; then
   echo "Starting SGLang DeepSeek-V3.2 server on ${BASE_URL}"
   SGLANG_ENABLE_JIT_DEEPGEMM=0 \
+  SGLANG_NSA_FUSE_TOPK=0 \
   SGLANG_NSA_TOPK_LOG_DIR="${run_dir}/topk_logs" \
   SGLANG_NSA_TOPK_LOG_MODE=decode \
   SGLANG_NSA_TOPK_LOG_EVERY_DECODE=1 \
