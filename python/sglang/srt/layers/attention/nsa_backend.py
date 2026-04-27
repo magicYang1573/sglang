@@ -96,13 +96,18 @@ _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is
 # Records are written directly to disk without buffering, so the file remains
 # valid even if the process is killed mid-run.
 #
-# Filter rules (all must hold to log a token):
-#   1. ctx_len  > _NSA_TOPK_LOG_MIN_CTX  (default 2048)
-#   2. token_pos >= 2048
-#   3. token_pos falls within _NSA_TOPK_LOG_WINDOW positions before (inclusive)
-#      any positive multiple of _NSA_TOPK_LOG_BOUNDARY
-#      i.e.  token_pos % BOUNDARY == 0
-#         OR (next_multiple_of_BOUNDARY - token_pos) <= WINDOW
+# Mode/filter rules:
+#   1. SGLANG_NSA_TOPK_LOG_MODE controls which phase is logged:
+#      "decode" (default), "extend", or "all".
+#   2. ctx_len > _NSA_TOPK_LOG_MIN_CTX (default 2048).
+#   3. By default, token_pos follows the boundary/window sampling rule below.
+#   4. Set SGLANG_NSA_TOPK_LOG_EVERY_DECODE=1 to log every decode token.
+#
+# Boundary sampling rule:
+#   token_pos >= 2048 and token_pos falls within _NSA_TOPK_LOG_WINDOW positions
+#   before (inclusive) any positive multiple of _NSA_TOPK_LOG_BOUNDARY:
+#      token_pos % BOUNDARY == 0
+#      OR (next_multiple_of_BOUNDARY - token_pos) <= WINDOW
 #
 # Defaults:  BOUNDARY=4096, WINDOW=8
 # ---------------------------------------------------------------------------
@@ -110,6 +115,10 @@ _NSA_TOPK_LOG_MIN_CTX: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_MIN_CTX", "
 _NSA_TOPK_LOG_DIR: Optional[str] = os.environ.get("SGLANG_NSA_TOPK_LOG_DIR", None)
 _NSA_TOPK_LOG_BOUNDARY: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_BOUNDARY", "4096"))
 _NSA_TOPK_LOG_WINDOW: int = int(os.environ.get("SGLANG_NSA_TOPK_LOG_WINDOW", "8"))
+_NSA_TOPK_LOG_MODE: str = os.environ.get("SGLANG_NSA_TOPK_LOG_MODE", "decode").lower()
+_NSA_TOPK_LOG_EVERY_DECODE: bool = os.environ.get(
+    "SGLANG_NSA_TOPK_LOG_EVERY_DECODE", "0"
+).lower() in ("1", "true", "yes", "on")
 
 _NSA_TOPK_MAGIC = 0x4E534154  # "NSAT"
 _NSA_TOPK_HEADER_SIZE = 8     # magic(4) + topk_width(4)
@@ -128,6 +137,13 @@ def _should_log_token_pos(token_pos: int) -> bool:
         return True
     next_boundary = ((token_pos // _NSA_TOPK_LOG_BOUNDARY) + 1) * _NSA_TOPK_LOG_BOUNDARY
     return (next_boundary - token_pos) <= _NSA_TOPK_LOG_WINDOW
+
+
+def _should_log_nsa_topk_mode(mode: str) -> bool:
+    """Return True if top-k logging is enabled for the current forward mode."""
+    if _NSA_TOPK_LOG_MODE in ("all", "*"):
+        return True
+    return mode == _NSA_TOPK_LOG_MODE
 
 
 def _get_file_handle(req_id: str, topk_width: int):
@@ -205,9 +221,9 @@ def _log_nsa_topk_indices(
     Decode mode: topk_indices shape [batch_size, topk]   — 1 token per request.
     Extend mode: topk_indices shape [total_tokens, topk] — all new tokens flattened.
 
-    Records are flushed to per-request .npz files via flush_nsa_topk_log().
+    Records are flushed to per-request binary files via flush_nsa_topk_log().
     """
-    if _NSA_TOPK_LOG_DIR is None:
+    if _NSA_TOPK_LOG_DIR is None or not _should_log_nsa_topk_mode(mode):
         return
 
     mode_int = 1 if mode == "decode" else 0
@@ -225,7 +241,7 @@ def _log_nsa_topk_indices(
             if ctx_len <= _NSA_TOPK_LOG_MIN_CTX:
                 continue
             token_pos = ctx_len - 1
-            if not _should_log_token_pos(token_pos):
+            if not _NSA_TOPK_LOG_EVERY_DECODE and not _should_log_token_pos(token_pos):
                 continue
             req_id = rids[i] if (rids is not None and i < len(rids)) else i
             _collect_token_record(req_id, mode_int, layer_id, ctx_len, token_pos, topk_cpu[i])
