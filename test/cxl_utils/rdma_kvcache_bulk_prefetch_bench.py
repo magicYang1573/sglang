@@ -22,6 +22,12 @@ up to ``concurrency`` RDMA operations can overlap in time on one RNIC.  The
 per-request latency includes both RDMA READ (remote MR -> landing MR) and the
 required local page-first -> layer-first layout conversion.
 
+By default the benchmark uses the legacy single-device loopback transport.
+Pass ``--remote-ib-dev`` to create a two-device local transport: requester QPs
+bind to ``--ib-dev`` and read from responder QPs/MRs bound to
+``--remote-ib-dev``.  With the two ports externally cabled or connected through
+a switch, this exercises the physical RNIC path more closely than loopback.
+
 To avoid host-side data races and excessive MR registration pressure, each of
 the ``concurrency`` QPs registers only its own non-overlapping slice of a larger
 landing buffer.  The remote read source is the same logical KV buffer for all
@@ -140,6 +146,11 @@ def summarize(
 def init_contexts(
     rdma_ext,
     ib_dev: str,
+    remote_ib_dev: str | None,
+    local_port_num: int,
+    remote_port_num: int,
+    local_gid_index: int,
+    remote_gid_index: int,
     remote_buf: torch.Tensor,
     landing_buf: torch.Tensor,
     landing_stride_bytes: int,
@@ -157,17 +168,33 @@ def init_contexts(
         )
 
     for worker_idx in range(concurrency):
-        ctx = rdma_ext.RDMAContext()
+        two_device = remote_ib_dev is not None
+        ctx = rdma_ext.RDMATwoDevicePair() if two_device else rdma_ext.RDMAContext()
         local_offset = worker_idx * landing_stride_bytes
         try:
-            ctx.init(
-                ib_dev,
-                landing_buf.data_ptr() + local_offset,
-                local_slice_bytes,
-                remote_buf.data_ptr(),
-                remote_size,
-                max_wr,
-            )
+            if two_device:
+                ctx.init(
+                    ib_dev,
+                    remote_ib_dev,
+                    landing_buf.data_ptr() + local_offset,
+                    local_slice_bytes,
+                    remote_buf.data_ptr(),
+                    remote_size,
+                    max_wr,
+                    local_port_num,
+                    remote_port_num,
+                    local_gid_index,
+                    remote_gid_index,
+                )
+            else:
+                ctx.init(
+                    ib_dev,
+                    landing_buf.data_ptr() + local_offset,
+                    local_slice_bytes,
+                    remote_buf.data_ptr(),
+                    remote_size,
+                    max_wr,
+                )
         except RuntimeError as exc:
             registered_gb = (worker_idx + 1) * (local_slice_bytes + remote_size) / 1e9
             raise RuntimeError(
@@ -289,6 +316,11 @@ def run_case(
     context_tokens: int,
     concurrency: int,
     ib_dev: str,
+    remote_ib_dev: str | None,
+    local_port_num: int,
+    remote_port_num: int,
+    local_gid_index: int,
+    remote_gid_index: int,
     num_layers: int,
     per_layer_kv_bytes: int,
     warmup_batches: int,
@@ -320,6 +352,12 @@ def run_case(
         "requests": concurrency * measured_batches,
         "warmup_requests": concurrency * warmup_batches,
         "ib_dev": ib_dev,
+        "remote_ib_dev": remote_ib_dev,
+        "transport": "two_device" if remote_ib_dev is not None else "loopback",
+        "local_port_num": local_port_num,
+        "remote_port_num": remote_port_num,
+        "local_gid_index": local_gid_index,
+        "remote_gid_index": remote_gid_index,
     }
     if dry_run:
         return {**base, "summary": {}}
@@ -328,6 +366,11 @@ def run_case(
             "PyTorch is required for real RDMA runs because the benchmark uses "
             "CPU tensors as MR-backed KVCache buffers. Re-run with the same "
             "Python environment used for SGLang."
+        )
+    if remote_ib_dev is not None and not hasattr(rdma_ext, "RDMATwoDevicePair"):
+        raise RuntimeError(
+            "rdma_scatter_ext does not expose RDMATwoDevicePair. Rebuild it with:\n"
+            f"  cd {ROOT} && make clean && make rdma PYTHON={sys.executable}"
         )
 
     # One remote KV buffer, replicated RDMA READs.  Landing and layer-first
@@ -346,6 +389,11 @@ def run_case(
     contexts = init_contexts(
         rdma_ext=rdma_ext,
         ib_dev=ib_dev,
+        remote_ib_dev=remote_ib_dev,
+        local_port_num=local_port_num,
+        remote_port_num=remote_port_num,
+        local_gid_index=local_gid_index,
+        remote_gid_index=remote_gid_index,
         remote_buf=remote_buf,
         landing_buf=landing_buf,
         landing_stride_bytes=total_bytes,
@@ -407,7 +455,13 @@ def write_csv(path: Path, cases: List[Dict[str, object]]) -> None:
         "avg_batch_wall_ms",
         "aggregate_bw_gb_s",
         "per_request_bw_gb_s",
+        "transport",
         "ib_dev",
+        "remote_ib_dev",
+        "local_port_num",
+        "remote_port_num",
+        "local_gid_index",
+        "remote_gid_index",
     ]
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -420,7 +474,13 @@ def write_csv(path: Path, cases: List[Dict[str, object]]) -> None:
                 "concurrency": case["concurrency"],
                 "requests": case["requests"],
                 "gb_per_request": case["gb_per_request"],
+                "transport": case["transport"],
                 "ib_dev": case["ib_dev"],
+                "remote_ib_dev": case["remote_ib_dev"],
+                "local_port_num": case["local_port_num"],
+                "remote_port_num": case["remote_port_num"],
+                "local_gid_index": case["local_gid_index"],
+                "remote_gid_index": case["remote_gid_index"],
             }
             if isinstance(summary, dict):
                 row.update(summary)
@@ -445,7 +505,43 @@ def main() -> None:
     parser.add_argument(
         "--ib-dev",
         default="mlx5_0",
-        help="Single RNIC device used by every RDMA context.",
+        help=(
+            "Loopback RNIC device, or requester/local RNIC when "
+            "--remote-ib-dev is set."
+        ),
+    )
+    parser.add_argument(
+        "--remote-ib-dev",
+        default=None,
+        help=(
+            "Optional responder/remote RNIC device. When set, each worker "
+            "creates a two-device RDMA READ pair (--ib-dev -> --remote-ib-dev) "
+            "instead of a single-device loopback QP."
+        ),
+    )
+    parser.add_argument(
+        "--local-port-num",
+        type=int,
+        default=1,
+        help="IB port number for --ib-dev in two-device mode.",
+    )
+    parser.add_argument(
+        "--remote-port-num",
+        type=int,
+        default=1,
+        help="IB port number for --remote-ib-dev in two-device mode.",
+    )
+    parser.add_argument(
+        "--local-gid-index",
+        type=int,
+        default=0,
+        help="GID index for --ib-dev in two-device mode.",
+    )
+    parser.add_argument(
+        "--remote-gid-index",
+        type=int,
+        default=0,
+        help="GID index for --remote-ib-dev in two-device mode.",
     )
     parser.add_argument(
         "--num-layers",
@@ -498,6 +594,12 @@ def main() -> None:
         parser.error("--requests-per-concurrency must be >= 1")
     if args.warmup_batches < 0:
         parser.error("--warmup-batches must be >= 0")
+    if args.remote_ib_dev is not None and args.remote_ib_dev == args.ib_dev:
+        parser.error("--remote-ib-dev must be different from --ib-dev")
+    if args.local_port_num < 1 or args.remote_port_num < 1:
+        parser.error("--local-port-num and --remote-port-num must be >= 1")
+    if args.local_gid_index < 0 or args.remote_gid_index < 0:
+        parser.error("--local-gid-index and --remote-gid-index must be >= 0")
 
     max_context = max(contexts)
     max_conc = max(concurrencies)
@@ -514,7 +616,14 @@ def main() -> None:
     print("=" * 78)
     print(f"contexts:       {contexts}")
     print(f"concurrency:    {concurrencies}")
-    print(f"ib_dev:         {args.ib_dev} (single NIC)")
+    if args.remote_ib_dev is None:
+        print(f"transport:      loopback on {args.ib_dev}")
+    else:
+        print(
+            "transport:      two-device "
+            f"{args.ib_dev}:port{args.local_port_num}/gid{args.local_gid_index} "
+            f"-> {args.remote_ib_dev}:port{args.remote_port_num}/gid{args.remote_gid_index}"
+        )
     print(f"KV shape:       [tokens, {args.num_layers} layers, {args.per_layer_kv_bytes} B/layer]")
     print(f"max transfer:   {max_transfer / 1e9:.3f} GB/request")
     print(
@@ -544,6 +653,11 @@ def main() -> None:
                 context_tokens=context_tokens,
                 concurrency=concurrency,
                 ib_dev=args.ib_dev,
+                remote_ib_dev=args.remote_ib_dev,
+                local_port_num=args.local_port_num,
+                remote_port_num=args.remote_port_num,
+                local_gid_index=args.local_gid_index,
+                remote_gid_index=args.remote_gid_index,
                 num_layers=args.num_layers,
                 per_layer_kv_bytes=args.per_layer_kv_bytes,
                 warmup_batches=args.warmup_batches,
@@ -565,6 +679,12 @@ def main() -> None:
             "contexts": contexts,
             "concurrency": concurrencies,
             "ib_dev": args.ib_dev,
+            "remote_ib_dev": args.remote_ib_dev,
+            "transport": "two_device" if args.remote_ib_dev is not None else "loopback",
+            "local_port_num": args.local_port_num,
+            "remote_port_num": args.remote_port_num,
+            "local_gid_index": args.local_gid_index,
+            "remote_gid_index": args.remote_gid_index,
             "num_layers": args.num_layers,
             "per_layer_kv_bytes": args.per_layer_kv_bytes,
             "bytes_per_token": bytes_per_token,

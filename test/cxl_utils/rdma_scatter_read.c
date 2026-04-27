@@ -96,6 +96,66 @@ static int modify_qp_to_rts(struct ibv_qp *qp) {
 /*  public API                                                         */
 /* ------------------------------------------------------------------ */
 
+static int rdma_alloc_endpoint(struct rdma_context *rctx,
+                               const char *ib_dev_name,
+                               uint8_t port_num,
+                               int gid_index,
+                               int max_topk) {
+    memset(rctx, 0, sizeof(*rctx));
+    rctx->port_num = port_num;
+    rctx->gid_index = gid_index;
+
+    rctx->ctx = open_device(ib_dev_name);
+    if (!rctx->ctx) return -1;
+
+    struct ibv_port_attr port_attr;
+    if (ibv_query_port(rctx->ctx, rctx->port_num, &port_attr)) {
+        fprintf(stderr, "rdma: ibv_query_port failed on %s\n", ib_dev_name);
+        goto err;
+    }
+    rctx->lid = port_attr.lid;
+    if (ibv_query_gid(rctx->ctx, rctx->port_num, rctx->gid_index, &rctx->gid)) {
+        fprintf(stderr, "rdma: ibv_query_gid failed on %s\n", ib_dev_name);
+        goto err;
+    }
+
+    rctx->pd = ibv_alloc_pd(rctx->ctx);
+    if (!rctx->pd) { fprintf(stderr, "rdma: ibv_alloc_pd failed on %s\n", ib_dev_name); goto err; }
+
+    int cq_size = max_topk + 64;
+    rctx->send_cq = ibv_create_cq(rctx->ctx, cq_size, NULL, NULL, 0);
+    if (!rctx->send_cq) { fprintf(stderr, "rdma: ibv_create_cq(send) failed on %s\n", ib_dev_name); goto err; }
+    rctx->recv_cq = ibv_create_cq(rctx->ctx, 16, NULL, NULL, 0);
+    if (!rctx->recv_cq) { fprintf(stderr, "rdma: ibv_create_cq(recv) failed on %s\n", ib_dev_name); goto err; }
+
+    struct ibv_device_attr dev_attr;
+    if (ibv_query_device(rctx->ctx, &dev_attr)) {
+        fprintf(stderr, "rdma: ibv_query_device failed on %s\n", ib_dev_name);
+        goto err;
+    }
+    rctx->max_send_wr = dev_attr.max_qp_wr;
+    if (rctx->max_send_wr > cq_size)
+        rctx->max_send_wr = cq_size;
+
+    struct ibv_qp_init_attr qp_init;
+    memset(&qp_init, 0, sizeof(qp_init));
+    qp_init.send_cq = rctx->send_cq;
+    qp_init.recv_cq = rctx->recv_cq;
+    qp_init.qp_type = IBV_QPT_RC;
+    qp_init.cap.max_send_wr  = rctx->max_send_wr;
+    qp_init.cap.max_recv_wr  = 1;
+    qp_init.cap.max_send_sge = 1;
+    qp_init.cap.max_recv_sge = 1;
+    rctx->qp = ibv_create_qp(rctx->pd, &qp_init);
+    if (!rctx->qp) { fprintf(stderr, "rdma: ibv_create_qp failed on %s\n", ib_dev_name); goto err; }
+
+    return 0;
+
+err:
+    rdma_destroy(rctx);
+    return -1;
+}
+
 int rdma_init_loopback(struct rdma_context *rctx,
                        const char *ib_dev_name,
                        void *local_buf, size_t local_size,
@@ -193,6 +253,81 @@ int rdma_init_loopback(struct rdma_context *rctx,
 
 err:
     rdma_destroy(rctx);
+    return -1;
+}
+
+int rdma_init_two_device_pair(struct rdma_context *requester,
+                              struct rdma_context *responder,
+                              const char *local_ib_dev_name,
+                              const char *remote_ib_dev_name,
+                              uint8_t local_port_num,
+                              uint8_t remote_port_num,
+                              int local_gid_index,
+                              int remote_gid_index,
+                              void *local_buf, size_t local_size,
+                              void *remote_buf, size_t remote_size,
+                              int max_topk) {
+    if (rdma_alloc_endpoint(requester, local_ib_dev_name,
+                            local_port_num, local_gid_index, max_topk))
+        goto err;
+    if (rdma_alloc_endpoint(responder, remote_ib_dev_name,
+                            remote_port_num, remote_gid_index, max_topk))
+        goto err;
+
+    requester->local_buf  = local_buf;
+    requester->local_size = local_size;
+    requester->remote_buf = remote_buf;
+    requester->remote_size = remote_size;
+
+    responder->remote_buf = remote_buf;
+    responder->remote_size = remote_size;
+
+    requester->local_mr = ibv_reg_mr(requester->pd, local_buf, local_size,
+                                     IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (!requester->local_mr) {
+        fprintf(stderr, "rdma: ibv_reg_mr(two-device local) failed: %s\n", strerror(errno));
+        goto err;
+    }
+
+    responder->remote_mr = ibv_reg_mr(responder->pd, remote_buf, remote_size,
+                                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                                      IBV_ACCESS_REMOTE_WRITE);
+    if (!responder->remote_mr) {
+        fprintf(stderr, "rdma: ibv_reg_mr(two-device remote) failed: %s\n", strerror(errno));
+        goto err;
+    }
+
+    requester->remote_addr = (uint64_t)(uintptr_t)remote_buf;
+    requester->remote_rkey = responder->remote_mr->rkey;
+
+    if (modify_qp_to_init(requester->qp, requester->port_num)) {
+        fprintf(stderr, "rdma: modify_qp_to_init requester failed\n"); goto err;
+    }
+    if (modify_qp_to_init(responder->qp, responder->port_num)) {
+        fprintf(stderr, "rdma: modify_qp_to_init responder failed\n"); goto err;
+    }
+    if (modify_qp_to_rtr(requester->qp, requester->port_num,
+                         responder->qp->qp_num, responder->lid,
+                         &responder->gid, responder->gid_index)) {
+        fprintf(stderr, "rdma: modify_qp_to_rtr requester failed\n"); goto err;
+    }
+    if (modify_qp_to_rtr(responder->qp, responder->port_num,
+                         requester->qp->qp_num, requester->lid,
+                         &requester->gid, requester->gid_index)) {
+        fprintf(stderr, "rdma: modify_qp_to_rtr responder failed\n"); goto err;
+    }
+    if (modify_qp_to_rts(requester->qp)) {
+        fprintf(stderr, "rdma: modify_qp_to_rts requester failed\n"); goto err;
+    }
+    if (modify_qp_to_rts(responder->qp)) {
+        fprintf(stderr, "rdma: modify_qp_to_rts responder failed\n"); goto err;
+    }
+
+    return 0;
+
+err:
+    rdma_destroy(requester);
+    rdma_destroy(responder);
     return -1;
 }
 

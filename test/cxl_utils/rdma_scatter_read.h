@@ -57,6 +57,30 @@ int rdma_init_loopback(struct rdma_context *rctx,
                        int max_topk);
 
 /*
+ * Initialise a two-device RDMA READ pair on one host:
+ *   - requester opens local_ib_dev and owns the local landing MR
+ *   - responder opens remote_ib_dev and owns the remote source MR
+ *   - requester QP is connected to responder QP, so READ traffic traverses
+ *     the two RNIC ports instead of using a single-device loopback QP
+ *
+ * The caller issues rdma_bulk_read()/rdma_scatter_read() on requester only.
+ * Destroy both contexts with rdma_destroy().
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int rdma_init_two_device_pair(struct rdma_context *requester,
+                              struct rdma_context *responder,
+                              const char *local_ib_dev_name,
+                              const char *remote_ib_dev_name,
+                              uint8_t local_port_num,
+                              uint8_t remote_port_num,
+                              int local_gid_index,
+                              int remote_gid_index,
+                              void *local_buf, size_t local_size,
+                              void *remote_buf, size_t remote_size,
+                              int max_topk);
+
+/*
  * Perform discrete RDMA READs for top_k items.
  *
  * Each of the top_k indices triggers one RDMA READ of item_size bytes from

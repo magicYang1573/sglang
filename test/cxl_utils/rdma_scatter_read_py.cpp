@@ -167,6 +167,76 @@ public:
     ~RDMAContextHandle() { destroy(); }
 };
 
+class RDMATwoDevicePairHandle {
+    rdma_context requester_;
+    rdma_context responder_;
+    bool initialized_ = false;
+
+public:
+    RDMATwoDevicePairHandle() {
+        memset(&requester_, 0, sizeof(requester_));
+        memset(&responder_, 0, sizeof(responder_));
+    }
+
+    void init(const std::string &local_ib_dev,
+              const std::string &remote_ib_dev,
+              uint64_t local_ptr, size_t local_size,
+              uint64_t remote_ptr, size_t remote_size,
+              int max_wr,
+              uint8_t local_port_num,
+              uint8_t remote_port_num,
+              int local_gid_index,
+              int remote_gid_index) {
+        destroy();
+        int ret = rdma_init_two_device_pair(
+            &requester_, &responder_,
+            local_ib_dev.c_str(), remote_ib_dev.c_str(),
+            local_port_num, remote_port_num,
+            local_gid_index, remote_gid_index,
+            reinterpret_cast<void *>(local_ptr), local_size,
+            reinterpret_cast<void *>(remote_ptr), remote_size,
+            max_wr);
+        if (ret != 0)
+            throw std::runtime_error("RDMATwoDevicePair::init failed on " +
+                                     local_ib_dev + " -> " + remote_ib_dev);
+        initialized_ = true;
+    }
+
+    double bulk_read(size_t total_bytes) {
+        if (!initialized_)
+            throw std::runtime_error("RDMATwoDevicePair not initialized");
+        double us = rdma_bulk_read(&requester_, total_bytes);
+        if (us < 0)
+            throw std::runtime_error("RDMATwoDevicePair::bulk_read failed");
+        return us;
+    }
+
+    double scatter_read(uint64_t indices_ptr, int top_k, int item_size) {
+        if (!initialized_)
+            throw std::runtime_error("RDMATwoDevicePair not initialized");
+        double us = rdma_scatter_read(
+            &requester_, reinterpret_cast<const int64_t *>(indices_ptr),
+            top_k, item_size);
+        if (us < 0)
+            throw std::runtime_error("RDMATwoDevicePair::scatter_read failed");
+        return us;
+    }
+
+    void destroy() {
+        if (initialized_) {
+            rdma_destroy(&requester_);
+            rdma_destroy(&responder_);
+            memset(&requester_, 0, sizeof(requester_));
+            memset(&responder_, 0, sizeof(responder_));
+            initialized_ = false;
+        }
+    }
+
+    bool is_initialized() const { return initialized_; }
+
+    ~RDMATwoDevicePairHandle() { destroy(); }
+};
+
 /* ------------------------------------------------------------------ */
 /*  Module definition                                                   */
 /* ------------------------------------------------------------------ */
@@ -222,4 +292,32 @@ PYBIND11_MODULE(rdma_scatter_ext, m) {
         .def("destroy", &RDMAContextHandle::destroy,
              "Tear down RDMA resources.")
         .def("is_initialized", &RDMAContextHandle::is_initialized);
+
+    py::class_<RDMATwoDevicePairHandle>(m, "RDMATwoDevicePair",
+        "Two-device RDMA READ pair on one host. The requester binds to "
+        "local_ib_dev and reads a remote MR registered on remote_ib_dev, "
+        "so traffic traverses two RNIC ports instead of a loopback QP.")
+        .def(py::init<>())
+        .def("init", &RDMATwoDevicePairHandle::init,
+             py::arg("local_ib_dev"),
+             py::arg("remote_ib_dev"),
+             py::arg("local_ptr"), py::arg("local_size"),
+             py::arg("remote_ptr"), py::arg("remote_size"),
+             py::arg("max_wr"),
+             py::arg("local_port_num") = 1,
+             py::arg("remote_port_num") = 1,
+             py::arg("local_gid_index") = 0,
+             py::arg("remote_gid_index") = 0,
+             "Initialize a two-device RC pair for RDMA READ.")
+        .def("bulk_read", &RDMATwoDevicePairHandle::bulk_read,
+             py::arg("total_bytes"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Bulk contiguous RDMA READ from remote device to local device.")
+        .def("scatter_read", &RDMATwoDevicePairHandle::scatter_read,
+             py::arg("indices_ptr"), py::arg("top_k"), py::arg("item_size"),
+             py::call_guard<py::gil_scoped_release>(),
+             "Per-token discrete RDMA READs through the two-device pair.")
+        .def("destroy", &RDMATwoDevicePairHandle::destroy,
+             "Tear down both RDMA endpoints.")
+        .def("is_initialized", &RDMATwoDevicePairHandle::is_initialized);
 }
