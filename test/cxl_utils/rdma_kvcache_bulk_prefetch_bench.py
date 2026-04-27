@@ -5,16 +5,27 @@ This script does not start SGLang.  It directly uses ``rdma_scatter_ext`` from
 ``test/cxl_utils`` and simulates the SGLang HiSparse RDMA warm-path layout:
 
     remote KVCache:  [num_tokens, num_layers, per_layer_kv_bytes]
-    landing buffer: same byte size, used as the RDMA READ destination
+    landing buffer: page-first RDMA READ destination
+    local KVCache:  [num_layers, num_tokens, per_layer_kv_bytes]
 
 For each context length, one request transfers:
 
     context_tokens * num_layers * per_layer_kv_bytes
 
 For each concurrency value, the measured request count is
-``concurrency * requests_per_concurrency``.  Requests are issued in batches with
-at most ``concurrency`` in flight, and the reported latency is the average over
-all measured requests.  Every RDMA context uses the same RNIC.
+``concurrency * requests_per_concurrency``.
+
+Workers keep a fixed pool of ``concurrency`` RDMA QPs busy: as soon as one
+``bulk_read*`` call completes, the worker immediately starts the next request
+(global index via an atomic counter).  This approximates a closed system where
+up to ``concurrency`` RDMA operations can overlap in time on one RNIC.  The
+per-request latency includes both RDMA READ (remote MR -> landing MR) and the
+required local page-first -> layer-first layout conversion.
+
+To avoid host-side data races, each of the ``concurrency`` QPs uses a
+non-overlapping slice of a larger landing buffer via ``bulk_read_offset`` when
+available.  The remote read source is the same logical KV buffer for all
+replica transfers (read-only, NIC-side).
 
 Build the extension first:
 
@@ -87,10 +98,14 @@ def percentile(values: List[float], pct: float) -> float:
 
 def summarize(
     request_us: List[float],
+    rdma_us: List[float],
+    layout_us: List[float],
     wall_us: List[float],
     total_bytes_per_request: int,
 ) -> Dict[str, float]:
     avg_req_us = float(np.mean(request_us)) if request_us else 0.0
+    avg_rdma_us = float(np.mean(rdma_us)) if rdma_us else 0.0
+    avg_layout_us = float(np.mean(layout_us)) if layout_us else 0.0
     avg_wall_us = float(np.mean(wall_us)) if wall_us else 0.0
     p50_req_us = percentile(request_us, 50)
     p99_req_us = percentile(request_us, 99)
@@ -110,6 +125,8 @@ def summarize(
 
     return {
         "avg_kvcache_prefetch_ms": round(avg_req_us / 1000.0, 3),
+        "avg_rdma_read_ms": round(avg_rdma_us / 1000.0, 3),
+        "avg_layout_convert_ms": round(avg_layout_us / 1000.0, 3),
         "p50_kvcache_prefetch_ms": round(p50_req_us / 1000.0, 3),
         "p99_kvcache_prefetch_ms": round(p99_req_us / 1000.0, 3),
         "avg_batch_wall_ms": round(avg_wall_us / 1000.0, 3),
@@ -155,7 +172,14 @@ def destroy_contexts(contexts) -> None:
 
 def run_concurrent_bulk_read(
     contexts,
+    landing_buf: torch.Tensor,
+    layer_first_buf: torch.Tensor,
     total_bytes: int,
+    landing_stride_bytes: int,
+    use_bulk_read_offset: bool,
+    context_tokens: int,
+    num_layers: int,
+    per_layer_kv_bytes: int,
     concurrency: int,
     warmup_batches: int,
     measured_batches: int,
@@ -165,11 +189,14 @@ def run_concurrent_bulk_read(
         next_lock = threading.Lock()
         start_event = threading.Event()
         request_us = [0.0] * num_requests
+        rdma_us = [0.0] * num_requests
+        layout_us = [0.0] * num_requests
         errors: List[str] = []
 
         def worker(worker_idx: int) -> None:
             nonlocal next_request
             ctx = contexts[worker_idx]
+            local_offset = worker_idx * landing_stride_bytes
             start_event.wait()
             while True:
                 with next_lock:
@@ -178,7 +205,25 @@ def run_concurrent_bulk_read(
                     request_idx = next_request
                     next_request += 1
                 try:
-                    request_us[request_idx] = float(ctx.bulk_read(total_bytes))
+                    req_t0 = time.perf_counter()
+                    if use_bulk_read_offset:
+                        rdma_elapsed_us = float(
+                            ctx.bulk_read_offset(0, local_offset, total_bytes)
+                        )
+                    else:
+                        rdma_elapsed_us = float(ctx.bulk_read(total_bytes))
+
+                    layout_t0 = time.perf_counter()
+                    landing_view = landing_buf.narrow(
+                        0, local_offset, total_bytes
+                    ).view(context_tokens, num_layers, per_layer_kv_bytes)
+                    src = landing_view.permute(1, 0, 2).contiguous()
+                    layer_first_buf[worker_idx].copy_(src)
+                    layout_elapsed_us = (time.perf_counter() - layout_t0) * 1e6
+
+                    rdma_us[request_idx] = rdma_elapsed_us
+                    layout_us[request_idx] = layout_elapsed_us
+                    request_us[request_idx] = (time.perf_counter() - req_t0) * 1e6
                 except Exception as exc:
                     errors.append(
                         f"{phase_name}: worker={worker_idx} request={request_idx}: {exc}"
@@ -200,7 +245,12 @@ def run_concurrent_bulk_read(
 
         if errors:
             raise RuntimeError("; ".join(errors[:3]))
-        return {"request_us": request_us, "wall_us": wall_us}
+        return {
+            "request_us": request_us,
+            "rdma_us": rdma_us,
+            "layout_us": layout_us,
+            "wall_us": wall_us,
+        }
 
     warmup_requests = concurrency * warmup_batches
     if warmup_requests > 0:
@@ -209,11 +259,15 @@ def run_concurrent_bulk_read(
     measured_requests = concurrency * measured_batches
     measured = run_phase(measured_requests, "measured")
     request_us = measured["request_us"]
+    rdma_us = measured["rdma_us"]
+    layout_us = measured["layout_us"]
     wall_us = [measured["wall_us"]]
     return {
         "request_us": request_us,
+        "rdma_us": rdma_us,
+        "layout_us": layout_us,
         "batch_wall_us": wall_us,
-        "summary": summarize(request_us, wall_us, total_bytes),
+        "summary": summarize(request_us, rdma_us, layout_us, wall_us, total_bytes),
     }
 
 
@@ -263,11 +317,30 @@ def run_case(
             "Python environment used for SGLang."
         )
 
+    ctx_cls = getattr(rdma_ext, "RDMAContext", None)
+    use_offset = ctx_cls is not None and hasattr(ctx_cls, "bulk_read_offset")
+    if not use_offset:
+        print(
+            "  [WARN] rdma_scatter_ext has no RDMAContext.bulk_read_offset; "
+            "falling back to bulk_read() — concurrent workers may race on the "
+            "same landing range. Rebuild a multi-instance RDMAContext extension."
+        )
+
+    # One remote KV buffer, replicated RDMA READs.  Landing and layer-first
+    # output are striped per worker so concurrent requests do not race locally.
     remote_buf = torch.empty(total_bytes, dtype=torch.uint8)
-    landing_buf = torch.empty(total_bytes, dtype=torch.uint8)
+    if use_offset:
+        landing_buf = torch.empty(total_bytes * concurrency, dtype=torch.uint8)
+    else:
+        landing_buf = torch.empty(total_bytes, dtype=torch.uint8)
+    layer_first_buf = torch.empty(
+        (concurrency, num_layers, context_tokens, per_layer_kv_bytes),
+        dtype=torch.uint8,
+    )
     if touch:
         touch_buffer(remote_buf, 7)
         touch_buffer(landing_buf, 0)
+        touch_buffer(layer_first_buf.view(-1), 0)
 
     contexts = init_contexts(
         rdma_ext=rdma_ext,
@@ -280,7 +353,14 @@ def run_case(
     try:
         measured = run_concurrent_bulk_read(
             contexts=contexts,
+            landing_buf=landing_buf,
+            layer_first_buf=layer_first_buf,
             total_bytes=total_bytes,
+            landing_stride_bytes=total_bytes,
+            use_bulk_read_offset=use_offset,
+            context_tokens=context_tokens,
+            num_layers=num_layers,
+            per_layer_kv_bytes=per_layer_kv_bytes,
             concurrency=concurrency,
             warmup_batches=warmup_batches,
             measured_batches=measured_batches,
@@ -289,10 +369,12 @@ def run_case(
         destroy_contexts(contexts)
         del remote_buf
         del landing_buf
+        del layer_first_buf
 
     summary = measured["summary"]
     print(
         "  avg_prefetch={avg_kvcache_prefetch_ms:.3f} ms "
+        "(rdma={avg_rdma_read_ms:.3f} ms, layout={avg_layout_convert_ms:.3f} ms) "
         "p50={p50_kvcache_prefetch_ms:.3f} ms "
         "p99={p99_kvcache_prefetch_ms:.3f} ms "
         "agg_bw={aggregate_bw_gb_s:.3f} GB/s".format(**summary)
@@ -302,6 +384,8 @@ def run_case(
         **base,
         "summary": summary,
         "request_us": measured["request_us"],
+        "rdma_us": measured["rdma_us"],
+        "layout_us": measured["layout_us"],
         "batch_wall_us": measured["batch_wall_us"],
     }
 
@@ -314,6 +398,8 @@ def write_csv(path: Path, cases: List[Dict[str, object]]) -> None:
         "requests",
         "gb_per_request",
         "avg_kvcache_prefetch_ms",
+        "avg_rdma_read_ms",
+        "avg_layout_convert_ms",
         "p50_kvcache_prefetch_ms",
         "p99_kvcache_prefetch_ms",
         "avg_batch_wall_ms",
@@ -412,8 +498,14 @@ def main() -> None:
         parser.error("--warmup-batches must be >= 0")
 
     max_context = max(contexts)
+    max_conc = max(concurrencies)
     bytes_per_token = args.num_layers * args.per_layer_kv_bytes
     max_transfer = max_context * bytes_per_token
+    # Upper bound: remote + landing stripe + layer-first output stripe.
+    # During layout conversion, each worker may transiently allocate one
+    # additional contiguous layer-first copy, so peak can approach +max_conc.
+    max_host_bytes = max_transfer * (1 + 2 * max_conc)
+    max_transient_bytes = max_transfer * max_conc
     print("=" * 78)
     print("Standalone RDMA Full-KVCache Prefetch Benchmark")
     print("=" * 78)
@@ -422,7 +514,14 @@ def main() -> None:
     print(f"ib_dev:         {args.ib_dev} (single NIC)")
     print(f"KV shape:       [tokens, {args.num_layers} layers, {args.per_layer_kv_bytes} B/layer]")
     print(f"max transfer:   {max_transfer / 1e9:.3f} GB/request")
-    print(f"buffer memory:  {2 * max_transfer / 1e9:.3f} GB per case (shared across concurrency)")
+    print(
+        f"host memory:    {max_host_bytes / 1e9:.3f} GB max per case "
+        f"(1× remote + {max_conc}× landing + {max_conc}× layer-first output)"
+    )
+    print(
+        f"transient tmp:  up to {max_transient_bytes / 1e9:.3f} GB "
+        "during concurrent permute(...).contiguous()"
+    )
     print(
         f"warmup:        {args.warmup_batches} batch(es); "
         f"measured requests = concurrency * {args.requests_per_concurrency}"
