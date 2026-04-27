@@ -36,6 +36,9 @@ replica transfers (read-only, NIC-side).
 Build the extension first:
 
     cd test/cxl_utils && make rdma PYTHON=/path/to/python
+
+By default this writes one run log under ``--output-dir`` (one compact line per
+case). Pass ``--export-json-csv`` to also emit the JSON/CSV summary at the end.
 """
 
 from __future__ import annotations
@@ -48,7 +51,7 @@ import sysconfig
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, TextIO
 
 import numpy as np
 
@@ -86,6 +89,13 @@ def ctx_tag(tokens: int) -> str:
     if tokens % 1024 == 0:
         return f"{tokens // 1024}k"
     return str(tokens)
+
+
+def log_line(f: TextIO | None, text: str) -> None:
+    if f is None:
+        return
+    f.write(text.rstrip("\n") + "\n")
+    f.flush()
 
 
 def touch_buffer(buf: torch.Tensor, value: int, page_bytes: int = 4096) -> None:
@@ -328,17 +338,19 @@ def run_case(
     max_wr: int,
     touch: bool,
     dry_run: bool,
+    log_f: TextIO | None = None,
 ) -> Dict[str, object]:
     bytes_per_token = num_layers * per_layer_kv_bytes
     total_bytes = context_tokens * bytes_per_token
     total_gb = total_bytes / 1e9
 
-    print(
+    start_line = (
         f"\nctx={ctx_tag(context_tokens):>4s} concurrency={concurrency:>3d} "
         f"requests={concurrency * measured_batches:>4d} "
         f"transfer/request={total_gb:.3f} GB "
         f"({context_tokens} tokens x {num_layers} layers x {per_layer_kv_bytes} B)"
     )
+    print(start_line)
 
     base = {
         "context_tokens": context_tokens,
@@ -360,6 +372,10 @@ def run_case(
         "remote_gid_index": remote_gid_index,
     }
     if dry_run:
+        log_line(
+            log_f,
+            f"ctx={ctx_tag(context_tokens):>4s} c={concurrency:3d} dry_run",
+        )
         return {**base, "summary": {}}
     if torch is None:
         raise RuntimeError(
@@ -422,12 +438,27 @@ def run_case(
         del layer_first_buf
 
     summary = measured["summary"]
-    print(
+    detail_line = (
         "  avg_prefetch={avg_kvcache_prefetch_ms:.3f} ms "
         "(rdma={avg_rdma_read_ms:.3f} ms, layout={avg_layout_convert_ms:.3f} ms) "
         "p50={p50_kvcache_prefetch_ms:.3f} ms "
         "p99={p99_kvcache_prefetch_ms:.3f} ms "
         "agg_bw={aggregate_bw_gb_s:.3f} GB/s".format(**summary)
+    )
+    print(detail_line)
+    log_line(
+        log_f,
+        "ctx={:>4s} c={:3d} req={:4d} xfr={:.3f}GB  "
+        "avg={:.3f}ms rdma={:.3f}ms layout={:.3f}ms  agg={:.3f}GB/s".format(
+            ctx_tag(context_tokens),
+            concurrency,
+            concurrency * measured_batches,
+            total_gb,
+            float(summary["avg_kvcache_prefetch_ms"]),
+            float(summary["avg_rdma_read_ms"]),
+            float(summary["avg_layout_convert_ms"]),
+            float(summary["aggregate_bw_gb_s"]),
+        ),
     )
 
     return {
@@ -582,6 +613,26 @@ def main() -> None:
         "--output-dir",
         default=str(ROOT / "results_rdma_kvcache_bulk_prefetch"),
     )
+    parser.add_argument(
+        "--log-file",
+        "--stream-file",
+        default=None,
+        dest="log_file",
+        help="Path for the run log (one line per case, flushed as each finishes). "
+        "Default: <output-dir>/rdma_kvcache_bulk_prefetch_<ts>.log",
+    )
+    parser.add_argument(
+        "--no-log",
+        "--no-stream",
+        action="store_true",
+        dest="no_log",
+        help="Do not write the run log file.",
+    )
+    parser.add_argument(
+        "--export-json-csv",
+        action="store_true",
+        help="Also write rdma_kvcache_bulk_prefetch_<ts>.json and .csv at the end.",
+    )
     args = parser.parse_args()
 
     contexts = parse_int_list(args.contexts)
@@ -600,6 +651,27 @@ def main() -> None:
         parser.error("--local-port-num and --remote-port-num must be >= 1")
     if args.local_gid_index < 0 or args.remote_gid_index < 0:
         parser.error("--local-gid-index and --remote-gid-index must be >= 0")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    if args.no_log:
+        log_path: Path | None = None
+    elif args.log_file:
+        log_path = Path(args.log_file)
+    else:
+        log_path = out_dir / f"rdma_kvcache_bulk_prefetch_{ts}.log"
+
+    log_f: TextIO | None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_f = open(log_path, "w", encoding="utf-8", newline="\n")
+        log_line(
+            log_f,
+            f"# {time.strftime('%Y-%m-%d %H:%M:%S')}  {' '.join(sys.argv)}",
+        )
+    else:
+        log_f = None
 
     max_context = max(contexts)
     max_conc = max(concurrencies)
@@ -642,67 +714,81 @@ def main() -> None:
         f"warmup:        {args.warmup_batches} batch(es); "
         f"measured requests = concurrency * {args.requests_per_concurrency}"
     )
+    try:
+        rdma_ext = None if args.dry_run else load_rdma_extension()
+        all_cases: List[Dict[str, object]] = []
 
-    rdma_ext = None if args.dry_run else load_rdma_extension()
-    all_cases: List[Dict[str, object]] = []
+        for context_tokens in contexts:
+            for concurrency in concurrencies:
+                case = run_case(
+                    rdma_ext=rdma_ext,
+                    context_tokens=context_tokens,
+                    concurrency=concurrency,
+                    ib_dev=args.ib_dev,
+                    remote_ib_dev=args.remote_ib_dev,
+                    local_port_num=args.local_port_num,
+                    remote_port_num=args.remote_port_num,
+                    local_gid_index=args.local_gid_index,
+                    remote_gid_index=args.remote_gid_index,
+                    num_layers=args.num_layers,
+                    per_layer_kv_bytes=args.per_layer_kv_bytes,
+                    warmup_batches=args.warmup_batches,
+                    measured_batches=args.requests_per_concurrency,
+                    max_wr=args.max_wr,
+                    touch=not args.no_touch,
+                    dry_run=args.dry_run,
+                    log_f=log_f,
+                )
+                all_cases.append(case)
 
-    for context_tokens in contexts:
-        for concurrency in concurrencies:
-            case = run_case(
-                rdma_ext=rdma_ext,
-                context_tokens=context_tokens,
-                concurrency=concurrency,
-                ib_dev=args.ib_dev,
-                remote_ib_dev=args.remote_ib_dev,
-                local_port_num=args.local_port_num,
-                remote_port_num=args.remote_port_num,
-                local_gid_index=args.local_gid_index,
-                remote_gid_index=args.remote_gid_index,
-                num_layers=args.num_layers,
-                per_layer_kv_bytes=args.per_layer_kv_bytes,
-                warmup_batches=args.warmup_batches,
-                measured_batches=args.requests_per_concurrency,
-                max_wr=args.max_wr,
-                touch=not args.no_touch,
-                dry_run=args.dry_run,
+        json_path: Path | None = None
+        csv_path: Path | None = None
+        if args.export_json_csv:
+            json_path = out_dir / f"rdma_kvcache_bulk_prefetch_{ts}.json"
+            csv_path = out_dir / f"rdma_kvcache_bulk_prefetch_{ts}.csv"
+            payload = {
+                "config": {
+                    "contexts": contexts,
+                    "concurrency": concurrencies,
+                    "ib_dev": args.ib_dev,
+                    "remote_ib_dev": args.remote_ib_dev,
+                    "transport": "two_device" if args.remote_ib_dev is not None else "loopback",
+                    "local_port_num": args.local_port_num,
+                    "remote_port_num": args.remote_port_num,
+                    "local_gid_index": args.local_gid_index,
+                    "remote_gid_index": args.remote_gid_index,
+                    "num_layers": args.num_layers,
+                    "per_layer_kv_bytes": args.per_layer_kv_bytes,
+                    "bytes_per_token": bytes_per_token,
+                    "warmup_batches": args.warmup_batches,
+                    "requests_per_concurrency": args.requests_per_concurrency,
+                    "max_wr": args.max_wr,
+                    "touch": not args.no_touch,
+                    "dry_run": args.dry_run,
+                    "run_timestamp": ts,
+                    "output_dir": str(out_dir),
+                    "log_file": str(log_path) if log_path else None,
+                },
+                "cases": all_cases,
+            }
+            with json_path.open("w") as f:
+                json.dump(payload, f, indent=2)
+            write_csv(csv_path, all_cases)
+        if log_f is not None and log_path is not None:
+            log_line(
+                log_f, f"# end {time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            all_cases.append(case)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    json_path = out_dir / f"rdma_kvcache_bulk_prefetch_{ts}.json"
-    csv_path = out_dir / f"rdma_kvcache_bulk_prefetch_{ts}.csv"
-
-    payload = {
-        "config": {
-            "contexts": contexts,
-            "concurrency": concurrencies,
-            "ib_dev": args.ib_dev,
-            "remote_ib_dev": args.remote_ib_dev,
-            "transport": "two_device" if args.remote_ib_dev is not None else "loopback",
-            "local_port_num": args.local_port_num,
-            "remote_port_num": args.remote_port_num,
-            "local_gid_index": args.local_gid_index,
-            "remote_gid_index": args.remote_gid_index,
-            "num_layers": args.num_layers,
-            "per_layer_kv_bytes": args.per_layer_kv_bytes,
-            "bytes_per_token": bytes_per_token,
-            "warmup_batches": args.warmup_batches,
-            "requests_per_concurrency": args.requests_per_concurrency,
-            "max_wr": args.max_wr,
-            "touch": not args.no_touch,
-            "dry_run": args.dry_run,
-        },
-        "cases": all_cases,
-    }
-    with json_path.open("w") as f:
-        json.dump(payload, f, indent=2)
-    write_csv(csv_path, all_cases)
-
-    print("\nSaved:")
-    print(f"  JSON: {json_path}")
-    print(f"  CSV:  {csv_path}")
+        if log_path is not None or json_path is not None:
+            print("\nSaved:")
+            if log_path is not None:
+                print(f"  log:  {log_path.resolve()}")
+            if json_path is not None and csv_path is not None:
+                print(f"  JSON: {json_path}")
+                print(f"  CSV:  {csv_path}")
+    finally:
+        if log_f is not None:
+            log_f.close()
 
 
 if __name__ == "__main__":
