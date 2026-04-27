@@ -64,6 +64,7 @@ if [[ "${START_SERVER:-1}" == "1" ]]; then
     --enable-dp-attention \
     --trust-remote-code \
     --dtype bfloat16 \
+    --disable-cuda-graph \
     --allow-auto-truncate \
     --max-total-tokens 500000 \
     --mem-fraction-static 0.85 \
