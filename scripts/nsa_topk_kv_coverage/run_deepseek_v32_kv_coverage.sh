@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${ROOT_DIR}"
 
 MODEL_PATH="${MODEL_PATH:-/data3/yt/models/DeepSeek-V3.2-AWQ}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-/data1/yt/miniconda3/envs/sgl/bin/python}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-26666}"
 BASE_URL="${BASE_URL:-http://${HOST}:${PORT}}"
