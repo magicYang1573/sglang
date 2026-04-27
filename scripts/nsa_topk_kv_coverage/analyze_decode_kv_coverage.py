@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Analyze decode-time NSA top-k history KV coverage."""
+"""Analyze decode-time NSA top-k: per-layer ratio of used KV slots vs total prompt KV slots.
+
+Each transformer layer has its own KV tensors; sequence positions are shared indices.
+For a fixed prompt length *P*, each layer has *P* prompt-side KV slots (positions 0..P-1).
+
+Metrics (per request, per layer):
+- total_prompt_kv_slots: P (denominator for "全部 KV" in prompt range).
+- unique_kv_slots_used_decode_union: distinct positions in [0, P) ever appearing in logged
+  top-k across all decode steps (union).
+- kv_union_used_to_total_prompt: union / P — fraction of prompt KV ever read during decode.
+- mean_per_decode_step_used_to_total_prompt: mean over decode steps of
+  (count of top-k indices in [0, P) / P). Counts duplicates within one step if any.
+
+Summary files aggregate these per (prompt_length, layer_id) across requests.
+"""
 
 from __future__ import annotations
 
@@ -61,10 +75,6 @@ def _length_label(length: int) -> str:
     return str(length)
 
 
-def _rid_from_log_path(path: Path) -> str:
-    return path.stem
-
-
 def _infer_prompt_len_from_rid(rid: str) -> int:
     match = re.match(r"ctx(\d+)k_", rid)
     if not match:
@@ -100,11 +110,12 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
     per_request_rows: List[Dict[str, Any]] = []
 
     for log_path in sorted(log_dir.glob("*.bin")):
-        rid = _rid_from_log_path(log_path)
+        rid = log_path.stem
         meta = manifest_by_rid.get(rid, {})
         prompt_len = int(meta.get("target_prompt_len") or _infer_prompt_len_from_rid(rid))
         output_len = int(meta.get("output_len", 0))
         length_label = _length_label(prompt_len)
+        denom = max(prompt_len, 1)
 
         records = _read_bin_file(log_path)
         if len(records) == 0:
@@ -116,15 +127,16 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
         request_union: set[int] = set()
         for layer_id in sorted(int(x) for x in np.unique(records["layer_id"])):
             layer_records = records[records["layer_id"] == layer_id]
+            in_prompt = (layer_records["topk"] >= 0) & (layer_records["topk"] < prompt_len)
+            counts_in_prompt = np.sum(in_prompt, axis=1).astype(np.float64)
+            mean_step_ratio = float(np.mean(counts_in_prompt / denom))
+
             flat_topk = layer_records["topk"].reshape(-1)
             valid = flat_topk[(flat_topk >= 0) & (flat_topk < prompt_len)]
             unique = np.unique(valid)
+            union_n = int(len(unique))
             request_union.update(int(x) for x in unique.tolist())
-            avg_valid_topk = (
-                float(np.mean(np.sum((layer_records["topk"] >= 0) & (layer_records["topk"] < prompt_len), axis=1)))
-                if len(layer_records) > 0
-                else 0.0
-            )
+            union_ratio = union_n / denom
 
             per_layer_rows.append(
                 {
@@ -133,15 +145,17 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
                     "target_prompt_len": prompt_len,
                     "output_len": output_len,
                     "layer_id": layer_id,
-                    "decode_records": len(layer_records),
-                    "unique_history_kv_used": len(unique),
-                    "coverage": _safe_float(len(unique) / prompt_len),
-                    "avg_history_topk_per_decode": _safe_float(avg_valid_topk),
+                    "total_prompt_kv_slots": prompt_len,
+                    "decode_steps": len(layer_records),
+                    "unique_kv_slots_used_decode_union": union_n,
+                    "kv_union_used_to_total_prompt": _safe_float(union_ratio),
+                    "mean_per_decode_step_used_to_total_prompt": _safe_float(mean_step_ratio),
                     "min_token_pos": int(np.min(layer_records["token_pos"])),
                     "max_token_pos": int(np.max(layer_records["token_pos"])),
                 }
             )
 
+        union_any = len(request_union)
         per_request_rows.append(
             {
                 "rid": rid,
@@ -149,43 +163,39 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
                 "target_prompt_len": prompt_len,
                 "output_len": output_len,
                 "num_layers": len(set(int(x) for x in records["layer_id"])),
-                "decode_records": len(records),
-                "unique_history_kv_used_any_layer": len(request_union),
-                "coverage_any_layer": _safe_float(len(request_union) / prompt_len),
+                "decode_steps_total": len(records),
+                "unique_kv_slots_used_any_layer_union": union_any,
+                "kv_union_used_to_total_prompt_any_layer": _safe_float(union_any / denom),
             }
         )
 
-    _write_csv(
-        output_dir / "per_request_layer.csv",
-        per_layer_rows,
-        [
-            "rid",
-            "length_label",
-            "target_prompt_len",
-            "output_len",
-            "layer_id",
-            "decode_records",
-            "unique_history_kv_used",
-            "coverage",
-            "avg_history_topk_per_decode",
-            "min_token_pos",
-            "max_token_pos",
-        ],
-    )
-    _write_csv(
-        output_dir / "per_request.csv",
-        per_request_rows,
-        [
-            "rid",
-            "length_label",
-            "target_prompt_len",
-            "output_len",
-            "num_layers",
-            "decode_records",
-            "unique_history_kv_used_any_layer",
-            "coverage_any_layer",
-        ],
-    )
+    per_layer_fields = [
+        "rid",
+        "length_label",
+        "target_prompt_len",
+        "output_len",
+        "layer_id",
+        "total_prompt_kv_slots",
+        "decode_steps",
+        "unique_kv_slots_used_decode_union",
+        "kv_union_used_to_total_prompt",
+        "mean_per_decode_step_used_to_total_prompt",
+        "min_token_pos",
+        "max_token_pos",
+    ]
+    _write_csv(output_dir / "per_request_layer.csv", per_layer_rows, per_layer_fields)
+
+    per_request_fields = [
+        "rid",
+        "length_label",
+        "target_prompt_len",
+        "output_len",
+        "num_layers",
+        "decode_steps_total",
+        "unique_kv_slots_used_any_layer_union",
+        "kv_union_used_to_total_prompt_any_layer",
+    ]
+    _write_csv(output_dir / "per_request.csv", per_request_rows, per_request_fields)
 
     by_length_layer: Dict[tuple[int, int], List[Dict[str, Any]]] = defaultdict(list)
     for row in per_layer_rows:
@@ -193,21 +203,23 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
 
     summary_layer_rows: List[Dict[str, Any]] = []
     for (prompt_len, layer_id), rows in sorted(by_length_layer.items()):
-        coverages = [float(row["coverage"]) for row in rows]
-        unique_counts = [float(row["unique_history_kv_used"]) for row in rows]
-        coverage_stats = _summarize(coverages)
-        unique_stats = _summarize(unique_counts)
+        union_ratios = [float(row["kv_union_used_to_total_prompt"]) for row in rows]
+        step_ratios = [float(row["mean_per_decode_step_used_to_total_prompt"]) for row in rows]
+        u_stats = _summarize([float(row["unique_kv_slots_used_decode_union"]) for row in rows])
+        ur_stats = _summarize(union_ratios)
+        sr_stats = _summarize(step_ratios)
         summary_layer_rows.append(
             {
                 "length_label": _length_label(prompt_len),
                 "target_prompt_len": prompt_len,
                 "layer_id": layer_id,
                 "num_requests": len(rows),
-                "mean_unique_history_kv_used": _safe_float(unique_stats["mean"]),
-                "mean_coverage": _safe_float(coverage_stats["mean"]),
-                "std_coverage": _safe_float(coverage_stats["std"]),
-                "p50_coverage": _safe_float(coverage_stats["p50"]),
-                "p90_coverage": _safe_float(coverage_stats["p90"]),
+                "mean_unique_kv_slots_used_decode_union": _safe_float(u_stats["mean"]),
+                "mean_kv_union_used_to_total_prompt": _safe_float(ur_stats["mean"]),
+                "std_kv_union_used_to_total_prompt": _safe_float(ur_stats["std"]),
+                "p50_kv_union_used_to_total_prompt": _safe_float(ur_stats["p50"]),
+                "p90_kv_union_used_to_total_prompt": _safe_float(ur_stats["p90"]),
+                "mean_per_decode_step_used_to_total_prompt": _safe_float(sr_stats["mean"]),
             }
         )
 
@@ -219,11 +231,12 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
             "target_prompt_len",
             "layer_id",
             "num_requests",
-            "mean_unique_history_kv_used",
-            "mean_coverage",
-            "std_coverage",
-            "p50_coverage",
-            "p90_coverage",
+            "mean_unique_kv_slots_used_decode_union",
+            "mean_kv_union_used_to_total_prompt",
+            "std_kv_union_used_to_total_prompt",
+            "p50_kv_union_used_to_total_prompt",
+            "p90_kv_union_used_to_total_prompt",
+            "mean_per_decode_step_used_to_total_prompt",
         ],
     )
 
@@ -233,20 +246,17 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
 
     summary_rows: List[Dict[str, Any]] = []
     for prompt_len, rows in sorted(by_length.items()):
-        coverages = [float(row["coverage_any_layer"]) for row in rows]
-        unique_counts = [float(row["unique_history_kv_used_any_layer"]) for row in rows]
-        coverage_stats = _summarize(coverages)
-        unique_stats = _summarize(unique_counts)
+        ratios = [float(row["kv_union_used_to_total_prompt_any_layer"]) for row in rows]
+        r_stats = _summarize(ratios)
         summary_rows.append(
             {
                 "length_label": _length_label(prompt_len),
                 "target_prompt_len": prompt_len,
                 "num_requests": len(rows),
-                "mean_unique_history_kv_used_any_layer": _safe_float(unique_stats["mean"]),
-                "mean_coverage_any_layer": _safe_float(coverage_stats["mean"]),
-                "std_coverage_any_layer": _safe_float(coverage_stats["std"]),
-                "p50_coverage_any_layer": _safe_float(coverage_stats["p50"]),
-                "p90_coverage_any_layer": _safe_float(coverage_stats["p90"]),
+                "mean_kv_union_used_to_total_prompt_any_layer": _safe_float(r_stats["mean"]),
+                "std_kv_union_used_to_total_prompt_any_layer": _safe_float(r_stats["std"]),
+                "p50_kv_union_used_to_total_prompt_any_layer": _safe_float(r_stats["p50"]),
+                "p90_kv_union_used_to_total_prompt_any_layer": _safe_float(r_stats["p90"]),
             }
         )
 
@@ -257,11 +267,10 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
             "length_label",
             "target_prompt_len",
             "num_requests",
-            "mean_unique_history_kv_used_any_layer",
-            "mean_coverage_any_layer",
-            "std_coverage_any_layer",
-            "p50_coverage_any_layer",
-            "p90_coverage_any_layer",
+            "mean_kv_union_used_to_total_prompt_any_layer",
+            "std_kv_union_used_to_total_prompt_any_layer",
+            "p50_kv_union_used_to_total_prompt_any_layer",
+            "p90_kv_union_used_to_total_prompt_any_layer",
         ],
     )
     print(f"Wrote analysis CSVs to {output_dir}")

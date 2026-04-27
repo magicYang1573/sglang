@@ -10,7 +10,7 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-26666}"
 BASE_URL="${BASE_URL:-http://${HOST}:${PORT}}"
 
-run_dir="/data2/ljr/a/sglang/deepseek_v32_$(date +%Y%m%d_%H%M%S)"
+run_dir="${RUN_ROOT:-/data2/ljr/a/sglang/exp-topk}/deepseek_v32_$(date +%Y%m%d_%H%M%S)"
 SERVER_PID=""
 
 mkdir -p "${run_dir}/topk_logs" "${run_dir}/analysis"
@@ -81,7 +81,7 @@ echo "Generating fixed-length ShareGPT-derived dataset"
 "${PYTHON_BIN}" scripts/nsa_topk_kv_coverage/generate_mixed_sharegpt_dataset.py \
   --model "${MODEL_PATH}" \
   --output-dir "${run_dir}" \
-  --lengths 16384,32768,65536,131072 \
+  --lengths "${LENGTHS:-16384,32768,65536,131072}" \
   --requests-per-length "${REQUESTS_PER_LENGTH:-4}" \
   --output-len 1000 \
   --seed 0 \
