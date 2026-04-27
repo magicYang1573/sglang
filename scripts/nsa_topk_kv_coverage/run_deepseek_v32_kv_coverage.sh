@@ -107,12 +107,19 @@ else
 fi
 
 echo "Sending mixed-length requests"
+# Client sampling defaults to non-greedy (see run_mixed_length_requests.py) to reduce
+# verbatim loops when min_tokens==max_tokens and ignore_eos. Set GREEDY_DECODE=1 for legacy greedy.
+REQUEST_SAMPLING_ARGS=()
+if [[ "${GREEDY_DECODE:-0}" == "1" ]]; then
+  REQUEST_SAMPLING_ARGS+=(--greedy-decode)
+fi
 PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -u scripts/nsa_topk_kv_coverage/run_mixed_length_requests.py \
   --base-url "${BASE_URL}" \
   --model "${MODEL_PATH}" \
   --dataset-jsonl "${DATASET_CACHE_DIR}/dataset.jsonl" \
   --output-jsonl "${run_dir}/request_outputs.jsonl" \
   --concurrency "${CONCURRENCY:-64}" \
+  "${REQUEST_SAMPLING_ARGS[@]}" \
   2>&1 | tee "${run_dir}/run_requests.log"
 
 echo "Analyzing decode-time KV coverage"

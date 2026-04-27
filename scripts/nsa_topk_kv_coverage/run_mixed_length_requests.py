@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Send mixed-length fixed-token prompts to an SGLang OpenAI completions server."""
+"""Send mixed-length fixed-token prompts to an SGLang OpenAI completions server.
+
+Why greedy outputs often "loop"
+--------------------------------
+With ``temperature=0``, ``min_tokens == max_tokens``, and ``ignore_eos=True``, the model
+must emit exactly N new tokens. Greedy decoding repeatedly picks the single highest-probability
+next token; on long forced continuations this often locks into repeated n-grams (especially
+when the prompt is synthetic token soup with no crisp continuation).
+
+Defaults use stronger stochastic sampling plus repetition / frequency / presence penalties
+while still requesting N tokens and ``ignore_eos=True`` so decode-length stays N for NSA
+logging experiments. Tune flags if text becomes incoherent or over-penalized.
+Use ``--greedy-decode`` to restore the old fully-greedy behavior.
+"""
 
 from __future__ import annotations
 
@@ -8,6 +21,7 @@ import asyncio
 import json
 import sys
 import time
+import zlib
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -24,35 +38,42 @@ def _load_dataset(path: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def _stable_seed_for_rid(rid: str) -> int:
+    """32-bit positive int for sampling_seed (reproducible per rid)."""
+    return (zlib.crc32(rid.encode("utf-8")) & 0x7FFFFFFF) or 1
+
+
 async def _send_one(
     session: aiohttp.ClientSession,
     url: str,
     model: str,
     row: Dict[str, Any],
     extra_body: Dict[str, Any],
+    sampling: Dict[str, Any],
 ) -> Dict[str, Any]:
     rid = row["rid"]
     output_len = int(row["output_len"])
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model,
         "prompt": row["input_ids"],
         "max_tokens": output_len,
         "min_tokens": output_len,
-        "temperature": 0.0,
-        "ignore_eos": True,
         "stream": True,
+        "ignore_eos": True,
         "rid": rid,
     }
+    payload.update(sampling)
     payload.update(extra_body)
 
     start = time.perf_counter()
-    generated_text = []
+    generated_text: List[str] = []
     chunk_count = 0
     result: Dict[str, Any] = {
         "rid": rid,
         "target_prompt_len": row["target_prompt_len"],
         "requested_output_len": output_len,
         "success": False,
+        "sampling": {k: v for k, v in sampling.items() if k != "seed" or v is not None},
     }
 
     try:
@@ -97,6 +118,26 @@ async def _run(args: argparse.Namespace) -> None:
     extra_body = json.loads(args.extra_request_body) if args.extra_request_body else {}
     url = args.base_url.rstrip("/") + "/v1/completions"
 
+    if args.greedy_decode:
+        sampling = {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "repetition_penalty": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "seed": None,
+        }
+    else:
+        sampling = {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "repetition_penalty": args.repetition_penalty,
+            "frequency_penalty": args.frequency_penalty,
+            "presence_penalty": args.presence_penalty,
+        }
+
     timeout = aiohttp.ClientTimeout(total=args.timeout)
     connector = aiohttp.TCPConnector(limit=args.concurrency)
     semaphore = asyncio.Semaphore(args.concurrency)
@@ -105,7 +146,16 @@ async def _run(args: argparse.Namespace) -> None:
 
         async def limited(row: Dict[str, Any]) -> Dict[str, Any]:
             async with semaphore:
-                return await _send_one(session, url, args.model, row, extra_body)
+                samp = dict(sampling)
+                if args.greedy_decode:
+                    samp.pop("seed", None)
+                elif args.seed is not None:
+                    samp["seed"] = int(args.seed)
+                elif args.per_rid_seed:
+                    samp["seed"] = _stable_seed_for_rid(row["rid"])
+                else:
+                    samp.pop("seed", None)
+                return await _send_one(session, url, args.model, row, extra_body, samp)
 
         tasks = [asyncio.create_task(limited(row)) for row in rows]
         completed = 0
@@ -139,7 +189,61 @@ def main() -> None:
     parser.add_argument(
         "--extra-request-body",
         default="",
-        help="JSON object merged into every completions request.",
+        help="JSON object merged into every completions request (overrides script defaults).",
+    )
+    parser.add_argument(
+        "--greedy-decode",
+        action="store_true",
+        help="Use temperature=0 and no penalties (old behavior; more repetitive on long N).",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.82,
+        help=">0 reduces repetitive loops when min_tokens forces long completions.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.95,
+        help="Nucleus mass; slightly higher widens alternatives vs verbatim loops.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=64,
+        help="If >0, limits tail of sampling distribution (SGLang extension).",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.22,
+        help=">1 penalizes reusing the same token ids (stronger anti-loop).",
+    )
+    parser.add_argument(
+        "--frequency-penalty",
+        type=float,
+        default=0.55,
+        help="Penalizes tokens proportional to how often they already appeared.",
+    )
+    parser.add_argument(
+        "--presence-penalty",
+        type=float,
+        default=0.28,
+        help="Penalizes any token that has already appeared at least once.",
+    )
+    parser.set_defaults(per_rid_seed=True)
+    parser.add_argument(
+        "--no-per-rid-seed",
+        dest="per_rid_seed",
+        action="store_false",
+        help="Do not set sampling seed (less reproducible across runs).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Fixed sampling seed for all requests (overrides per-rid seed).",
     )
     args = parser.parse_args()
     asyncio.run(_run(args))
