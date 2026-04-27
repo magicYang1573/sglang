@@ -13,6 +13,10 @@ Metrics (per request, per layer):
   (count of top-k indices in [0, P) / P). Counts duplicates within one step if any.
 
 Summary files aggregate these per (prompt_length, layer_id) across requests.
+
+Additionally, under ``<output_dir>/by_length/len_<16k|32k|...>/`` the same per-length
+slices are written (``per_request_layer.csv``, ``per_request.csv``, ``summary_by_layer.csv``,
+``summary.csv``) so each context length can be inspected without filtering the global CSVs.
 """
 
 from __future__ import annotations
@@ -197,6 +201,28 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
     ]
     _write_csv(output_dir / "per_request.csv", per_request_rows, per_request_fields)
 
+    summary_layer_fields = [
+        "length_label",
+        "target_prompt_len",
+        "layer_id",
+        "num_requests",
+        "mean_unique_kv_slots_used_decode_union",
+        "mean_kv_union_used_to_total_prompt",
+        "std_kv_union_used_to_total_prompt",
+        "p50_kv_union_used_to_total_prompt",
+        "p90_kv_union_used_to_total_prompt",
+        "mean_per_decode_step_used_to_total_prompt",
+    ]
+    summary_length_fields = [
+        "length_label",
+        "target_prompt_len",
+        "num_requests",
+        "mean_kv_union_used_to_total_prompt_any_layer",
+        "std_kv_union_used_to_total_prompt_any_layer",
+        "p50_kv_union_used_to_total_prompt_any_layer",
+        "p90_kv_union_used_to_total_prompt_any_layer",
+    ]
+
     by_length_layer: Dict[tuple[int, int], List[Dict[str, Any]]] = defaultdict(list)
     for row in per_layer_rows:
         by_length_layer[(int(row["target_prompt_len"]), int(row["layer_id"]))].append(row)
@@ -226,18 +252,7 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
     _write_csv(
         output_dir / "summary_by_length_layer.csv",
         summary_layer_rows,
-        [
-            "length_label",
-            "target_prompt_len",
-            "layer_id",
-            "num_requests",
-            "mean_unique_kv_slots_used_decode_union",
-            "mean_kv_union_used_to_total_prompt",
-            "std_kv_union_used_to_total_prompt",
-            "p50_kv_union_used_to_total_prompt",
-            "p90_kv_union_used_to_total_prompt",
-            "mean_per_decode_step_used_to_total_prompt",
-        ],
+        summary_layer_fields,
     )
 
     by_length: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
@@ -263,17 +278,28 @@ def analyze(log_dir: Path, manifest_path: Path, output_dir: Path) -> None:
     _write_csv(
         output_dir / "summary_by_length.csv",
         summary_rows,
-        [
-            "length_label",
-            "target_prompt_len",
-            "num_requests",
-            "mean_kv_union_used_to_total_prompt_any_layer",
-            "std_kv_union_used_to_total_prompt_any_layer",
-            "p50_kv_union_used_to_total_prompt_any_layer",
-            "p90_kv_union_used_to_total_prompt_any_layer",
-        ],
+        summary_length_fields,
     )
+
+    by_len_root = output_dir / "by_length"
+    for prompt_len in sorted(
+        {int(r["target_prompt_len"]) for r in per_request_rows},
+        key=int,
+    ):
+        lab = _length_label(prompt_len)
+        sub = by_len_root / f"len_{lab}"
+        r_pl = [r for r in per_layer_rows if int(r["target_prompt_len"]) == prompt_len]
+        r_pr = [r for r in per_request_rows if int(r["target_prompt_len"]) == prompt_len]
+        r_sl = [r for r in summary_layer_rows if int(r["target_prompt_len"]) == prompt_len]
+        r_one = [r for r in summary_rows if int(r["target_prompt_len"]) == prompt_len]
+        _write_csv(sub / "per_request_layer.csv", r_pl, per_layer_fields)
+        _write_csv(sub / "per_request.csv", r_pr, per_request_fields)
+        _write_csv(sub / "summary_by_layer.csv", r_sl, summary_layer_fields)
+        if r_one:
+            _write_csv(sub / "summary.csv", r_one, summary_length_fields)
+
     print(f"Wrote analysis CSVs to {output_dir}")
+    print(f"Per-length slices: {by_len_root}/len_<label>/")
 
 
 def main() -> None:
