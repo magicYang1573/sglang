@@ -22,9 +22,9 @@ up to ``concurrency`` RDMA operations can overlap in time on one RNIC.  The
 per-request latency includes both RDMA READ (remote MR -> landing MR) and the
 required local page-first -> layer-first layout conversion.
 
-To avoid host-side data races, each of the ``concurrency`` QPs uses a
-non-overlapping slice of a larger landing buffer via ``bulk_read_offset`` when
-available.  The remote read source is the same logical KV buffer for all
+To avoid host-side data races and excessive MR registration pressure, each of
+the ``concurrency`` QPs registers only its own non-overlapping slice of a larger
+landing buffer.  The remote read source is the same logical KV buffer for all
 replica transfers (read-only, NIC-side).
 
 Build the extension first:
@@ -142,22 +142,41 @@ def init_contexts(
     ib_dev: str,
     remote_buf: torch.Tensor,
     landing_buf: torch.Tensor,
+    landing_stride_bytes: int,
+    local_slice_bytes: int,
     concurrency: int,
     max_wr: int,
 ):
     contexts = []
     remote_size = remote_buf.numel() * remote_buf.element_size()
     landing_size = landing_buf.numel() * landing_buf.element_size()
-    for _ in range(concurrency):
-        ctx = rdma_ext.RDMAContext()
-        ctx.init(
-            ib_dev,
-            landing_buf.data_ptr(),
-            landing_size,
-            remote_buf.data_ptr(),
-            remote_size,
-            max_wr,
+    if landing_size < landing_stride_bytes * concurrency:
+        raise ValueError(
+            f"landing buffer too small: landing_size={landing_size}, "
+            f"landing_stride_bytes={landing_stride_bytes}, concurrency={concurrency}"
         )
+
+    for worker_idx in range(concurrency):
+        ctx = rdma_ext.RDMAContext()
+        local_offset = worker_idx * landing_stride_bytes
+        try:
+            ctx.init(
+                ib_dev,
+                landing_buf.data_ptr() + local_offset,
+                local_slice_bytes,
+                remote_buf.data_ptr(),
+                remote_size,
+                max_wr,
+            )
+        except RuntimeError as exc:
+            registered_gb = (worker_idx + 1) * (local_slice_bytes + remote_size) / 1e9
+            raise RuntimeError(
+                f"{exc} while registering worker {worker_idx + 1}/{concurrency}; "
+                f"per-worker MR is local={local_slice_bytes / 1e9:.3f} GB + "
+                f"remote={remote_size / 1e9:.3f} GB, "
+                f"attempted registered footprint={registered_gb:.3f} GB. "
+                "This usually means locked-memory/MR resources are exhausted."
+            ) from exc
         contexts.append(ctx)
     return contexts
 
@@ -176,7 +195,6 @@ def run_concurrent_bulk_read(
     layer_first_buf: torch.Tensor,
     total_bytes: int,
     landing_stride_bytes: int,
-    use_bulk_read_offset: bool,
     context_tokens: int,
     num_layers: int,
     per_layer_kv_bytes: int,
@@ -206,12 +224,7 @@ def run_concurrent_bulk_read(
                     next_request += 1
                 try:
                     req_t0 = time.perf_counter()
-                    if use_bulk_read_offset:
-                        rdma_elapsed_us = float(
-                            ctx.bulk_read_offset(0, local_offset, total_bytes)
-                        )
-                    else:
-                        rdma_elapsed_us = float(ctx.bulk_read(total_bytes))
+                    rdma_elapsed_us = float(ctx.bulk_read(total_bytes))
 
                     layout_t0 = time.perf_counter()
                     landing_view = landing_buf.narrow(
@@ -317,22 +330,10 @@ def run_case(
             "Python environment used for SGLang."
         )
 
-    ctx_cls = getattr(rdma_ext, "RDMAContext", None)
-    use_offset = ctx_cls is not None and hasattr(ctx_cls, "bulk_read_offset")
-    if not use_offset:
-        print(
-            "  [WARN] rdma_scatter_ext has no RDMAContext.bulk_read_offset; "
-            "falling back to bulk_read() — concurrent workers may race on the "
-            "same landing range. Rebuild a multi-instance RDMAContext extension."
-        )
-
     # One remote KV buffer, replicated RDMA READs.  Landing and layer-first
     # output are striped per worker so concurrent requests do not race locally.
     remote_buf = torch.empty(total_bytes, dtype=torch.uint8)
-    if use_offset:
-        landing_buf = torch.empty(total_bytes * concurrency, dtype=torch.uint8)
-    else:
-        landing_buf = torch.empty(total_bytes, dtype=torch.uint8)
+    landing_buf = torch.empty(total_bytes * concurrency, dtype=torch.uint8)
     layer_first_buf = torch.empty(
         (concurrency, num_layers, context_tokens, per_layer_kv_bytes),
         dtype=torch.uint8,
@@ -347,6 +348,8 @@ def run_case(
         ib_dev=ib_dev,
         remote_buf=remote_buf,
         landing_buf=landing_buf,
+        landing_stride_bytes=total_bytes,
+        local_slice_bytes=total_bytes,
         concurrency=concurrency,
         max_wr=max_wr,
     )
@@ -357,7 +360,6 @@ def run_case(
             layer_first_buf=layer_first_buf,
             total_bytes=total_bytes,
             landing_stride_bytes=total_bytes,
-            use_bulk_read_offset=use_offset,
             context_tokens=context_tokens,
             num_layers=num_layers,
             per_layer_kv_bytes=per_layer_kv_bytes,
@@ -506,6 +508,7 @@ def main() -> None:
     # additional contiguous layer-first copy, so peak can approach +max_conc.
     max_host_bytes = max_transfer * (1 + 2 * max_conc)
     max_transient_bytes = max_transfer * max_conc
+    max_registered_bytes = max_transfer * 2 * max_conc
     print("=" * 78)
     print("Standalone RDMA Full-KVCache Prefetch Benchmark")
     print("=" * 78)
@@ -521,6 +524,10 @@ def main() -> None:
     print(
         f"transient tmp:  up to {max_transient_bytes / 1e9:.3f} GB "
         "during concurrent permute(...).contiguous()"
+    )
+    print(
+        f"registered MR:  up to {max_registered_bytes / 1e9:.3f} GB "
+        "(each QP registers one landing slice plus the shared remote buffer)"
     )
     print(
         f"warmup:        {args.warmup_batches} batch(es); "
