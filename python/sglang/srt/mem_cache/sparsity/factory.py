@@ -129,6 +129,11 @@ def parse_hisparse_config(server_args) -> SparseConfig:
 def parse_sparse_decode_config(server_args) -> SparseConfig:
     """Parse the new ``--sparse-decode-config`` JSON string, with defaults
     appropriate for the non-native sparse decode path.
+
+    NOTE: ``min_sparse_prompt_len`` is parsed for backward-compat (older
+    tests / configs may still set it) but the runtime no longer consumes
+    it.  Short requests auto-degenerate to dense via
+    ``valid_lengths = clamp(seq_lens, top_k)`` inside the algorithm.
     """
     cfg = _parse_sparse_config(getattr(server_args, "sparse_decode_config", None))
     # Safer defaults for non-native sparse decode.
@@ -138,8 +143,12 @@ def parse_sparse_decode_config(server_args) -> SparseConfig:
         cfg.backend = "fa3"
     if cfg.page_size is None:
         cfg.page_size = 1
-    if cfg.min_sparse_prompt_len is None:
-        cfg.min_sparse_prompt_len = 4096
+    if cfg.min_sparse_prompt_len is not None:
+        logger.warning(
+            "SparseConfig.min_sparse_prompt_len is deprecated and ignored; "
+            "short requests are now handled via "
+            "valid_lengths = clamp(seq_lens, top_k) inside the algorithm."
+        )
     return cfg
 
 

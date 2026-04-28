@@ -128,8 +128,8 @@ flowchart TB
     D1 --> D2["model_runner._forward_raw<br/>coord.wait_for_pending_backup"]
     D2 --> D3["attn_backend.init_forward_metadata<br/>dense base metadata"]
     D3 --> D4{for each layer}
-    D4 --> D5["controller.begin_layer_decode<br/>  algorithm.retrieve_topk<br/>  coord.swap_in_selected_pages<br/>  adapter.adapt_for_attn_metadata"]
-    D5 --> D6["flash_attn_with_kvcache<br/>reads KV from device hot buffer"]
+    D4 --> D5["controller.begin_layer_decode<br/>  algorithm.retrieve_topk<br/>  coord.swap_in_selected_pages<br/>  adapter.build_sparse_call_args"]
+    D5 --> D6["Fa3SparseDecodeBackend.forward_decode<br/>directly calls flash_attn_with_kvcache<br/>with SparseFa3CallArgs"]
     D6 --> D7["controller.end_layer_decode<br/>  algorithm.update_representations"]
     D7 --> D4
   end
@@ -227,37 +227,84 @@ class HiSparseCoordinator:
 
 新路径的"每层"钩子由 **attention backend** 发起，而不是由模型层主动插入（不 monkey-patch、不改 `RadixAttention`）。FA3 后端的 `forward_metadata` 是**每步一次**计算（[flashattention_backend.py 254-595](../../python/sglang/srt/layers/attention/flashattention_backend.py) `init_forward_metadata`），每层 `forward_decode` 读 `self.forward_metadata`；要在每层注入稀疏信息，唯一干净的切点就是 `forward_decode` 入口。
 
-实现方式：**极薄子类 `Fa3SparseDecodeBackend`**，**只覆盖 `forward_decode` 一个方法**，其它（`init_forward_metadata`、CUDA Graph capture/replay、`forward_extend`、spec decode 等）全部继承。**不在 `ModelRunner` 中 import / 持有**；只通过 `attention_registry` 注册，`ServerArgs.get_attention_backends()` 在启用时把 `decode_attention_backend` 字符串改写为 `"fa3_sparse_decode"`，`ModelRunner` 走现有 `HybridAttnBackend` 的 `(prefill=fa3, decode=fa3_sparse_decode)` 组合路径（[model_runner.py 2097-2108](../../python/sglang/srt/model_executor/model_runner.py)）。
+实现方式：**子类 `Fa3SparseDecodeBackend`**，**只覆盖 `forward_decode` 一个方法**——并且**不再调 `super().forward_decode`**，而是**直接调用 `flash_attn_with_kvcache`**，把 controller 给的 `SparseFa3CallArgs` 各字段按形参传进去。这与 NSA `_forward_fa3` 完全同构（[nsa_backend.py 1639-1675](../../python/sglang/srt/layers/attention/nsa_backend.py)）；其它（`init_forward_metadata` / `forward_extend` / CUDA Graph capture/replay 等）全部继承父类。
+
+**不在 `ModelRunner` 中 import / 持有**；只通过 `attention_registry` 注册，`ServerArgs.get_attention_backends()` 在启用时把 `decode_attention_backend` 字符串改写为 `"fa3_sparse_decode"`，`ModelRunner` 走现有 `HybridAttnBackend` 的 `(prefill=fa3, decode=fa3_sparse_decode)` 组合路径（[model_runner.py 2097-2108](../../python/sglang/srt/model_executor/model_runner.py)）。
 
 ```python
-# layers/attention/fa3_sparse_decode_backend.py   -- 全文不到 20 行核心代码
+# layers/attention/fa3_sparse_decode_backend.py   -- 核心 ~50 行
 
+from sglang.jit_kernel.flash_attention import flash_attn_with_kvcache
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
 
 class Fa3SparseDecodeBackend(FlashAttentionBackend):
-    """Thin wrapper: let HiSparseCoordinator.algorithm_controller rewrite
-    FA3 metadata per-layer before delegating to FlashAttentionBackend.
+    """Inherits FA3 for everything except ``forward_decode``.
+
+    For decode, this class:
+      1. writes the new token's K/V using the standard pool ``set_kv_buffer``;
+      2. asks the controller for a ``SparseFa3CallArgs`` package
+         (``page_table``, ``cache_seqlens``, ``cu_seqlens_q``, ``max_seqlen_k``);
+      3. directly calls ``flash_attn_with_kvcache`` with those args.
+
+    The shared FA3 ``self.forward_metadata`` is never read or mutated on
+    sparse rows — dense and sparse paths run on disjoint tensors.
 
     Not imported / held by ModelRunner. Registered via attention_registry
     and selected through ServerArgs.get_attention_backends() rewrite.
     """
 
-    def forward_decode(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kw):
+    def forward_decode(
+        self, q, k, v, layer, forward_batch,
+        save_kv_cache=True, q_rope=None, k_rope=None, sinks=None,
+    ):
         coord = forward_batch.hisparse_coordinator
         ctl = coord.algorithm_controller if coord is not None else None
 
+        # No controller (e.g. plain FA3 fallback) — delegate to parent dense path.
         if ctl is None:
-            return super().forward_decode(q, k, v, layer, forward_batch, save_kv_cache, **kw)
+            return super().forward_decode(
+                q, k, v, layer, forward_batch,
+                save_kv_cache=save_kv_cache, q_rope=q_rope, k_rope=k_rope, sinks=sinks,
+            )
 
-        original_meta = self.forward_metadata
-        self.forward_metadata = ctl.begin_layer_decode(
-            q=q, layer=layer, forward_batch=forward_batch, attn_metadata=original_meta,
+        # 1. Standard KV write of the *new* token (same as parent class).
+        if k is not None and save_kv_cache:
+            cache_loc = forward_batch.out_cache_loc
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale,
+            )
+
+        # 2. Controller produces a sparse call-arg pack for this layer.
+        sparse_args = ctl.begin_layer_decode(
+            q=q, layer=layer, forward_batch=forward_batch,
+            attn_metadata=self.forward_metadata,
         )
-        try:
-            out = super().forward_decode(q, k, v, layer, forward_batch, save_kv_cache, **kw)
-        finally:
-            self.forward_metadata = original_meta
+
+        # 3. Read K/V buffers and shape them for FA3 (page_size=1, so view is a no-op-ish).
+        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            layer.layer_id
+        )
+        key_cache = key_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.head_dim)
+        value_cache = value_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim)
+
+        # 4. Call FA3 directly (bypasses parent forward_decode's metadata path).
+        out = flash_attn_with_kvcache(
+            q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=sparse_args.page_table,
+            cache_seqlens=sparse_args.cache_seqlens,
+            cu_seqlens_q=sparse_args.cu_seqlens_q,
+            cu_seqlens_k_new=sparse_args.cu_seqlens_k,
+            max_seqlen_q=1,                       # decode always 1
+            max_seqlen_k=sparse_args.max_seqlen_k,
+            softmax_scale=layer.scaling,
+            causal=True,
+            softcap=layer.logit_cap,
+            num_splits=self.num_splits,
+            ver=self.fa_impl_ver,
+        )
 
         ctl.end_layer_decode(o=out, layer=layer, forward_batch=forward_batch)
         return out
@@ -274,9 +321,12 @@ def create_fa3_sparse_decode_backend(runner):
     return Fa3SparseDecodeBackend(runner)
 ```
 
-- Decode backend 通过 `forward_batch.hisparse_coordinator.algorithm_controller` 拿到 controller（与 DSA 路径走 `forward_batch.hisparse_coordinator.swap_in_selected_pages` 同形）。
-- 在调用 `super().forward_decode` 之前改写 `self.forward_metadata`，让 FA3 kernel 在 KV 读取时使用稀疏 `page_table`。
-- Prefill 路径（`forward_extend`）**不改**，直接走 dense FA3；由于 `HiSparseMHATokenToKVPool` 同时承担 full / device 角色（§6.4），`get_kv_buffer(layer_id)` 始终返回同一块 K/V 张量，无需任何视图切换。
+要点：
+
+- Sparse 路径**完全不读、不写共享 `self.forward_metadata`**——所有需要的字段都在 `SparseFa3CallArgs` 里独立提供。这与 NSA `_forward_fa3` 模式一致，是为后续 CUDA Graph 兼容打下的关键基础。
+- KV 写入仍通过 `forward_batch.token_to_kv_pool.set_kv_buffer`（`HiSparseMHATokenToKVPool` 内部会通过 `full_to_hisparse_device_index_mapping` 把 loc 翻译到 hot buffer），与 dense FA3 完全一致。
+- Prefill 路径（`forward_extend`）**不改**，直接走父类 dense FA3；由于 `HiSparseMHATokenToKVPool` 同时承担 full / device 角色（§6.4），`get_kv_buffer(layer_id)` 始终返回同一块 K/V 张量，无需任何视图切换。
+- `save_kv_cache=False` 路径、cross attention、SWA、MLA、cascade attention 等**首版不支持**——若调用方传入这些场景（`layer.is_cross_attention` / `is_swa_layer` / `use_mla` / `use_cascade_attn`），实现里应在入口处显式 fallback 到 `super().forward_decode`。这是因为 sparse_decode 首版只面向 Qwen2/Qwen3 的标准 self-attention（[server_args.py](../../python/sglang/srt/server_args.py) 守卫已校验）。后续若要扩到这些路径，把对应字段加进 `SparseFa3CallArgs` 即可，不影响算法 / Adapter / Controller。
 
 ---
 
@@ -361,30 +411,32 @@ class SparseAlgorithmController:
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         attn_metadata: Any,
-    ) -> Any:
+    ) -> "SparseFa3CallArgs":
         """
-        1) Save original metadata on first layer (for per-step reset).
-        2) Algorithm selects top-k token indices.
-        3) Call HiSparseCoordinator.swap_in_selected_pages to swap-in & get device locs.
-        4) Let adapter rewrite metadata so FA3 sees sparse page_table / cache_seqlens.
+        1) Algorithm selects top-k token indices for ALL requests in the batch.
+           - Short requests (seq_len <= top_k) auto-degenerate to dense via
+             ``valid_lengths = clamp(seq_lens, top_k)`` semantics; the adapter
+             then sees a sparse-equivalent set that selects every valid token.
+           - There is **no** per-request short-circuit / dense fallback here:
+             every request goes through the same fixed pipeline (single
+             control flow → CUDA-Graph friendly).
+        2) Call HiSparseCoordinator.swap_in_selected_pages to swap-in & get
+           device locs.
+        3) Let adapter return a SparseFa3CallArgs object packaging the
+           per-layer ``page_table`` / ``cache_seqlens`` / ``cu_seqlens_q`` /
+           ``max_seqlen_k`` to feed directly into ``flash_attn_with_kvcache``.
         """
-        if layer.layer_id == self.start_layer:
-            self.adapter.save_original_metadata(attn_metadata)
-
-        sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
-
-        # Step 2: algorithm returns TOKEN-LEVEL top-k indices
+        # Step 1: algorithm returns TOKEN-LEVEL top-k indices for the whole batch
         top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
             queries=q,
             layer_id=layer.layer_id,
             req_pool_indices=forward_batch.req_pool_indices,
-            sparse_mask=sparse_mask,
             forward_batch=forward_batch,
-            attn_metadata=attn_metadata,
         )
-        # Contract: top_k_tokens shape = [bs, top_k] int32, padded with -1 (token positions only).
+        # Contract: top_k_tokens shape = [bs, top_k] int32, padded with -1
+        # for slots beyond valid_lengths[i] (token positions only).
 
-        # Step 3: swap-in, returns physical device locs in HiSparse device buffer
+        # Step 2: swap-in, returns physical device locs in HiSparse device buffer
         top_k_device_locs = self.io.swap_in_selected_pages(
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
@@ -392,12 +444,11 @@ class SparseAlgorithmController:
             layer_id=layer.layer_id,
         )  # shape: [bs, top_k] int32
 
-        # Step 4: generic adapter rewrites metadata
-        return self.adapter.adapt_for_attn_metadata(
+        # Step 3: adapter packages FA3 call args (no shared metadata mutation)
+        return self.adapter.build_sparse_call_args(
             top_k_device_locs=top_k_device_locs,
             valid_lengths=valid_lengths,
-            sparse_mask=sparse_mask,
-            current_metadata=attn_metadata,
+            dense_metadata=attn_metadata,
             forward_batch=forward_batch,
             layer_id=layer.layer_id,
         )
@@ -410,22 +461,12 @@ class SparseAlgorithmController:
     ) -> None:
         """Maybe update representations on the algorithm side (decode)."""
         layer_id = layer.layer_id
-        k_buffer = self.io.mem_pool_device.get_key_buffer(layer_id)   # full pool already empty in decode? See §6
-        # Note: in sparse_decode mode, full KV lives on host; algorithms that need
-        # k_buffer on decode (e.g. Quest tail page update) should keep using
-        # host mirror via SparseAlgorithmController._k_buffer_for_update()
         self.algorithm.update_representations(
             layer_id=layer_id,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             k_buffer=self._k_buffer_for_update(layer_id),
             forward_batch=forward_batch,
-        )
-
-    def _compute_sparse_mask(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
-        return (
-            self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
         )
 
     def _k_buffer_for_update(self, layer_id: int) -> torch.Tensor:
@@ -437,6 +478,8 @@ class SparseAlgorithmController:
         """
         ...
 ```
+
+> **没有短路径**：本设计**取消**了"按 batch 维度判断是否走 dense"的 Python 分支（旧版本中的 `_all_dense_this_step` / `compute_all_dense_flag` / `min_sparse_prompt_len` 短路径）。所有请求都走同一条 sparse 流程，短请求由算法层通过 `valid_lengths = clamp(seq_lens, top_k)` 自然等价 dense（详见 §5.1）。这样一来 graph 内**单一控制流**，与 NSA 路径同款，未来开图代价最小。
 
 ### 4.3 与 `HiSparseCoordinator` 的组合
 
@@ -485,6 +528,8 @@ io_coord = HiSparseCoordinator(
 
 现有 [base_algorithm.py](../../python/sglang/srt/mem_cache/sparsity/algorithms/base_algorithm.py) 已经定义了 `retrieve_topk / construct_representations / update_representations`。与本设计衔接时：**不引入 `granularity` 字段**；`retrieve_topk` 的对外契约**固定为 token 粒度**（与 HiSparse / `hisparse.cuh` 一致）。
 
+为对齐"取消短路径、graph 内单一控制流"的设计原则（见 §4.2 末尾说明），**`retrieve_topk` 不再接收 `sparse_mask` 形参**——是否对某个请求进行有效稀疏由算法**根据 `seq_len` 内部决定**，并通过 `valid_lengths = clamp(seq_len, top_k)` 输出"短请求 → 全量 token、长请求 → top-k"的统一语义。
+
 ```python
 class BaseSparseAlgorithm(ABC):
     @abstractmethod
@@ -493,18 +538,38 @@ class BaseSparseAlgorithm(ABC):
         queries: torch.Tensor,              # [bs, num_heads * head_dim] or [bs, num_heads, head_dim]
         layer_id: int,
         req_pool_indices: torch.Tensor,     # [bs] int64
-        sparse_mask: torch.Tensor,          # [bs] bool
+        forward_batch: "ForwardBatch",      # provides seq_lens etc.
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            top_k_tokens:   [bs, top_k] int32  # TOKEN positions, padded with -1
-            valid_lengths:  [bs] int32         # valid entries per request (<= top_k)
+            top_k_tokens:   [bs, top_k] int32  # TOKEN positions, pad with -1 in
+                                                # slots beyond ``valid_lengths[i]``
+            valid_lengths:  [bs] int32         # min(seq_len[i], top_k)
+
         Contract (fixed, not configurable):
-          - shape MUST be (bs, top_k) matching SparseConfig.top_k; pad with -1.
+          - shape MUST be (bs, top_k) matching SparseConfig.top_k.
           - values MUST be absolute TOKEN positions inside the sequence
-            (i.e. 0..seq_len-1). Algorithms that score or store by PAGE internally
-            MUST expand selected pages to token positions before returning.
+            (i.e. 0..seq_len-1). Algorithms that score or store by PAGE
+            internally MUST expand selected pages to token positions before
+            returning.
+          - **Short-request semantics**: when ``seq_len[i] <= top_k`` the
+            algorithm MUST output a set that is equivalent to dense (i.e.
+            covers every valid token of that request); attention will then
+            see the full key set and the result equals the dense path.
+          - ``valid_lengths[i] = min(seq_len[i], top_k)`` (a single broadcast
+            ``clamp``).
+          - There is no ``sparse_mask`` input: the controller is no longer
+            responsible for telling the algorithm which requests "want" sparse;
+            the algorithm derives that from ``seq_len`` alone.
+
+        CUDA-Graph friendliness (forward-looking):
+          - Implementations are encouraged (and the production Quest version
+            is required) to use only fixed-shape GPU ops here — no
+            ``.item()`` / ``torch.unique`` / ``torch.nonzero`` / Python
+            for-loops. The first release tolerates Python loops (CUDA Graph
+            is force-disabled), but switching to graph mode in the future
+            should not require touching the algorithm's public signature.
         """
 ```
 
@@ -517,12 +582,16 @@ class BaseSparseAlgorithm(ABC):
 具体改造点：
 
 1. **内部**：`_compute_page_representations`、`_retrieve_page_scores`、按 `page_idx` 聚合等逻辑**保持 page 粒度**（min/max bounding-box 不变）。
-2. **`retrieve_topk`**：在实现末尾把「选中的 page」**展开为 token 位置**（本设计首版 `page_size=1` 时，逻辑 page 与 token 一一对应，展开代价极低；若将来 `page_size>1`，对每个入选 page 展开为该页内 `[start_token, start_token+page_size)` 的 token，再与 `num_recent_pages` 近窗 token 合并、截断或裁剪到 `SparseConfig.top_k` 后 pad 成 `[bs, top_k]`）。
-3. 覆盖 `retrieve_topk`（或提供 Quest 专用的默认实现），保证输出 `[bs, top_k] int32` **始终是 token 下标**，满足 `hisparse.cuh` 与 `swap_in_selected_pages`。
-4. `num_recent_pages` 的近窗 **page/token** 规则不变：近窗对应 token 必须出现在最终 token 列表里（与原「保留最近若干页」语义一致）。
-5. Prefill 阶段 `construct_representations` 用 `HiSparseMHATokenToKVPool.get_key_buffer(layer_id)` 计算（此时该请求的 KV 仍驻留在 `logical_attn_allocator` 的逻辑区段中）；Decode 阶段 `update_representations` 用 **host 池的 K buffer** 计算（因为 `admit_request_from_gpu` 已把逻辑区段的 KV 备份到 host 并 `free` 了这些行；host 池的 `layer_first` 布局与 layer_id 直接对应）—— 由 `SparseAlgorithmController._k_buffer_for_update` 按 forward mode 返回正确的 K buffer。
+2. **`retrieve_topk` 不再接收 `sparse_mask`**：所有请求都参与 page 打分；在打分前用 `seq_lens` 推出每个请求的有效 page 范围，无效 page 在打分时直接置 `-inf`，最终通过 topk 自然不被选中。
+3. **短请求自动等价 dense**：当 `seq_len[i] <= top_k` 时，由于 valid pages 总数 ≤ top_k，topk 会把所有 valid pages 全部选中（无效 page 都是 -inf）；展开为 token 后 `valid_lengths[i] = seq_len[i]`，attention 看到的就是该请求的全量 token，与 dense 路径数值等价（attention softmax 不依赖 token 顺序）。这一行为来自一句 broadcast：`valid_lengths = clamp(seq_lens, top_k)`，**没有 if-else**。
+4. **`retrieve_topk` 实现末尾把「选中的 page」展开为 token 位置**（本设计首版 `page_size=1` 时，逻辑 page 与 token 一一对应，展开代价极低；若将来 `page_size>1`，对每个入选 page 展开为该页内 `[start_token, start_token+page_size)` 的 token，再与 `num_recent_pages` 近窗 token 合并、截断或裁剪到 `SparseConfig.top_k` 后 pad 成 `[bs, top_k]`）。
+5. 覆盖 `retrieve_topk`（或提供 Quest 专用的默认实现），保证输出 `[bs, top_k] int32` **始终是 token 下标**，满足 `hisparse.cuh` 与 `swap_in_selected_pages`。
+6. `num_recent_pages` 的近窗 **page/token** 规则不变：近窗对应 token 必须出现在最终 token 列表里（与原「保留最近若干页」语义一致）。**注意**：原实现里 `num_recent_pages` 大于 `seq_len / page_size` 时会丢弃当前请求；新版本改为对 recent_count 做 `clamp(max=num_pages)`，保证短请求不会被特殊处理。
+7. Prefill 阶段 `construct_representations` 用 `HiSparseMHATokenToKVPool.get_key_buffer(layer_id)` 计算（此时该请求的 KV 仍驻留在 `logical_attn_allocator` 的逻辑区段中）；Decode 阶段 `update_representations` 用 **host 池的 K buffer** 计算（因为 `admit_request_from_gpu` 已把逻辑区段的 KV 备份到 host 并 `free` 了这些行；host 池的 `layer_first` 布局与 layer_id 直接对应）—— 由 `SparseAlgorithmController._k_buffer_for_update` 按 forward mode 返回正确的 K buffer。
 
-**注意**：Quest 代表向量要求 `MHATokenToKVPoolHost.k_buffer[layer_id]` 可以被 GPU 直接读。host pool 的 pinned memory 支持 GPU direct read，但性能较差；首版允许慢路径，后续可在 GPU 上维护一个 min/max 表示池（每页 `[head_num, head_dim]`），完全避免 decode 时访问 host K。
+**注意**：
+- Quest 代表向量要求 `MHATokenToKVPoolHost.k_buffer[layer_id]` 可以被 GPU 直接读。host pool 的 pinned memory 支持 GPU direct read，但性能较差；首版允许慢路径，后续可在 GPU 上维护一个 min/max 表示池（每页 `[head_num, head_dim]`），完全避免 decode 时访问 host K。
+- 首版 `retrieve_topk` 仍保留 `for i in range(bs)` 这一 Python 循环只是工程权宜；为未来开图，**需要重写为一次性的 broadcast `_batched_page_scores` + 一次 `torch.topk(k=top_k)`**。这部分即使不开图也能给 eager 模式带来明显加速，建议在算法验证完成后立即跟进（不影响算法接口契约）。
 
 ### 5.3 对齐 HiSparse kernel 的约束
 
@@ -539,25 +608,50 @@ class BaseSparseAlgorithm(ABC):
 
 ### 6.1 `SparseDecodeAdapter`（通用抽象基类）
 
+Adapter 不再返回"改写后的 `FlashAttentionMetadata` 对象"，而是返回一个**只供 sparse 路径使用的 FA3 调用参数包**（`SparseFa3CallArgs`），以便 `Fa3SparseDecodeBackend.forward_decode` **直接调** `flash_attn_with_kvcache`，与 NSA 路径的 `_forward_fa3` 同形（[nsa_backend.py 1639-1675](../../python/sglang/srt/layers/attention/nsa_backend.py)）。
+
+这样 dense 共享 metadata 在 sparse 流程中**永不被读写**——这是为未来 CUDA Graph 兼容打下的关键基础（共享 metadata 张量身份保持稳定）。
+
 ```python
 # sparsity/backend/backend_adaptor.py  (扩展)
 
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class SparseFa3CallArgs:
+    """Per-layer FA3 sparse-decode call arguments.
+
+    This is **NOT** a FlashAttentionMetadata — it is a self-contained
+    parameter pack that the backend feeds directly into
+    ``flash_attn_with_kvcache`` (see ``Fa3SparseDecodeBackend.forward_decode``).
+
+    All tensors live on GPU.  In the eager-mode first release the tensors
+    are freshly produced each layer; when CUDA Graph is enabled later the
+    same fields will be backed by pre-allocated buffers + in-place writes.
+    """
+    page_table: torch.Tensor          # [bs, top_k] int32, physical locs in HiSparse device buffer
+    cache_seqlens: torch.Tensor       # [bs] int32, ``min(seq_len, top_k)``
+    cu_seqlens_q: torch.Tensor        # [bs+1] int32, arange (decode: each row q_len = 1)
+    max_seqlen_k: int                 # static upper bound = top_k
+    cu_seqlens_k: Optional[torch.Tensor] = None  # [bs+1] int32, cumsum(cache_seqlens); built lazily
+
+
 class SparseDecodeAdapter(BackendAdaptor):
-    """Common base: rewrite attention metadata so the backend reads
-    only the top-k physical slots that HiSparseCoordinator already
-    swapped into the device buffer."""
+    """Common base: package backend-specific call args from
+    (top_k_device_locs, valid_lengths) given by the controller."""
 
     @abstractmethod
-    def adapt_for_attn_metadata(
+    def build_sparse_call_args(
         self,
-        top_k_device_locs: torch.Tensor,   # [bs, top_k] int32, physical locs in device buffer
+        top_k_device_locs: torch.Tensor,   # [bs, top_k] int32
         valid_lengths: torch.Tensor,       # [bs] int32
-        sparse_mask: torch.Tensor,         # [bs] bool
-        current_metadata: Any,
+        dense_metadata: Any,               # READ-ONLY ref for cu_seqlens_q reuse
         forward_batch: "ForwardBatch",
         layer_id: int,
         **kwargs,
-    ) -> Any: ...
+    ) -> SparseFa3CallArgs: ...
 ```
 
 ### 6.2 `Fa3SparseDecodeAdapter`（通用，与算法无关）
@@ -567,77 +661,75 @@ class SparseDecodeAdapter(BackendAdaptor):
 
 class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
     """
-    Generic adapter that, given top-k physical device-buffer slots per request,
-    rewrites FlashAttentionMetadata so FA3 reads only those slots.
+    Generic adapter that wraps the swapped-in top-k physical slots into the
+    minimal set of arguments FA3's ``flash_attn_with_kvcache`` needs.
 
     Algorithm-agnostic: it knows nothing about Quest / H2O / etc.
+    Backend-coupled: it knows exactly which fields FA3 consumes for sparse
+    decode (``page_table`` / ``cache_seqlens`` / ``cu_seqlens_q`` /
+    ``max_seqlen_k``), but **never** mutates the shared FlashAttentionMetadata.
     """
 
-    def save_original_metadata(self, metadata: FlashAttentionMetadata) -> None:
-        # Only saved on the first layer of each step, so per-layer calls can
-        # freely overwrite fields.
-        self._original = dict(
-            page_table=metadata.page_table.clone(),
-            cache_seqlens_int32=metadata.cache_seqlens_int32.clone(),
-            cu_seqlens_k=metadata.cu_seqlens_k.clone(),
-            max_seq_len_k=int(metadata.max_seq_len_k),
-        )
+    def __init__(self, device: torch.device):
+        super().__init__(device)
+        self._top_k: Optional[int] = None  # cached on first call
 
-    def adapt_for_attn_metadata(
+    def build_sparse_call_args(
         self,
-        top_k_device_locs: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: FlashAttentionMetadata,
-        forward_batch: ForwardBatch,
+        top_k_device_locs: torch.Tensor,    # [bs, top_k] int32
+        valid_lengths: torch.Tensor,        # [bs] int32
+        dense_metadata: "FlashAttentionMetadata",
+        forward_batch: "ForwardBatch",
         layer_id: int,
         **kwargs,
-    ) -> FlashAttentionMetadata:
-        meta = current_metadata
+    ) -> SparseFa3CallArgs:
         bs, top_k = top_k_device_locs.shape
+        cache_seqlens = valid_lengths.to(torch.int32)
 
-        # Reset each layer from the saved dense metadata, so sparse_mask=False
-        # requests fall back to dense.
-        meta.page_table.copy_(self._original["page_table"])
-        meta.cache_seqlens_int32.copy_(self._original["cache_seqlens_int32"])
+        # cu_seqlens_q for decode is just arange — reuse the dense one from
+        # FA3's per-step metadata (it is always ``arange(0, bs+1)``); we do
+        # not own a separate buffer for it.
+        cu_seqlens_q = dense_metadata.cu_seqlens_q
 
-        # For sparse requests, replace the first `top_k` columns of page_table
-        # with the device_buffer physical slots.
-        if sparse_mask.any():
-            # page_table shape: [bs, max_seq_len_k]
-            # we overwrite a prefix of width top_k for sparse rows
-            sparse_rows = sparse_mask.nonzero(as_tuple=False).squeeze(1)
-            page_table_rows = meta.page_table[sparse_rows]
-            page_table_rows[:, :top_k] = top_k_device_locs[sparse_rows]
-            meta.page_table[sparse_rows] = page_table_rows
+        # cu_seqlens_k built fresh per layer (eager mode).  When graph mode
+        # is later enabled this becomes an out= cumsum into a pre-allocated
+        # buffer.
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
+        )
 
-            # cache_seqlens = valid_lengths for sparse rows (<= top_k)
-            meta.cache_seqlens_int32[sparse_rows] = valid_lengths[sparse_rows].to(torch.int32)
-
-            meta.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(meta.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
-            )
-            meta.max_seq_len_k = int(meta.cache_seqlens_int32.max())
-
-        return meta
+        return SparseFa3CallArgs(
+            page_table=top_k_device_locs,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            # Static upper bound — FA3 uses cache_seqlens for masking, so a
+            # constant ``top_k`` here is correct (and graph-friendly).
+            max_seqlen_k=top_k,
+        )
 ```
 
 **关键点**：
-- Adapter **只看三样东西**：`top_k_device_locs`（已经是物理 slot）、`valid_lengths`、`sparse_mask`。它完全不知道算法是 Quest 还是 H2O。
-- 每层重新从 "saved original metadata" 复位后再改写，避免跨层污染。
-- `page_table` 的 dtype / 设备 / shape 均遵循 FA3 既有约束（[flashattention_backend.py 542-555](../../python/sglang/srt/layers/attention/flashattention_backend.py)）。
+- Adapter **只看三样东西**：`top_k_device_locs`（已经是物理 slot）、`valid_lengths`、`dense_metadata.cu_seqlens_q`（只读引用 FA3 已分配的 q-cumulative）。它完全不知道算法是 Quest 还是 H2O。
+- **不再改写共享 metadata**——dense 与 sparse 走完全独立的张量，两条路径互不污染。
+- **没有 `save_original_metadata`** —— 不需要在每步开头存 dense 副本，因为 sparse 流程根本不动 dense metadata。
+- **`max_seqlen_k = top_k`**（Python 字面量上界），FA3 内部用 `cache_seqlens` 做 mask；与 NSA 同款 `nsa_max_seqlen_q = 1` 风格一致。
 - page_size=1 时 `page_table` 即 per-token 物理 slot，天然对齐 HiSparse device buffer 的语义。
 
-### 6.3 `Fa3SparseDecodeBackend`（极薄子类，`ModelRunner` 零感知）
+### 6.3 `Fa3SparseDecodeBackend`（薄子类，`ModelRunner` 零感知）
 
-见 §3.4 的代码样例。要点汇总：
+完整实现见 §3.4 的代码样例。要点汇总：
 - **只覆盖 `forward_decode` 一个方法**；`forward_extend` / CUDA Graph 的 capture&replay / spec decode 等全部继承，不需要任何并行实现。
 - 通过 **`attention_registry.register_attention_backend("fa3_sparse_decode")`** 注册工厂函数；`ModelRunner` 里**无** `import`、**无**新增字段。
 - `ServerArgs.get_attention_backends()` 在 `enable_sparse_decode` 时把 `decode_attention_backend` 字符串改写为 `"fa3_sparse_decode"`，`prefill_attention_backend` 保持 `"fa3"`，走 [model_runner.py 2097-2108](../../python/sglang/srt/model_executor/model_runner.py) 既有的 `HybridAttnBackend` 组合分支，无需新增路径。
-- Decode 时：先 `ctl.begin_layer_decode` 改写 metadata，再调 `super().forward_decode`，最后 `ctl.end_layer_decode`。
+- Decode 时：写 KV → `ctl.begin_layer_decode` 拿 `SparseFa3CallArgs` → 直接调 `flash_attn_with_kvcache(...)` → `ctl.end_layer_decode`。**不调 `super().forward_decode`**。
 
-> **为什么保留这个子类而不是把逻辑塞进 Adapter？**
-> FA3 的 `forward_metadata` 是"每步一次"的约束对象；要在每层 FA3 kernel 调用之前改写它，必须有一个实现 `AttentionBackend.forward_decode` 契约的调用入口。把它塞进 Adapter 等于让 Adapter 同时实现整个 `AttentionBackend` 接口（CUDA Graph、spec decode、local attention 等），职责就糊了。当前这个极薄子类只做一件事——"调 controller 改 metadata → 委派给 FA3"，与 Adapter（"算法给 top-k 物理 loc → 得到新 metadata"）形成清晰的职责切分。
+> **职责切分**：
+> - **Backend 子类**：实现 `AttentionBackend.forward_decode` 契约，知道 FA3 kernel 的形参与 KV 张量 view 形状。
+> - **Adapter**：把 `(top_k_device_locs, valid_lengths)` 包装成 `SparseFa3CallArgs`，与算法解耦。
+> - **算法**：纯粹产生 `(top_k_tokens, valid_lengths)`，与 backend 解耦。
+>
+> 三层各自单一职责，未来开图、加新算法、加新 backend 都不需要跨层修改。
 
 ### 6.4 `HiSparseMHATokenToKVPool`（同时承担 full / device 双角色，无需包裹类）
 
@@ -725,7 +817,7 @@ class HiSparseMHATokenToKVPool(MHATokenToKVPool):
 #### 6.4.3 为什么不需要 `set_view` / 不需要包裹类
 
 - **prefill**：FA3 正常通过 `req_to_token` 得到物理 row，写入 / 读取底层 MHA 张量，与普通 MHA 模型完全一致。
-- **decode 的 KV 读取**：由 `Fa3SparseDecodeAdapter` 覆写 `metadata.page_table` 为 `swap_in_selected_pages` 返回的 `top_k_device_locs`（这些 loc 指向 hot buffer 区段），FA3 通过这些物理 loc 读 K/V；底层张量还是同一块。
+- **decode 的 KV 读取**：由 `Fa3SparseDecodeBackend.forward_decode` 直接把 `SparseFa3CallArgs.page_table`（来自 `swap_in_selected_pages` 返回的 `top_k_device_locs`，指向 hot buffer 区段）通过形参传给 `flash_attn_with_kvcache`，FA3 通过这些物理 loc 读 K/V；底层张量还是同一块。
 - **decode 的新 token 写入**：`set_kv_buffer` 通过 mapping 翻译 loc 到 hot buffer 保留槽位。
 - **prefill 结束后的迁移**：`HiSparseCoordinator.admit_request_from_gpu` 把逻辑空间里的 KV backup 到 host，再把对应 logical 行 `free` 回 `logical_attn_allocator`；此后该请求在 GPU 上只占 `device_buffer_size` 的 hot buffer 行。
 
@@ -737,7 +829,7 @@ class HiSparseMHATokenToKVPool(MHATokenToKVPool):
 | Device hot buffer (decode) | `HiSparseMHATokenToKVPool.k_buffer[layer]` 的 `hisparse_attn_allocator` 范围 | 同上（同一块张量的子范围） |
 | Host pool | `MHATokenToKVPoolHost.k_buffer[layer]` | `layer_first`, `[layer, size, head_num, head_dim]` |
 
-FA3 在 [flashattention_backend.py 1085-1090](../../python/sglang/srt/layers/attention/flashattention_backend.py) 做一次 `.view(-1, page_size, num_kv_heads, head_dim)`；`page_size=1` 下没有额外的索引变换（[flashattention_backend.py 542-555](../../python/sglang/srt/layers/attention/flashattention_backend.py)）。decode 时 adapter 把 `page_table` 覆写为指向 hot buffer 区段的物理 loc，FA3 kernel 对它一视同仁。
+FA3 在 [flashattention_backend.py 1085-1090](../../python/sglang/srt/layers/attention/flashattention_backend.py) 做一次 `.view(-1, page_size, num_kv_heads, head_dim)`；`page_size=1` 下没有额外的索引变换（[flashattention_backend.py 542-555](../../python/sglang/srt/layers/attention/flashattention_backend.py)）。decode 时 `Fa3SparseDecodeBackend.forward_decode` 把 `SparseFa3CallArgs.page_table` 作为形参传入 `flash_attn_with_kvcache`（指向 hot buffer 区段的物理 loc），FA3 kernel 对它一视同仁。共享的 `metadata.page_table`（dense 那一份）在 sparse 流程中**完全不读不写**。
 
 ### 6.6 复用 `hisparse.cuh` 的 MHA 绑定
 
@@ -779,12 +871,13 @@ def load_cache_to_device_buffer_mha(
 |---|---|---|---|
 | `algorithm` | str | `"quest"` | 首版仅 `"quest"`；后续由 `_ALGORITHM_REGISTRY` 扩展 |
 | `attention_backend` | str | `"fa3"` | 首版仅 `"fa3"` |
-| `top_k` | int | 2048 | 每层 decode 参与 attention 的 token 数 |
+| `top_k` | int | 2048 | 每层 decode 参与 attention 的 token 数；短请求（`seq_len <= top_k`）由算法自动等价 dense |
 | `device_buffer_size` | int | `2 * top_k` | GPU hot buffer 大小，必须 ≥ `top_k` |
 | `host_to_device_ratio` | int | 2 | host pool 容量 = device full pool × ratio |
 | `page_size` | int | 1 | 首版固定 1 |
-| `min_sparse_prompt_len` | int | 4096 | 低于此长度的请求走 dense |
 | `sparse_extra_config` | dict | `{}` | 算法自定义，如 Quest 的 `sparsity_ratio`、`num_recent_pages` |
+
+> **不再保留 `min_sparse_prompt_len`**：旧版本用它做"短请求免开销"短路径，但该短路径与 graph 单一控制流不兼容，且短请求场景下算法本身的开销远小于 dense attention（详见 §4.2 末尾说明）。新版本所有请求都走同一条 sparse 流程，短请求由 `valid_lengths = clamp(seq_len, top_k)` 自然等价 dense。`SparseConfig` 中保留该字段为 backward-compatible 占位，但运行时不再消费它（首版会在 server_args 守卫里直接忽略并打 warning）。
 
 ### 7.2 守卫（[server_args.py](../../python/sglang/srt/server_args.py) 中追加）
 
@@ -809,7 +902,6 @@ python3 -m sglang.launch_server \
       "top_k": 2048,
       "device_buffer_size": 4096,
       "host_to_device_ratio": 2,
-      "min_sparse_prompt_len": 4096,
       "sparse_extra_config": {"sparsity_ratio": 0.5, "num_recent_pages": 8}
   }'
 ```
@@ -836,7 +928,7 @@ python3 -m sglang.launch_server \
 | [schedule_batch.py 2246-2252](../../python/sglang/srt/managers/schedule_batch.py) `prepare_for_decode` | `coord.map_last_loc_to_buffer(...)` 复用，分支无关 | backup + grow |
 | [scheduler_output_processor_mixin.py 196-199](../../python/sglang/srt/managers/scheduler_output_processor_mixin.py) prefill 完 | DSA: `admit_request_into_staging`；sparse_decode: `admit_request_from_gpu`（内部委派 `controller.on_prefill_finished`） | prefill→decode 过渡 |
 | [scheduler_output_processor_mixin.py 93-94, 563-564](../../python/sglang/srt/managers/scheduler_output_processor_mixin.py) req 结束 | `coord.request_finished(req)` 内部同时调 `controller.on_request_end(req)` | 资源回收 |
-| [cuda_graph_runner.py 1019-1022, 1204-1205](../../python/sglang/srt/model_executor/cuda_graph_runner.py) | capture/replay 处理不变；controller 的 retrieve 路径若含动态 shape，需在 capture 前做 shape 固定 | CUDA Graph |
+| [cuda_graph_runner.py 1019-1022, 1204-1205](../../python/sglang/srt/model_executor/cuda_graph_runner.py) | sparse_decode 首版**强制关图**（[server_args.py 6748-6769](../../python/sglang/srt/server_args.py)），capture/replay 路径不会被命中；CUDA Graph 启用工作见 §10.4 | CUDA Graph |
 
 ### 8.1 钩子时序图（decode 单步）
 
@@ -860,14 +952,15 @@ sequenceDiagram
     MR->>AB: init_forward_metadata (dense base)
     loop each layer
       MR->>AB: forward_decode(q,k,v,layer)
+      AB->>AB: token_to_kv_pool.set_kv_buffer (write new token)
       AB->>Ctl: begin_layer_decode
       Ctl->>Alg: retrieve_topk
       Alg-->>Ctl: top_k_tokens, valid_lengths
       Ctl->>Coord: swap_in_selected_pages
       Coord-->>Ctl: top_k_device_locs
-      Ctl->>Adp: adapt_for_attn_metadata (generic)
-      Adp-->>AB: updated metadata
-      AB->>AB: flash_attn_with_kvcache (reads device buffer)
+      Ctl->>Adp: build_sparse_call_args
+      Adp-->>AB: SparseFa3CallArgs
+      AB->>AB: flash_attn_with_kvcache (sparse path, reads device buffer)
       AB->>Ctl: end_layer_decode
       Ctl->>Alg: update_representations
     end
@@ -939,11 +1032,76 @@ Retract / Abort 走现有 `retract_req` / `abort_staging_request` 的同一份�
 
 ## 10. 与 CUDA Graph / TP / DP 的协同
 
-- **CUDA Graph**：Controller 在 capture 前已随 `HiSparseCoordinator` 绑定完成。Quest 的 `retrieve_topk` 当前含 Python for-loop（[base_algorithm.py 293-355](../../python/sglang/srt/mem_cache/sparsity/algorithms/base_algorithm.py)），在 CUDA Graph 路径下要么：
-  - 首版**禁用 CUDA Graph**（`enable_sparse_decode → --disable-cuda-graph`，文档给 warning）。
-  - 或后续迭代把 `retrieve_topk` 改为 triton kernel（已有 TODO）。
-- **TP**：沿用 `HiSparseCoordinator.tp_group`；`sparse_decode` 路径不需要 `collect_ready_reqs` 的 `all_reduce(MIN)`（因为不走 staging queue），在该路径下跳过。
-- **DP**：与 HiSparse 相同，使用 `attention_tp_group`。
+### 10.1 现状（首版）
+
+为了让首版聚焦在"非原生稀疏算法 + Quest + FA3"的正确性验证，**首版强制关闭 CUDA Graph 与 Piecewise CUDA Graph**（参见 [server_args.py 6748-6769](../../python/sglang/srt/server_args.py)）：
+
+```python
+if not self.disable_cuda_graph:
+    self.disable_cuda_graph = True       # 全图 CUDA Graph 关闭
+if not self.disable_piecewise_cuda_graph:
+    self.disable_piecewise_cuda_graph = True  # 分片图也关闭
+```
+
+关图是首版的工程取舍，**不是设计上的不可恢复约束**。本节先说明本设计为开图打下的基础（§10.2），再列出已经做的"开图友好"决策（§10.3），最后给出未来打开 CUDA Graph 时的演进路线（§10.4）。
+
+> 本节不展开 capture/replay 时序、kernel 指针稳定性等具体实现细节。这些会在后续单独的"sparse_decode CUDA Graph 兼容方案"文档中给出。
+
+### 10.2 现有 DSA / NSA + HiSparse 路径的开图经验
+
+现有 [nsa_backend.py](../../python/sglang/srt/layers/attention/nsa_backend.py) 的 DSA HiSparse 路径已经在 CUDA Graph 下稳定运行（[server_args.py 6678-6707](../../python/sglang/srt/server_args.py) 没有禁用 cuda graph 的守卫）。它的开图模式可以归纳为四条原则：
+
+| 原则 | NSA 怎么做 |
+|---|---|
+| **P1：metadata 一次成型，graph 内不再重写** | `init_forward_metadata_replay_cuda_graph` 在 graph 之外把 `cache_seqlens_int32` / `cu_seqlens_k` / `page_table_1` 写进**预分配缓冲**，graph 内只读 |
+| **P2：每层稀疏选择以"独立张量参数"传给 attention** | `forward_decode` 直接把 `swap_in_selected_pages` 返回的 `top_k_device_locs` 通过形参 `page_table=...` 传给 `flash_attn_with_kvcache`，**不写回共享 metadata** |
+| **P3：动态长度用"上界 + GPU mask"表达** | `nsa_cache_seqlens = original_seq_lens.clamp(max=top_k)`——一句 broadcast，不依赖每个请求的具体 topk 数量 |
+| **P4：graph 内单一控制流** | 不同 forward_mode（Decode / TargetVerify / DraftExtend）各自 capture 一份 graph，graph 内无 `if all_dense` 等运行时分支 |
+
+NSA 路径本质上跑的是同一套 HiSparse IO（`HiSparseCoordinator.swap_in_selected_pages`、`map_last_loc_to_buffer`、host pool backup）。这意味着 **HiSparse 的 IO 层本身已经满足 graph-safe**——sparse_decode 路径与 NSA 共用这套 IO，**IO 层无任何额外改造工作**。
+
+### 10.3 本设计为开图所做的决策
+
+为了让后续接入 CUDA Graph 时尽可能 **不修改算法 / Adapter / Backend 子类的对外契约**，本设计在以下几处主动遵循 NSA 的开图模式：
+
+1. **不在共享 metadata 上做改写**（P2）
+   - `Fa3SparseDecodeAdapter` 输出 **`SparseFa3CallArgs`**（含 `page_table` / `cache_seqlens` / `cu_seqlens_q` / `max_seqlen_k` 四个张量），而不是改写 `FlashAttentionMetadata` 里的字段。
+   - `Fa3SparseDecodeBackend.forward_decode` **直接调 `flash_attn_with_kvcache(...)`**，把 `SparseFa3CallArgs` 的张量按形参传进去。这与 NSA 的 `_forward_fa3` 完全同形（[nsa_backend.py 1639-1675](../../python/sglang/srt/layers/attention/nsa_backend.py)），后续接入开图时**只需把这些张量改为预分配缓冲 + 原地写**，调用形态零变更。
+2. **取消 graph 内的 Python 控制流**（P4）
+   - 不再有 `_all_dense_this_step` / `compute_all_dense_flag` / `min_sparse_prompt_len` 等"短请求 fallback dense"分支：**所有请求都走完整 sparse 流程**，短请求由算法自动等价 dense（`valid_lengths = clamp(seq_len, top_k)`，详见 §5.1）。
+3. **算法契约硬性要求 token 级 + 定长**（P3）
+   - `BaseSparseAlgorithm.retrieve_topk` 必须返回 `[bs, top_k] int32`（pad `-1`）+ `[bs] int32`，**不接受 sparse_mask 形参**——选择"是否对某个请求做有效 sparse"完全由算法内部根据 seq_len 自然处理。
+4. **HiSparse IO 层已经 graph-safe**
+   - `swap_in_selected_pages` 用预分配 `top_k_device_locs_buffer` + GPU 上的 `num_real_reqs` 做 batch padding，已被 NSA 路径验证可开图（[hisparse_coordinator.py 165-171](../../python/sglang/srt/managers/hisparse_coordinator.py)）。
+   - `map_last_loc_to_buffer` / `_eager_backup_previous_token` / `wait_for_pending_backup` 全部在 graph 之外（`prepare_for_decode` / `_forward_raw` 入口），不影响 graph capture。
+
+### 10.4 未来开图的演进路线（不在首版落地）
+
+打开 CUDA Graph 主要还剩以下三类工作，其中前两类落地后即可对 Quest 路径开图：
+
+1. **Adapter 改用预分配缓冲 + 原地写**：把 `Fa3SparseDecodeAdapter` 的 `SparseFa3CallArgs` 字段改为在 `init_cuda_graph_state(max_bs)` 时一次性分配的 GPU 张量，每层只做 `.copy_` / `cumsum(out=...)` 等原地写。Adapter 对外 API 不变，只换内部实现。
+2. **算法 `retrieve_topk` 全 GPU 定长**：把 Quest 的 `for i in range(bs)` 改为一次 broadcast 的 `_batched_page_scores` + 一次 `torch.topk(k=top_k)`。同一份算法接口，只换内部实现。这部分本来也能给 eager 模式带来明显加速（节省 Python overhead），所以即使不开图也建议做。
+3. **Capture/Replay 钩子接入**：`Fa3SparseDecodeBackend` 覆盖 `init_cuda_graph_state` / `init_forward_metadata_capture_cuda_graph` / `init_forward_metadata_replay_cuda_graph` 三个 FA3 父类已有的钩子，把 `SparseFa3CallArgs` 缓冲 ready 化。Backend 子类略增"钩子接入"代码，但 `forward_decode` 主逻辑不变。
+
+各类算法对开图的支持度：
+
+| 算法 | 开图支持 | 说明 |
+|---|---|---|
+| Quest | 友好 | 内部 page bounding-box 打分天然是 broadcast op，重写门槛低 |
+| StreamingLLM / Sliding Window | 友好 | 选择规则与位置相关、与 query 无关，定长打分容易 |
+| ChunkKV | 友好 | 与 Quest 同构（chunk/page 级表示） |
+| H2O / SnapKV | 暂缓 | 依赖累积/历史 attention scores，与 fused attention 不亲；首版本不打算支持，[non_native_sparse_attention_support_plan.md §4.3](non_native_sparse_attention_support_plan.md) 已经把它们列为暂缓 |
+
+> 本节定位：仅说明"首版关图的原因 + 已经做了哪些开图友好的决策 + 未来开图大致需要做什么"。具体的预分配缓冲布局、原地写策略、钩子时序图等，待算法层与 backend 子类落地稳定后，再单独成文。
+
+### 10.5 TP / DP 协同
+
+- **TP**：沿用 `HiSparseCoordinator.tp_group`；sparse_decode 路径不走 staging queue，所以 `collect_ready_reqs` 的 `all_reduce(MIN)` 不会被调用（[hisparse_coordinator.py 354-361](../../python/sglang/srt/managers/hisparse_coordinator.py)）。
+- **DP**：与 HiSparse 相同，使用 `attention_tp_group`。`forward_batch.global_num_tokens_*` 等 DP 字段在 cuda_graph_runner 中已被纳入 capture 缓冲，sparse_decode 不需要额外处理。
+
+### 10.6 历史方案残余清理（占位）
+
+> 旧版本 §10 曾包含详细的工作项 W1–W5、Capture/Replay 时序图与冲突点清单。本次重写后这些内容暂时移除，待算法层与 backend 子类落地稳定、CUDA Graph 启用工作真正开始时再单独成文。
 
 ---
 
@@ -957,8 +1115,8 @@ Retract / Abort 走现有 `retract_req` / `abort_staging_request` 的同一份�
   - Mock algorithm / adapter / io，测 `begin/end_layer_decode` 调用顺序与参数。
   - `on_prefill_finished` 的 migrate + release 幂等与错误路径。
 - `test/srt/test_fa3_sparse_decode_adapter.py`
-  - 给定 `top_k_device_locs` / `valid_lengths` / `sparse_mask`，比对改写后的 `FlashAttentionMetadata` 与手算。
-  - 特殊用例：`top_k = seq_len`（退化为 dense）、`sparse_mask` 全 False（不改）。
+  - 给定 `top_k_device_locs` / `valid_lengths`，校验返回的 `SparseFa3CallArgs.page_table` / `cache_seqlens` / `cu_seqlens_k` 与手算一致。
+  - 特殊用例：`seq_len <= top_k`（valid_lengths == seq_len，等价 dense）、`seq_len > top_k`（valid_lengths == top_k）。
 - `test/srt/test_hisparse_mha_kv_pool.py`
   - `set_kv_buffer` 在 mapping 为 0（prefill）/ 非零（decode）两种语义下写入正确的 row。
   - Prefill→decode 迁移后，`logical_attn_allocator.free` 把逻辑行归还，后续请求能复用。
@@ -983,19 +1141,24 @@ Retract / Abort 走现有 `retract_req` / `abort_staging_request` 的同一份�
 | KV 布局 | MLA（kv_lora + rope） | MHA（`head_num, head_dim`） |
 | 部署 | PD disagg only | 单实例（首版） |
 | Coordinator 入口 | `HiSparseCoordinator`（mode=`dsa_native`，不持 controller） | `HiSparseCoordinator`（mode=`sparse_decode`，内部持 `SparseAlgorithmController`） |
-| 每层切入 | 由 NSA backend 直接调 `coord.swap_in_selected_pages` | 由 `Fa3SparseDecodeBackend` 调 `controller.begin/end_layer_decode`，内部再调 `coord.swap_in_selected_pages` |
+| 每层切入 | 由 NSA backend 直接调 `coord.swap_in_selected_pages`，把返回 loc 当作 `page_table` 形参传给 `flash_attn_with_kvcache` | 由 `Fa3SparseDecodeBackend.forward_decode` 调 `controller.begin/end_layer_decode`，controller 再调 `coord.swap_in_selected_pages`；返回的 `top_k_device_locs` 被 adapter 包成 `SparseFa3CallArgs.page_table` 后**同样以形参方式**传给 `flash_attn_with_kvcache` |
+| FA3 共享 metadata 改写 | 不改写 | 不改写（`SparseFa3CallArgs` 与 dense metadata 完全独立） |
 | Kernel 调用 | `load_cache_to_device_buffer_mla` | `load_cache_to_device_buffer_mha`（新增 MHA 绑定，cuh 代码复用） |
+| CUDA Graph | 默认开 | 首版强制关图（设计已为开图打好基础，详见 §10.3 / §10.4） |
 | 外部感知的类 | `HiSparseCoordinator` 一个 | `HiSparseCoordinator` 一个（Controller 是它的内部模块） |
 
 ---
 
 ## 13. 风险、局限与后续迭代
 
-- **Python for-loop 影响 CUDA Graph**：首版禁用 CUDA Graph。后续用 triton kernel 重写 `retrieve_topk`。
+- **CUDA Graph 兼容**：首版强制关闭 CUDA Graph + Piecewise CUDA Graph。设计已主动遵循 NSA 路径开图模式（独立 sparse 调用参数包、取消短路径、token-level + 定长契约等），未来开图时**只需修改 Adapter 内部缓冲布局与 Quest 内部循环**，**不需要修改算法 / Adapter / Backend 子类的对外契约**（详见 §10.4）。
+- **算法 retrieve_topk 的 Python 循环**：首版为方便快速验证，Quest 内部仍保留 `for i in range(bs)`。这与未来开图不兼容；建议算法验证完成后立即重写为定长 broadcast，开图前必做（即使不开图，eager 模式也会受益）。
 - **Host K 访问慢路径**：Quest decode 时读 host K 计算新页表示，会走 pinned memory 的 GPU direct read。后续在 GPU 上维护 min/max 表示池，不再访问 host K。
 - **PD disagg 支持**：需要让 `MHATokenToKVPoolHost` 的 contiguous buf infos 注册到 mooncake 侧，并复用 `admit_request_direct` 的形态（参考原 HiSparse）。
-- **更多算法**：H2O / SnapKV / PQCache 只需实现 `BaseSparseAlgorithm`，controller / adapter 不需变动。
+- **更多算法**：H2O / SnapKV 等"依赖完整 attention scores"的算法本设计**不打算支持**，理由见 [non_native_sparse_attention_support_plan.md §4.3](non_native_sparse_attention_support_plan.md)；StreamingLLM / ChunkKV 等"位置规则 / 块级表示"算法可平滑接入，只需实现 `BaseSparseAlgorithm`，controller / adapter / backend 不需变动。
+- **首版 backend 子类不支持 cross / SWA / MLA / cascade / fp8 KV / sliding window**：`Fa3SparseDecodeBackend.forward_decode` 在遇到这些场景时直接 fallback 到 `super().forward_decode`（dense 路径）。后续若要扩展，把对应字段加进 `SparseFa3CallArgs` 即可。
 - **`SparseCoordinator` 旧代码**：本设计直接**删除**以避免长期双协调器混乱；模块导出 `sparsity/__init__.py` 与 `factory.py` 需要跟随调整。
+- **`min_sparse_prompt_len` 字段已废弃**：保留向后兼容字段名，但运行时不再消费（不区分 dense/sparse 流程，由算法内部自动通过 `valid_lengths = clamp(seq_len, top_k)` 处理短请求）。
 
 ---
 
@@ -1010,10 +1173,14 @@ Retract / Abort 走现有 `retract_req` / `abort_staging_request` 的同一份�
    - 增 `admit_request_from_gpu`。
    - `swap_in_selected_pages` 根据 mode 切换 MLA/MHA kernel。
 4. 替换 `sparsity/core/sparse_coordinator.py` 内容为 `SparseAlgorithmController`，同时更新 `sparsity/__init__.py` / `factory.py`（移除 `SparseCoordinator` 导出，改为导出 `SparseAlgorithmController`）。
-5. `BaseSparseAlgorithm.retrieve_topk` 文档与默认实现：`retrieve_topk` **固定**返回 token 级 `[bs, top_k]`（不增加 `granularity` 字段）；`BaseSparseAlgorithmImpl` 若仍按 page 打分，子类或默认路径在返回前须 **page→token** 展开。
-6. 改造 `QuestAlgorithm` 适配 token 级输出与 decode 阶段的 host K 读取。
-7. 新增 `SparseDecodeAdapter` + `Fa3SparseDecodeAdapter`。
-8. 新增 `Fa3SparseDecodeBackend`，只覆盖 `forward_decode`；在 `attention_registry.py` 注册 `"fa3_sparse_decode"`。`ModelRunner` 不 import 这个类。
+5. `BaseSparseAlgorithm.retrieve_topk` 文档与默认实现：
+   - `retrieve_topk` **固定**返回 token 级 `[bs, top_k]`（不增加 `granularity` 字段）。
+   - **不再接收 `sparse_mask` 形参**——所有请求都参与稀疏选择。
+   - `valid_lengths = clamp(seq_lens, top_k)` 一句 broadcast 实现"短请求自动等价 dense"语义。
+   - `BaseSparseAlgorithmImpl` 若仍按 page 打分，子类或默认路径在返回前须 **page→token** 展开。
+6. 改造 `QuestAlgorithm` 适配 token 级输出与 decode 阶段的 host K 读取；删除 `sparse_mask=False` 分支与"短请求丢弃"逻辑（保留 Python `for i in range(bs)` 也可，但建议同步重写为定长 broadcast 以利后续开图）。
+7. 新增 `SparseFa3CallArgs` 数据类、`SparseDecodeAdapter` 抽象基类（含 `build_sparse_call_args` 抽象方法）、`Fa3SparseDecodeAdapter`（不再有 `save_original_metadata` / `adapt_for_attn_metadata`）。
+8. 新增 `Fa3SparseDecodeBackend`，只覆盖 `forward_decode`；**直接调** `flash_attn_with_kvcache`（不调 `super().forward_decode`），在 `attention_registry.py` 注册 `"fa3_sparse_decode"`。`ModelRunner` 不 import 这个类。
 9. `ServerArgs`：新增 `enable_sparse_decode` / `sparse_decode_config` 与守卫；`get_attention_backends()` 自动把 `decode_attention_backend` 改写为 `"fa3_sparse_decode"`。
 10. `ModelRunner` / `ScheduleBatch` / `scheduler_output_processor_mixin` 侧按 §8 接入；**注意 DSA 路径完全不变**；`ModelRunner` 净改动 2 处（KV pool 选型 + coordinator 构造条件）。
 11. 补单测与端到端测试。

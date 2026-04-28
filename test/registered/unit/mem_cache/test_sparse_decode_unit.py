@@ -5,8 +5,10 @@ kernels (FA3 / hisparse.cuh), so they can run on any host with PyTorch.
 
 Covered components:
   * :class:`SparseConfig` parsing from JSON (factory helpers).
-  * :class:`QuestAlgorithm.retrieve_topk` token-level contract.
-  * :class:`Fa3SparseDecodeAdapter.adapt_for_attn_metadata` metadata rewrite.
+  * :class:`QuestAlgorithm.retrieve_topk` token-level contract (no
+    ``sparse_mask`` input; ``valid_lengths = clamp(seq_len, top_k)``).
+  * :class:`Fa3SparseDecodeAdapter.build_sparse_call_args` packaging the
+    ``SparseFa3CallArgs`` parameter pack.
   * :class:`SparseAlgorithmController` lifecycle orchestration with mocks.
 
 Run with::
@@ -38,7 +40,9 @@ class TestSparseConfigFactory(unittest.TestCase):
         self.assertEqual(cfg.algorithm, "quest")
         self.assertEqual(cfg.backend, "fa3")
         self.assertEqual(cfg.page_size, 1)
-        self.assertEqual(cfg.min_sparse_prompt_len, 4096)
+        # ``min_sparse_prompt_len`` is no longer auto-populated; the runtime
+        # ignores it (kept for backward-compat parsing only).
+        self.assertIsNone(cfg.min_sparse_prompt_len)
         self.assertEqual(cfg.top_k, 2048)
         self.assertEqual(cfg.device_buffer_size, 4096)
         self.assertEqual(cfg.host_to_device_ratio, 2)
@@ -48,7 +52,6 @@ class TestSparseConfigFactory(unittest.TestCase):
 
         raw = (
             '{"top_k": 128, "device_buffer_size": 256, "host_to_device_ratio": 3, '
-            '"min_sparse_prompt_len": 1024, '
             '"sparse_extra_config": {"sparsity_ratio": 0.3, "num_recent_pages": 2}}'
         )
         args = SimpleNamespace(sparse_decode_config=raw)
@@ -57,11 +60,22 @@ class TestSparseConfigFactory(unittest.TestCase):
         self.assertEqual(cfg.top_k, 128)
         self.assertEqual(cfg.device_buffer_size, 256)
         self.assertEqual(cfg.host_to_device_ratio, 3)
-        self.assertEqual(cfg.min_sparse_prompt_len, 1024)
         self.assertEqual(
             cfg.sparse_extra_config,
             {"sparsity_ratio": 0.3, "num_recent_pages": 2},
         )
+
+    def test_min_sparse_prompt_len_is_parsed_but_warned(self):
+        from sglang.srt.mem_cache.sparsity import parse_sparse_decode_config
+
+        raw = '{"top_k": 64, "min_sparse_prompt_len": 1024}'
+        args = SimpleNamespace(sparse_decode_config=raw)
+        with self.assertLogs(
+            "sglang.srt.mem_cache.sparsity.factory", level="WARNING"
+        ) as cm:
+            cfg = parse_sparse_decode_config(args)
+        self.assertEqual(cfg.min_sparse_prompt_len, 1024)
+        self.assertTrue(any("deprecated" in msg for msg in cm.output))
 
     def test_device_buffer_size_must_exceed_top_k(self):
         from sglang.srt.mem_cache.sparsity import parse_sparse_decode_config
@@ -132,7 +146,6 @@ class TestQuestRetrieveTopK(unittest.TestCase):
             algorithm="quest",
             backend="fa3",
             page_size=1,
-            min_sparse_prompt_len=0,
             sparse_extra_config={"sparsity_ratio": 0.5, "num_recent_pages": 2},
         )
         self.algorithm = QuestAlgorithm(self.config, self.device)
@@ -180,8 +193,8 @@ class TestQuestRetrieveTopK(unittest.TestCase):
             k_buffer=self.kv_pool.get_key_buffer(0),
         )
 
-    def test_output_shape_and_dtype(self):
-        seq_len = 32
+    def test_output_shape_and_dtype_long_seq(self):
+        seq_len = 32  # > top_k_budget (8) → genuine sparse selection
         req_idx = 1
         self.states.register(req_idx, seq_len)
         self._run_construct(req_idx, seq_len)
@@ -189,7 +202,6 @@ class TestQuestRetrieveTopK(unittest.TestCase):
         queries = torch.randn(
             1, self.head_num * self.head_dim, dtype=torch.float32, device=self.device
         )
-        sparse_mask = torch.ones(1, dtype=torch.bool, device=self.device)
         req_pool_indices = torch.tensor([req_idx], dtype=torch.int64, device=self.device)
 
         fwd = SimpleNamespace(
@@ -199,7 +211,6 @@ class TestQuestRetrieveTopK(unittest.TestCase):
             queries=queries,
             layer_id=0,
             req_pool_indices=req_pool_indices,
-            sparse_mask=sparse_mask,
             forward_batch=fwd,
         )
 
@@ -217,11 +228,15 @@ class TestQuestRetrieveTopK(unittest.TestCase):
         if length < self.top_k_budget:
             self.assertTrue(torch.all(top_k_tokens[0, length:] == -1))
 
-    def test_sparse_mask_false_returns_minus_one_row(self):
-        seq_len = 16
+    def test_short_seq_auto_dense_equivalent(self):
+        """When seq_len <= top_k, valid_lengths should report seq_len and the
+        selection should cover the full set of tokens (equivalent to dense).
+        """
+        seq_len = 4  # < top_k_budget (8)
         req_idx = 0
         self.states.register(req_idx, seq_len)
         self._run_construct(req_idx, seq_len)
+
         queries = torch.randn(
             1, self.head_num * self.head_dim, dtype=torch.float32, device=self.device
         )
@@ -232,28 +247,38 @@ class TestQuestRetrieveTopK(unittest.TestCase):
             queries=queries,
             layer_id=0,
             req_pool_indices=torch.tensor([req_idx], dtype=torch.int64),
-            sparse_mask=torch.zeros(1, dtype=torch.bool, device=self.device),
             forward_batch=fwd,
         )
-        self.assertEqual(int(valid_lengths[0].item()), 0)
-        self.assertTrue(torch.all(top_k_tokens[0] == -1))
+
+        length = int(valid_lengths[0].item())
+        # All seq_len tokens should be selected (dense-equivalent).
+        self.assertEqual(length, seq_len)
+
+        # The selected tokens (first ``length`` slots) form a permutation of
+        # [0..seq_len-1]: dense coverage.  Order is not guaranteed because
+        # bounding-box top-k may interleave with the recent window.
+        selected = top_k_tokens[0, :length].sort().values
+        torch.testing.assert_close(
+            selected, torch.arange(seq_len, dtype=torch.int32)
+        )
+        # Padding slots beyond ``length`` are -1.
+        self.assertTrue(torch.all(top_k_tokens[0, length:] == -1))
 
 
 # ---------------------------------------------------------------------------
-# Fa3SparseDecodeAdapter
+# Fa3SparseDecodeAdapter.build_sparse_call_args
 # ---------------------------------------------------------------------------
 
 
 class _FakeFlashAttentionMetadata:
-    """Minimal stand-in matching the fields Fa3SparseDecodeAdapter touches."""
+    """Minimal stand-in matching the fields the adapter reads.
 
-    def __init__(self, page_table, cache_seqlens_int32):
-        self.page_table = page_table
-        self.cache_seqlens_int32 = cache_seqlens_int32
-        self.cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
-        )
-        self.max_seq_len_k = int(cache_seqlens_int32.max().item())
+    The adapter only borrows ``cu_seqlens_q`` from this object.  In
+    real FA3 ``cu_seqlens_q`` is always ``arange(0, bs+1)`` for decode.
+    """
+
+    def __init__(self, cu_seqlens_q):
+        self.cu_seqlens_q = cu_seqlens_q
 
 
 class TestFa3SparseDecodeAdapter(unittest.TestCase):
@@ -266,40 +291,49 @@ class TestFa3SparseDecodeAdapter(unittest.TestCase):
         self.adapter = Fa3SparseDecodeAdapter(self.device)
         self.bs = 3
         self.top_k = 4
-        # Dense metadata: 3 requests with seqlen 10, 20, 30.
-        self.page_table_dense = torch.arange(
-            self.bs * 32, dtype=torch.int32, device=self.device
-        ).view(self.bs, 32)
-        self.cache_seqlens = torch.tensor(
-            [10, 20, 30], dtype=torch.int32, device=self.device
+        # Fake "FA3 dense" cu_seqlens_q (decode → arange).
+        self.dense_cu_seqlens_q = torch.arange(
+            self.bs + 1, dtype=torch.int32, device=self.device
         )
-        self.meta = _FakeFlashAttentionMetadata(
-            self.page_table_dense.clone(), self.cache_seqlens.clone()
-        )
+        self.dense_meta = _FakeFlashAttentionMetadata(self.dense_cu_seqlens_q)
 
-    def test_dense_rows_unchanged_when_sparse_mask_false(self):
-        self.adapter.save_original_metadata(self.meta)
-        top_k_device_locs = torch.full(
-            (self.bs, self.top_k), 777, dtype=torch.int32, device=self.device
+    def test_build_sparse_call_args_long_seq(self):
+        top_k_device_locs = torch.tensor(
+            [
+                [100, 101, 102, 103],
+                [200, 201, 202, 203],
+                [300, 301, 302, 303],
+            ],
+            dtype=torch.int32,
+            device=self.device,
         )
-        valid_lengths = torch.zeros(self.bs, dtype=torch.int32, device=self.device)
-        sparse_mask = torch.zeros(self.bs, dtype=torch.bool, device=self.device)
+        valid_lengths = torch.tensor([4, 4, 4], dtype=torch.int32, device=self.device)
 
-        out = self.adapter.adapt_for_attn_metadata(
-            selected_indices=top_k_device_locs,
+        args = self.adapter.build_sparse_call_args(
+            top_k_device_locs=top_k_device_locs,
             valid_lengths=valid_lengths,
-            sparse_mask=sparse_mask,
-            current_metadata=self.meta,
+            dense_metadata=self.dense_meta,
             forward_batch=None,
-            req_to_token=None,
-            page_size=1,
             layer_id=0,
         )
-        torch.testing.assert_close(out.page_table, self.page_table_dense)
-        torch.testing.assert_close(out.cache_seqlens_int32, self.cache_seqlens)
 
-    def test_sparse_rows_overwritten_with_top_k(self):
-        self.adapter.save_original_metadata(self.meta)
+        # page_table forwarded as-is.
+        torch.testing.assert_close(args.page_table, top_k_device_locs)
+        # cache_seqlens == valid_lengths cast to int32.
+        torch.testing.assert_close(args.cache_seqlens, valid_lengths.to(torch.int32))
+        # cu_seqlens_q borrowed from dense.
+        self.assertIs(args.cu_seqlens_q, self.dense_cu_seqlens_q)
+        # cu_seqlens_k = pad(cumsum(cache_seqlens))
+        expected_cu_k = torch.tensor(
+            [0, 4, 8, 12], dtype=torch.int32, device=self.device
+        )
+        torch.testing.assert_close(args.cu_seqlens_k, expected_cu_k)
+        # max_seqlen_k is the static upper bound = top_k.
+        self.assertEqual(args.max_seqlen_k, self.top_k)
+
+    def test_build_sparse_call_args_short_seq(self):
+        """When valid_lengths < top_k, padding slots should still be present
+        (and ignored by FA3 via cache_seqlens)."""
         top_k_device_locs = torch.tensor(
             [
                 [100, 101, -1, -1],
@@ -310,81 +344,22 @@ class TestFa3SparseDecodeAdapter(unittest.TestCase):
             device=self.device,
         )
         valid_lengths = torch.tensor([2, 3, 4], dtype=torch.int32, device=self.device)
-        # Mark only rows 1 and 2 as sparse; row 0 keeps dense.
-        sparse_mask = torch.tensor(
-            [False, True, True], dtype=torch.bool, device=self.device
-        )
 
-        out = self.adapter.adapt_for_attn_metadata(
-            selected_indices=top_k_device_locs,
+        args = self.adapter.build_sparse_call_args(
+            top_k_device_locs=top_k_device_locs,
             valid_lengths=valid_lengths,
-            sparse_mask=sparse_mask,
-            current_metadata=self.meta,
+            dense_metadata=self.dense_meta,
             forward_batch=None,
-            req_to_token=None,
-            page_size=1,
             layer_id=0,
         )
 
-        # Row 0 (dense) unchanged.
-        torch.testing.assert_close(out.page_table[0], self.page_table_dense[0])
-        self.assertEqual(int(out.cache_seqlens_int32[0].item()), 10)
-
-        # Rows 1 and 2 prefix replaced.
-        self.assertEqual(int(out.page_table[1, 0].item()), 200)
-        self.assertEqual(int(out.page_table[1, 1].item()), 201)
-        self.assertEqual(int(out.page_table[1, 2].item()), 202)
-        # invalid slot replaced with pad row 0
-        self.assertEqual(int(out.page_table[1, 3].item()), 0)
-        self.assertEqual(int(out.cache_seqlens_int32[1].item()), 3)
-
-        self.assertEqual(int(out.page_table[2, 0].item()), 300)
-        self.assertEqual(int(out.page_table[2, 3].item()), 303)
-        self.assertEqual(int(out.cache_seqlens_int32[2].item()), 4)
-
-        # cu_seqlens_k / max_seq_len_k rebuilt.
-        expected_cu = torch.tensor([0, 10, 13, 17], dtype=torch.int32)
-        torch.testing.assert_close(out.cu_seqlens_k, expected_cu)
-        self.assertEqual(out.max_seq_len_k, 10)
-
-    def test_consecutive_layers_reset_from_snapshot(self):
-        """Each layer must restart from the original dense metadata."""
-        self.adapter.save_original_metadata(self.meta)
-        top_k_layer1 = torch.tensor(
-            [[7, 7, 7, 7], [7, 7, 7, 7], [7, 7, 7, 7]],
-            dtype=torch.int32,
-            device=self.device,
+        torch.testing.assert_close(args.cache_seqlens, valid_lengths.to(torch.int32))
+        expected_cu_k = torch.tensor(
+            [0, 2, 5, 9], dtype=torch.int32, device=self.device
         )
-        sparse_mask = torch.ones(self.bs, dtype=torch.bool, device=self.device)
-        valid_lengths = torch.tensor([4, 4, 4], dtype=torch.int32, device=self.device)
-
-        # Layer 1 writes 7s.
-        self.adapter.adapt_for_attn_metadata(
-            selected_indices=top_k_layer1,
-            valid_lengths=valid_lengths,
-            sparse_mask=sparse_mask,
-            current_metadata=self.meta,
-            forward_batch=None,
-            req_to_token=None,
-            page_size=1,
-            layer_id=0,
-        )
-        self.assertTrue(torch.all(self.meta.page_table[:, :4] == 7))
-
-        # Layer 2 with sparse_mask all False should restore dense prefix.
-        self.adapter.adapt_for_attn_metadata(
-            selected_indices=top_k_layer1,
-            valid_lengths=valid_lengths,
-            sparse_mask=torch.zeros(self.bs, dtype=torch.bool, device=self.device),
-            current_metadata=self.meta,
-            forward_batch=None,
-            req_to_token=None,
-            page_size=1,
-            layer_id=1,
-        )
-        torch.testing.assert_close(
-            self.meta.page_table[:, :4], self.page_table_dense[:, :4]
-        )
+        torch.testing.assert_close(args.cu_seqlens_k, expected_cu_k)
+        # Adapter does not modify shared dense metadata.
+        self.assertIs(self.dense_meta.cu_seqlens_q, self.dense_cu_seqlens_q)
 
 
 # ---------------------------------------------------------------------------
@@ -406,20 +381,18 @@ class _MockAlgorithm:
         self.start_layer = start_layer
         self.end_layer = end_layer
 
-    def retrieve_topk(
-        self, queries, layer_id, req_pool_indices, sparse_mask, **kwargs
-    ):
+    def retrieve_topk(self, queries, layer_id, req_pool_indices, **kwargs):
         bs = queries.shape[0]
+        seq_lens = kwargs["forward_batch"].seq_lens
         top_k_tokens = torch.full(
             (bs, self.top_k), -1, dtype=torch.int32, device=queries.device
         )
-        valid_lengths = torch.zeros(bs, dtype=torch.int32, device=queries.device)
-        # Default behavior: every sparse row picks tokens [0, 1, 2, ...].
+        # valid_lengths = min(seq_len, top_k) — short requests auto-dense.
+        valid_lengths = seq_lens.clamp(max=self.top_k).to(torch.int32)
         for i in range(bs):
-            if bool(sparse_mask[i]):
-                n = min(self.top_k, int(kwargs["forward_batch"].seq_lens[i].item()))
+            n = int(valid_lengths[i].item())
+            if n > 0:
                 top_k_tokens[i, :n] = torch.arange(n, dtype=torch.int32)
-                valid_lengths[i] = n
         return top_k_tokens, valid_lengths
 
     def construct_representations(self, **kwargs):
@@ -431,15 +404,24 @@ class _MockAlgorithm:
 
 class _MockAdapter:
     def __init__(self):
-        self.saved_metadata = None
-        self.adapt_calls = []
+        self.build_calls = []
 
-    def save_original_metadata(self, metadata):
-        self.saved_metadata = metadata
+    def build_sparse_call_args(self, **kwargs):
+        from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
+            SparseFa3CallArgs,
+        )
 
-    def adapt_for_attn_metadata(self, **kwargs):
-        self.adapt_calls.append(kwargs["layer_id"])
-        return kwargs["current_metadata"]
+        self.build_calls.append(kwargs["layer_id"])
+        top_k_device_locs = kwargs["top_k_device_locs"]
+        valid_lengths = kwargs["valid_lengths"]
+        bs = top_k_device_locs.shape[0]
+        return SparseFa3CallArgs(
+            page_table=top_k_device_locs,
+            cache_seqlens=valid_lengths.to(torch.int32),
+            cu_seqlens_q=torch.arange(bs + 1, dtype=torch.int32),
+            cu_seqlens_k=torch.zeros(bs + 1, dtype=torch.int32),
+            max_seqlen_k=top_k_device_locs.shape[1],
+        )
 
 
 class _MockCoord:
@@ -459,7 +441,10 @@ class _MockCoord:
 
 class TestSparseAlgorithmController(unittest.TestCase):
     def setUp(self):
-        from sglang.srt.mem_cache.sparsity import SparseAlgorithmController, SparseConfig
+        from sglang.srt.mem_cache.sparsity import (
+            SparseAlgorithmController,
+            SparseConfig,
+        )
 
         self.device = torch.device("cpu")
         self.top_k = 4
@@ -484,7 +469,6 @@ class TestSparseAlgorithmController(unittest.TestCase):
                 algorithm="mock",
                 backend="mock",
                 page_size=1,
-                min_sparse_prompt_len=0,
                 sparse_extra_config={},
             ),
             algorithm=self.algorithm,
@@ -501,37 +485,38 @@ class TestSparseAlgorithmController(unittest.TestCase):
         self.assertEqual(self.algorithm.start_layer, 0)
         self.assertEqual(self.algorithm.end_layer, self.num_layers)
 
-    def test_begin_layer_decode_snapshots_and_swaps(self):
+    def test_begin_layer_decode_runs_full_pipeline(self):
         layer = SimpleNamespace(layer_id=0)
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens=torch.tensor([self.seq_len, self.seq_len], dtype=torch.int64),
         )
-        metadata = object()
+        metadata = SimpleNamespace(cu_seqlens_q=torch.arange(3, dtype=torch.int32))
         q = torch.randn(2, 8, dtype=torch.float32, device=self.device)
 
-        self.controller.begin_layer_decode(
+        sparse_args = self.controller.begin_layer_decode(
             q=q, layer=layer, forward_batch=forward_batch, attn_metadata=metadata
         )
 
-        # save_original_metadata should fire on layer 0 only.
-        self.assertIs(self.adapter.saved_metadata, metadata)
-        # swap_in_selected_pages called exactly once.
+        # swap_in_selected_pages called exactly once at layer_id=0.
         self.assertEqual(len(self.controller.io.swap_calls), 1)
         self.assertEqual(self.controller.io.swap_calls[0][0], 0)
-        # adapter.adapt_for_attn_metadata called.
-        self.assertEqual(self.adapter.adapt_calls, [0])
+        # adapter.build_sparse_call_args called exactly once.
+        self.assertEqual(self.adapter.build_calls, [0])
+        # Returned object is a SparseFa3CallArgs with the right shapes.
+        self.assertEqual(sparse_args.page_table.shape, (2, self.top_k))
+        self.assertEqual(sparse_args.cache_seqlens.shape, (2,))
 
-        # Layer 1: adapter should NOT re-save (snapshot taken only on start_layer).
-        self.controller.begin_layer_decode(
+        # Layer 1: pipeline runs again — no per-step "snapshot" gating.
+        sparse_args_l1 = self.controller.begin_layer_decode(
             q=q,
             layer=SimpleNamespace(layer_id=1),
             forward_batch=forward_batch,
             attn_metadata=metadata,
         )
-        # Still the same snapshot reference.
-        self.assertIs(self.adapter.saved_metadata, metadata)
-        self.assertEqual(self.adapter.adapt_calls, [0, 1])
+        self.assertEqual(self.adapter.build_calls, [0, 1])
+        self.assertEqual(len(self.controller.io.swap_calls), 2)
+        self.assertEqual(sparse_args_l1.page_table.shape, (2, self.top_k))
 
 
 if __name__ == "__main__":

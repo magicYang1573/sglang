@@ -1,23 +1,35 @@
-"""Generic FA3 metadata adapter for the sparse-decode path.
+"""Generic FA3 sparse-decode adapter.
 
-This adapter is algorithm-agnostic: it receives top-k *physical* device
-buffer slots (already populated by
-:meth:`HiSparseCoordinator.swap_in_selected_pages`) and rewrites FA3's
-:class:`FlashAttentionMetadata` so that the FA3 kernel only looks at those
-slots.  It knows nothing about Quest / H2O / SnapKV etc.
+This adapter packages the per-layer FA3 *sparse* call arguments
+(``page_table`` / ``cache_seqlens`` / ``cu_seqlens_q`` / ``cu_seqlens_k`` /
+``max_seqlen_k``) into a single :class:`SparseFa3CallArgs` object that
+``Fa3SparseDecodeBackend.forward_decode`` feeds **directly** into
+``flash_attn_with_kvcache``.  The adapter never touches the shared
+``FlashAttentionMetadata`` of the dense path.
+
+This design choice mirrors the NSA path's ``_forward_fa3`` (see
+``nsa_backend.py``): sparse and dense pages live on disjoint tensors, which
+keeps the dense ``self.forward_metadata`` graph-stable and is the basis of
+the sparse-decode CUDA-Graph compatibility plan documented in
+``docs/advanced_features/hisparse_sparse_decode_design.md`` §10.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import SparseDecodeAdapter
+from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
+    SparseDecodeAdapter,
+    SparseFa3CallArgs,
+)
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+    )
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -25,126 +37,63 @@ logger = logging.getLogger(__name__)
 
 
 class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
-    """Rewrite FA3 metadata so FA3 only attends to the top-k swapped-in rows.
+    """Adapter that wraps swapped-in top-k physical slots into the minimal
+    set of arguments FA3's ``flash_attn_with_kvcache`` needs.
 
-    Usage contract
-    --------------
-    * :meth:`save_original_metadata` is called **once per decode step** on the
-      first layer, snapshotting the dense metadata so that we can fall back
-      for ``sparse_mask == False`` rows on subsequent layers.
-    * :meth:`adapt_for_attn_metadata` is called on **every layer**; it always
-      resets the metadata to the dense snapshot and then overwrites the
-      sparse rows.
+    Algorithm-agnostic: it knows nothing about Quest / H2O / etc.  It only
+    knows about the FA3 sparse-decode call surface.
+
+    Eager-mode reference impl: each layer freshly computes
+    ``cu_seqlens_k = pad(cumsum(cache_seqlens))``.  When CUDA Graph is
+    later enabled this becomes an in-place ``cumsum(out=...)`` into a
+    pre-allocated buffer (the ``page_table`` / ``cache_seqlens`` tensors
+    coming from the controller are already pre-allocated by
+    ``HiSparseCoordinator``).
     """
 
-    def __init__(self, device: torch.device):
-        super().__init__(device)
-        self._snapshot: Optional[dict] = None
-
-    def save_original_metadata(self, metadata: "FlashAttentionMetadata") -> None:
-        self._snapshot = {
-            "page_table": metadata.page_table.clone(),
-            "cache_seqlens_int32": metadata.cache_seqlens_int32.clone(),
-            "cu_seqlens_k": (
-                metadata.cu_seqlens_k.clone()
-                if metadata.cu_seqlens_k is not None
-                else None
-            ),
-            "max_seq_len_k": int(metadata.max_seq_len_k),
-        }
-
-    def adapt_for_attn_metadata(
+    def build_sparse_call_args(
         self,
-        selected_indices: torch.Tensor,
+        top_k_device_locs: torch.Tensor,
         valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: "FlashAttentionMetadata",
+        dense_metadata: "FlashAttentionMetadata",
         forward_batch: "ForwardBatch",
-        req_to_token: torch.Tensor,
-        page_size: int,
         layer_id: int,
         **kwargs,
-    ) -> "FlashAttentionMetadata":
-        """Overwrite ``page_table`` prefix with physical hot-buffer slots."""
-        if self._snapshot is None:
-            # save_original_metadata was not called (controller contract error
-            # or adapter reused across steps) — return metadata unchanged so
-            # the dense FA3 path still works.
-            return current_metadata
+    ) -> SparseFa3CallArgs:
+        """Package FA3 sparse-decode call arguments.
 
-        meta = current_metadata
-        # Reset from snapshot every layer: FA3 re-uses the same metadata
-        # object across layers, so sparse changes from the previous layer
-        # must not leak.
-        meta.page_table.copy_(self._snapshot["page_table"])
-        meta.cache_seqlens_int32.copy_(self._snapshot["cache_seqlens_int32"])
+        Args:
+            top_k_device_locs: ``[bs, top_k]`` int32. Physical device-buffer
+                row indices already populated by
+                :meth:`HiSparseCoordinator.swap_in_selected_pages`.
+            valid_lengths: ``[bs]`` int32. ``min(seq_len[i], top_k)``.
+            dense_metadata: The FA3 dense per-step ``FlashAttentionMetadata``.
+                Read-only here — we only borrow ``cu_seqlens_q`` (which is
+                always ``arange(0, bs+1)`` for decode).
+        """
+        # FA3's sparse path only needs cache_seqlens to be int32; valid_lengths
+        # already has that dtype but make it explicit to be defensive.
+        cache_seqlens = valid_lengths.to(torch.int32)
 
-        if not bool(sparse_mask.any()):
-            # Every request stayed dense this layer; snapshot already
-            # restored, nothing more to do.
-            meta.max_seq_len_k = int(self._snapshot["max_seq_len_k"])
-            if self._snapshot["cu_seqlens_k"] is not None:
-                meta.cu_seqlens_k = self._snapshot["cu_seqlens_k"].clone()
-            return meta
+        # cu_seqlens_q: reuse FA3's pre-built arange (decode → q_len = 1 per row).
+        cu_seqlens_q = dense_metadata.cu_seqlens_q
 
-        top_k_device_locs = selected_indices  # [bs, top_k] int32
-        bs, top_k = top_k_device_locs.shape
-        device = meta.page_table.device
-
-        # Align dtype with page_table (FA3 page_table is int32 in the MHA/GQA path).
-        page_table_dtype = meta.page_table.dtype
-        locs_aligned = top_k_device_locs.to(page_table_dtype)
-
-        # Build a [bs, top_k] valid-slot mask so invalid (-1) entries are
-        # replaced by the first reserved pad row (0) and counted out of
-        # cache_seqlens.
-        top_k_range = torch.arange(top_k, device=device).unsqueeze(0)
-        valid_mask = top_k_range < valid_lengths.to(device).unsqueeze(1)
-        invalid_loc_mask = valid_mask & (locs_aligned < 0)
-        # If a sparse row contains invalid device locations in its valid
-        # prefix, fall back that row to dense for safety.
-        row_has_invalid = invalid_loc_mask.any(dim=1)
-        sparse_mask_device = sparse_mask.to(device)
-        effective_sparse_mask = sparse_mask_device & (~row_has_invalid)
-        effective_valid_mask = valid_mask & (~row_has_invalid.unsqueeze(1))
-        invalid_sparse_rows = row_has_invalid & sparse_mask_device
-        if bool(invalid_sparse_rows.any()):
-            logger.warning(
-                "FA3 sparse adapter found invalid swapped-in locations; "
-                "falling back %d row(s) to dense at layer_id=%d.",
-                int(invalid_sparse_rows.sum().item()),
-                layer_id,
-            )
-
-        # For sparse rows overwrite the ENTIRE top-k prefix of the page
-        # table; invalid slots use pad row 0 (FA3 cache_seqlens mask will
-        # truncate reads at valid_lengths so those slots don't actually
-        # contribute).  Dense rows remain untouched (already reset from
-        # snapshot).
-        sparse_rowmask = effective_sparse_mask.unsqueeze(1).expand(bs, top_k)
-        safe_locs = torch.where(
-            effective_valid_mask, locs_aligned, torch.zeros_like(locs_aligned)
-        )
-        target_page_table = meta.page_table[:, :top_k]
-        meta.page_table[:, :top_k] = torch.where(
-            sparse_rowmask, safe_locs, target_page_table
-        )
-
-        # Rebuild cache_seqlens: sparse rows truncated to valid_lengths,
-        # dense rows keep the snapshot's value.
-        effective_lengths = effective_valid_mask.sum(dim=1).to(torch.int32)
-        new_seqlens = torch.where(
-            effective_sparse_mask.to(meta.cache_seqlens_int32.device),
-            effective_lengths.to(meta.cache_seqlens_int32.dtype),
-            meta.cache_seqlens_int32,
-        )
-        meta.cache_seqlens_int32 = new_seqlens
-
-        # Recompute cu_seqlens_k and max_seq_len_k from the new cache_seqlens.
-        meta.cu_seqlens_k = torch.nn.functional.pad(
-            torch.cumsum(meta.cache_seqlens_int32, dim=0, dtype=torch.int32),
+        # cu_seqlens_k: built fresh per layer in eager mode.  When graph mode
+        # is enabled later this becomes an out= cumsum into a pre-allocated
+        # buffer.
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32),
             (1, 0),
         )
-        meta.max_seq_len_k = int(meta.cache_seqlens_int32.max().item())
 
-        return meta
+        # ``max_seqlen_k`` is a static upper bound (FA3 uses cache_seqlens
+        # for masking, so a constant is correct and graph-friendly).
+        top_k = top_k_device_locs.shape[1]
+
+        return SparseFa3CallArgs(
+            page_table=top_k_device_locs,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_k=top_k,
+        )

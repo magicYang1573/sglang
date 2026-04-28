@@ -1,9 +1,22 @@
-"""Thin FA3 subclass that lets :class:`HiSparseCoordinator` inject sparse
-per-layer metadata without touching the FA3 kernel call sites.
+"""FA3 attention backend subclass for the non-native sparse-decode path.
 
-The class is NEVER imported or held by :class:`ModelRunner` directly.  It is
-registered through :mod:`attention_registry` and selected via
-``ServerArgs.get_attention_backends()`` which rewrites
+Inherits :class:`FlashAttentionBackend` for everything except
+``forward_decode``.  For decode, this class:
+
+  1. writes the new token's K/V using the standard pool ``set_kv_buffer``;
+  2. asks the controller for a :class:`SparseFa3CallArgs` package
+     (``page_table`` / ``cache_seqlens`` / ``cu_seqlens_q`` /
+     ``cu_seqlens_k`` / ``max_seqlen_k``);
+  3. directly calls ``flash_attn_with_kvcache`` with those args.
+
+The shared FA3 ``self.forward_metadata`` is **never read or mutated** on
+sparse rows — dense and sparse paths run on disjoint tensors (see design
+doc :file:`docs/advanced_features/hisparse_sparse_decode_design.md` §6
+and §10).
+
+Not imported / held by :class:`ModelRunner` directly.  Registered through
+:mod:`attention_registry` and selected via
+``ServerArgs.get_attention_backends()`` rewriting
 ``decode_attention_backend`` to ``"fa3_sparse_decode"`` when
 ``--enable-sparse-decode`` is set.
 """
@@ -14,6 +27,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.jit_kernel.flash_attention import flash_attn_with_kvcache
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 
 if TYPE_CHECKING:
@@ -22,11 +36,13 @@ if TYPE_CHECKING:
 
 
 class Fa3SparseDecodeBackend(FlashAttentionBackend):
-    """FA3 backend that re-writes ``forward_metadata`` per decode layer via
-    :class:`SparseAlgorithmController`.
+    """FA3 backend that delegates per-layer decode to the sparse path.
 
-    The wrapper is deliberately minimal; everything except
-    :meth:`forward_decode` is inherited from :class:`FlashAttentionBackend`.
+    First release scope (mirrors §3.4 / §6.3 of the design doc):
+      * Plain self-attention only — no cross attention, sliding window, MLA,
+        cascade attention, or fp8 KV.  These cases fall back to the parent
+        class' dense ``forward_decode`` for safety.
+      * ``page_size = 1`` (validated by ServerArgs guard).
     """
 
     def forward_decode(
@@ -44,8 +60,24 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
         coord = getattr(forward_batch, "hisparse_coordinator", None)
         controller = getattr(coord, "algorithm_controller", None) if coord else None
 
-        if controller is None:
-            # No sparse controller attached → behave exactly like plain FA3.
+        # Fall back to dense FA3 when:
+        # 1. there's no sparse controller (e.g. the hisparse coordinator runs
+        #    in the legacy DSA mode, or sparse_decode is disabled);
+        # 2. the layer / KV layout is not in the supported subset (cross
+        #    attention, SWA, MLA, or cascade attention).
+        is_swa_layer = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+        use_cascade_attn = (
+            forward_batch.spec_info is not None and self.topk > 1
+        )
+        if (
+            controller is None
+            or layer.is_cross_attention
+            or is_swa_layer
+            or self.use_mla
+            or use_cascade_attn
+        ):
             return super().forward_decode(
                 q,
                 k,
@@ -58,30 +90,58 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
                 sinks=sinks,
             )
 
-        original_metadata = self.forward_metadata
-        try:
-            self.forward_metadata = controller.begin_layer_decode(
-                q=q,
-                layer=layer,
-                forward_batch=forward_batch,
-                attn_metadata=original_metadata,
-            )
-            out = super().forward_decode(
-                q,
+        # 1. Standard KV write of the *new* token (matches parent class).
+        if k is not None and save_kv_cache:
+            cache_loc = forward_batch.out_cache_loc
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer,
+                cache_loc,
                 k,
                 v,
-                layer,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                q_rope=q_rope,
-                k_rope=k_rope,
-                sinks=sinks,
+                layer.k_scale,
+                layer.v_scale,
             )
-        finally:
-            # Always restore the per-step (dense) metadata so downstream
-            # callers (e.g. next layer in the same step) see the pristine
-            # object before the next begin_layer_decode call.
-            self.forward_metadata = original_metadata
+
+        # 2. Controller produces a sparse FA3 call-arg pack for this layer.
+        sparse_args = controller.begin_layer_decode(
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            attn_metadata=self.forward_metadata,
+        )
+
+        # 3. K/V buffers (page_size=1 makes the view nearly a no-op).
+        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            layer.layer_id
+        )
+        key_cache = key_cache.view(
+            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        value_cache = value_cache.view(
+            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+
+        # 4. Direct FA3 sparse call (bypasses the parent's dense metadata path).
+        kwargs = {}
+        if sinks is not None:
+            kwargs["sinks"] = sinks
+        out = flash_attn_with_kvcache(
+            q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=sparse_args.page_table,
+            cache_seqlens=sparse_args.cache_seqlens,
+            cu_seqlens_q=sparse_args.cu_seqlens_q,
+            cu_seqlens_k_new=sparse_args.cu_seqlens_k,
+            max_seqlen_q=1,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=layer.logit_cap,
+            num_splits=self.num_splits,
+            ver=self.fa_impl_ver,
+            **kwargs,
+        )
 
         controller.end_layer_decode(o=out, layer=layer, forward_batch=forward_batch)
         return out

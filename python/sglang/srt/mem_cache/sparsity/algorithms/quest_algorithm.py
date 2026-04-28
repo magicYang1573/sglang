@@ -130,24 +130,30 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         queries: torch.Tensor,
         layer_id: int,
         req_pool_indices: torch.Tensor,
-        sparse_mask: torch.Tensor,
         **kwargs,
     ) -> tuple:
         """Return ``[bs, top_k]`` int32 token positions (padded with ``-1``).
 
-        Pipeline
-        --------
-        1. Score pages via query-page bounding-box criticality (reuses
-           :meth:`_retrieve_page_scores`).
-        2. Pick top-k pages (respecting ``num_recent_pages`` / sparsity ratio
-           / ``SparseConfig.top_k`` as a token budget).
-        3. Expand each picked page into its member tokens, then truncate /
-           pad to ``SparseConfig.top_k``.
+        Contract (see :class:`BaseSparseAlgorithm`):
+        - Output shape is ``(bs, top_k)`` int32; slots beyond
+          ``valid_lengths[i]`` are padded with ``-1``.
+        - ``valid_lengths[i] = min(seq_len[i], top_k)``.
+        - **No** ``sparse_mask`` input: short requests (seq_len <= top_k)
+          auto-degenerate to dense by selecting every valid token (the
+          algorithm's recent window + top-k pages naturally cover the full
+          range when ``num_pages <= top_k_budget``).
 
-        Requests with ``sparse_mask == False`` OR those whose sequence is
-        shorter than ``num_recent_pages * page_size`` fall back to dense, and
-        the output row is filled with ``-1`` (FA3 adapter will honor the
-        original dense metadata for such rows).
+        Pipeline (per request, eager-mode reference impl)
+        -------------------------------------------------
+        1. Score pages via query-page bounding-box criticality.
+        2. Pick top-k pages (recent window + history top scoring), trying to
+           saturate ``top_k_budget`` whenever possible.
+        3. Expand each picked page into its member tokens, then truncate to
+           the budget if needed.
+
+        NOTE: this implementation contains a Python ``for`` loop and is
+        therefore eager-only.  CUDA-Graph compatibility requires rewriting
+        this method as a fixed-shape broadcast (see design doc §10.4).
         """
         bs = queries.shape[0]
         device = queries.device
@@ -163,21 +169,23 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         out_tokens = torch.full(
             (bs, top_k_budget), -1, dtype=torch.int32, device=device
         )
-        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
+        # valid_lengths = min(seq_len, top_k_budget) — short requests will
+        # report "all tokens are selected" so attention sees the full key
+        # set (equivalent to dense).
+        out_lengths = seq_lens.clamp(max=top_k_budget).to(torch.int32)
 
         req_to_token = self.req_to_token_pool.req_to_token
         max_req_tokens = req_to_token.shape[1]
 
         for i in range(bs):
-            if not bool(sparse_mask[i]):
-                continue
-
             seq_len = int(seq_lens[i].item())
             if seq_len <= 0:
+                out_lengths[i] = 0
                 continue
 
             num_pages = int((seq_len + self.page_size - 1) // self.page_size)
             if num_pages <= 0:
+                out_lengths[i] = 0
                 continue
 
             page_idx = torch.arange(num_pages, device=device)
@@ -194,6 +202,8 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 queries[i : i + 1],
             )  # [1, num_pages]
 
+            # Recent window: clamp to num_pages so short requests don't
+            # over-claim recent pages.
             recent_count = min(self.num_recent_pages, num_pages)
             recent_start = num_pages - recent_count
 
@@ -203,9 +213,16 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 
             history_pages = recent_start
             # Budget top-k pages: respect sparsity_ratio but cap at history.
-            k_pages = min(
-                max(int(history_pages * self.sparsity_ratio), 1), history_pages
-            )
+            # When history_pages == 0 (i.e. num_pages <= num_recent_pages),
+            # k_pages stays 0 and we fall back to recent-only — which itself
+            # already covers every valid page → equivalent to dense.
+            if history_pages > 0:
+                k_pages = min(
+                    max(int(history_pages * self.sparsity_ratio), 1),
+                    history_pages,
+                )
+            else:
+                k_pages = 0
 
             if k_pages > 0:
                 topk_idx = torch.topk(masked_scores, k=k_pages, dim=1, sorted=False)[1]
@@ -250,8 +267,11 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 
             length = int(token_positions.numel())
             if length == 0:
+                out_lengths[i] = 0
                 continue
             out_tokens[i, :length] = token_positions
+            # Reflect actual filled length (may be < min(seq_len, top_k_budget)
+            # in pathological cases where dedup shrank the set).
             out_lengths[i] = length
 
         return out_tokens, out_lengths

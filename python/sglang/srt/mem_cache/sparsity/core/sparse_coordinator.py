@@ -42,8 +42,6 @@ class RequestTrackers:
         max_pool_size: int,
         device: torch.device,
         num_layers: int,
-        min_sparse_prompt_len: int,
-        max_context_len: int,
     ):
         self.device = device
         self.num_layers = num_layers
@@ -55,23 +53,16 @@ class RequestTrackers:
         self.last_constructed_page = torch.zeros(
             max_pool_size, dtype=torch.int64, device=device
         )
-        # CPU mirror of ``prompt_lens`` keyed by req_pool_idx.  Used by the
-        # decode hot path to decide sparse-vs-dense without syncing GPU state
-        # (see ``SparseAlgorithmController.compute_all_dense_flag``).  Kept in
-        # sync by :meth:`register` / :meth:`clear`.
-        self.prompt_lens_cpu: dict = {}
 
     def register(self, idx: int, prompt_len: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
         self.last_constructed_page[idx] = 0
-        self.prompt_lens_cpu[int(idx)] = int(prompt_len)
 
     def clear(self, idx: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
         self.last_constructed_page[idx] = 0
-        self.prompt_lens_cpu.pop(int(idx), None)
 
 
 @dataclass
@@ -84,6 +75,9 @@ class SparseConfig:
     algorithm: Optional[str] = None
     backend: Optional[str] = None
     page_size: Optional[int] = None
+    # NOTE: kept for backward-compat parsing only; runtime no longer consumes
+    # this field.  Short requests auto-degenerate to dense via
+    # ``valid_lengths = clamp(seq_lens, top_k)`` inside the algorithm.
     min_sparse_prompt_len: Optional[int] = None
     sparse_extra_config: dict = field(default_factory=dict)
 
@@ -126,13 +120,10 @@ class SparseAlgorithmController:
         self.io: Optional["HiSparseCoordinator"] = None
 
         max_pool_size = req_to_token_pool.req_to_token.shape[0]
-        max_context_len = req_to_token_pool.max_context_len
         self.states = RequestTrackers(
             max_pool_size=max_pool_size,
             device=device,
             num_layers=end_layer - start_layer,
-            min_sparse_prompt_len=(config.min_sparse_prompt_len or 0),
-            max_context_len=max_context_len,
         )
 
     def bind_io(self, io: "HiSparseCoordinator") -> None:
@@ -174,27 +165,6 @@ class SparseAlgorithmController:
         """Per-decode-step pre-forward hook.  Currently a no-op."""
         return
 
-    def compute_all_dense_flag(self, req_pool_indices_cpu) -> bool:
-        """Return True if no request in the batch needs sparse attention.
-
-        Purely CPU-side (reads ``RequestTrackers.prompt_lens_cpu``) so that
-        the decode hot path can short-circuit the sparse pipeline without
-        triggering a GPU sync.  Called once per decode step by
-        :meth:`HiSparseCoordinator.map_last_loc_to_buffer` and cached on the
-        coordinator for every attention layer's
-        :meth:`begin_layer_decode`.
-        """
-        min_len = self.config.min_sparse_prompt_len
-        if min_len is None:
-            # No threshold configured → every request goes through sparse.
-            return False
-        prompt_lens_cpu = self.states.prompt_lens_cpu
-        for req_idx in req_pool_indices_cpu:
-            prompt_len = prompt_lens_cpu.get(int(req_idx), 0)
-            if prompt_len >= min_len:
-                return False
-        return True
-
     def begin_layer_decode(
         self,
         q: torch.Tensor,
@@ -205,37 +175,23 @@ class SparseAlgorithmController:
         """Called by :class:`Fa3SparseDecodeBackend.forward_decode` at the
         beginning of every decode layer.
 
-        1. On the first layer of the step, saves a snapshot of the dense
-           metadata so later layers can revert.
-        2. Asks the algorithm for token-level top-k indices.
-        3. Delegates to :meth:`HiSparseCoordinator.swap_in_selected_pages` to
-           fetch those tokens into the device hot buffer.
-        4. Asks the adapter to rewrite the attention metadata so that FA3
-           reads only the newly swapped-in slots.
+        1. Asks the algorithm for token-level top-k indices for the WHOLE
+           batch (no per-request short-circuit; short requests degenerate
+           to dense via ``valid_lengths = clamp(seq_lens, top_k)``).
+        2. Delegates to :meth:`HiSparseCoordinator.swap_in_selected_pages`
+           to fetch those tokens into the device hot buffer.
+        3. Asks the adapter to package the per-layer FA3 sparse-call
+           arguments (returned to the backend as ``SparseFa3CallArgs``).
         """
         if self.io is None:
             raise RuntimeError(
                 "SparseAlgorithmController is not bound to a HiSparseCoordinator"
             )
 
-        if layer.layer_id == self.start_layer:
-            self.adapter.save_original_metadata(attn_metadata)
-
-        # Fast path: every request in this decode batch stays dense
-        # (e.g. all sequences shorter than ``min_sparse_prompt_len``).
-        # Skip retrieve_topk + swap_in + metadata rewrite entirely; FA3 will
-        # see the unchanged dense metadata.  The flag is populated once per
-        # step by :meth:`HiSparseCoordinator.map_last_loc_to_buffer`.
-        if getattr(self.io, "_all_dense_this_step", False):
-            return attn_metadata
-
-        sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
-
         top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
             queries=q,
             layer_id=layer.layer_id,
             req_pool_indices=forward_batch.req_pool_indices,
-            sparse_mask=sparse_mask,
             forward_batch=forward_batch,
             attn_metadata=attn_metadata,
         )
@@ -247,14 +203,11 @@ class SparseAlgorithmController:
             layer_id=layer.layer_id,
         )
 
-        return self.adapter.adapt_for_attn_metadata(
-            selected_indices=top_k_device_locs,
+        return self.adapter.build_sparse_call_args(
+            top_k_device_locs=top_k_device_locs,
             valid_lengths=valid_lengths,
-            sparse_mask=sparse_mask,
-            current_metadata=attn_metadata,
+            dense_metadata=attn_metadata,
             forward_batch=forward_batch,
-            req_to_token=self.req_to_token_pool.req_to_token,
-            page_size=(self.config.page_size or 1),
             layer_id=layer.layer_id,
         )
 
@@ -264,7 +217,7 @@ class SparseAlgorithmController:
         layer: "RadixAttention",
         forward_batch: "ForwardBatch",
     ) -> None:
-        """Called after ``super().forward_decode`` for each decode layer.
+        """Called after the FA3 sparse kernel for each decode layer.
 
         The algorithm updates its representation pool with the new token
         (decoded in the previous step) if necessary.  The K buffer used here
@@ -272,11 +225,6 @@ class SparseAlgorithmController:
         :meth:`_k_buffer_for_update` for the resolution.
         """
         if self.io is None:
-            return
-        # Paired with the short-circuit in :meth:`begin_layer_decode`: when
-        # the whole batch stayed dense we also skip representation updates
-        # (nothing selected this step, nothing new to track).
-        if getattr(self.io, "_all_dense_this_step", False):
             return
         layer_id = layer.layer_id
         k_buffer = self._k_buffer_for_update(layer_id)
@@ -322,19 +270,6 @@ class SparseAlgorithmController:
                 k_buffer=k_buffer,
                 forward_batch=fake_fb,
             )
-
-    def _compute_sparse_mask(self, req_pool_indices: torch.Tensor) -> torch.Tensor:
-        if self.config.min_sparse_prompt_len is None:
-            # All requests get sparse treatment.
-            return torch.ones(
-                req_pool_indices.shape,
-                dtype=torch.bool,
-                device=req_pool_indices.device,
-            )
-        return (
-            self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
-        )
 
     def _k_buffer_for_update(self, layer_id: int) -> torch.Tensor:
         """Resolve where the K buffer lives for incremental representation

@@ -23,8 +23,7 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
         queries: torch.Tensor,
         layer_id: int,
         req_pool_indices: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        attn_metadata: Optional[Any],
+        attn_metadata: Optional[Any] = None,
         **kwargs,
     ) -> tuple:
         indexer, forward_batch, x, q_lora, positions = (

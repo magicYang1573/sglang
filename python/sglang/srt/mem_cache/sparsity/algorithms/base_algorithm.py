@@ -108,7 +108,6 @@ class BaseSparseAlgorithm(ABC):
         queries: torch.Tensor,
         layer_id: int,
         req_pool_indices: torch.Tensor,
-        sparse_mask: torch.Tensor,
         **kwargs,
     ) -> tuple:
         """
@@ -122,16 +121,36 @@ class BaseSparseAlgorithm(ABC):
             queries: [bs, num_heads, head_dim] Current query vectors
             layer_id: Current layer index
             req_pool_indices: [bs] Request pool indices
-            sparse_mask: [bs] bool, which requests need sparse attention
-            attn_metadata: Attention metadata (contains seq_lens, etc.)
-            **kwargs: Algorithm-specific arguments
+            **kwargs: Includes ``forward_batch`` (for ``seq_lens``) and other
+                algorithm-specific arguments.
 
         Returns:
-            selected_indices: [bs, max_selected] Selected page/token indices, padded with -1
-            valid_lengths: [bs] Actual number of selected indices per request
+            top_k_tokens:  [bs, top_k] int32  TOKEN positions (0..seq_len-1),
+                           padded with ``-1`` in slots beyond
+                           ``valid_lengths[i]``.
+            valid_lengths: [bs] int32  ``min(seq_len[i], top_k)``.
 
-        Note:
-            - Indices are logical positions that will be mapped to physical KV cache by BackendAdaptor
+        Contract (fixed across all algorithms):
+            - Output shape MUST be ``(bs, SparseConfig.top_k)``.
+            - Values MUST be absolute TOKEN positions inside the sequence
+              (algorithms that score by page internally MUST expand to
+              token positions before returning).
+            - Short-request semantics: when ``seq_len[i] <= top_k`` the
+              algorithm MUST output a set equivalent to dense (covers every
+              valid token of that request); attention will then see the
+              full key set.  This is what makes ``min_sparse_prompt_len``
+              redundant and lets the caller use a single (graph-friendly)
+              control-flow path.
+            - There is **no** ``sparse_mask`` input: the algorithm decides
+              per request based on ``seq_len`` alone.
+
+        CUDA-Graph friendliness:
+            Implementations should avoid ``.item()``, ``torch.unique``,
+            ``torch.nonzero``, and dynamic-shape indexing (``x[mask]``).
+            The first release tolerates Python loops because CUDA Graph is
+            force-disabled for the sparse-decode path; later opening graph
+            mode requires only a fixed-shape rewrite of the algorithm
+            internals — the public signature stays the same.
 
         Algorithm-specific implementations:
             - ChunkKV: Select top-k chunks based on pre-computed importance scores with layer-wise index reuse
@@ -264,18 +283,27 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         queries: torch.Tensor,
         layer_id: int,
         req_pool_indices: torch.Tensor,
-        sparse_mask: torch.Tensor,
         **kwargs,
     ) -> tuple:
         """
         Default TopK retrieval: score-based selection + recent pages.
         Subclasses can override for query-dependent retrieval.
 
+        Returns ``(top_k_tokens, valid_lengths)`` matching the contract in
+        :meth:`BaseSparseAlgorithm.retrieve_topk`.  Specifically:
+        - Output shape is ``(bs, top_k_budget)`` with top_k_budget set
+          from ``self.config.top_k`` (NOT from per-batch max_len).
+        - Short requests (seq_len <= top_k_budget) report
+          ``valid_lengths[i] = seq_len[i]`` and the output positions cover
+          every valid page (recent window saturates) → equivalent to dense.
+
         TODO:
             1. Using triton kernel to speed up this function
-            2. Support CUDA Graph
+            2. Support CUDA Graph (requires removing the Python for-loop and
+               dynamic-shape ops)
         """
         bs, device = queries.shape[0], queries.device
+        top_k_budget = int(self.config.top_k)
 
         seq_lens_source = kwargs.get("forward_batch", None)
         if seq_lens_source is None or not hasattr(seq_lens_source, "seq_lens"):
@@ -287,23 +315,18 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         req_to_token = self.req_to_token_pool.req_to_token
         max_req_tokens = req_to_token.shape[1]
 
-        per_request_indices = []
-        per_request_lengths = []
+        out_indices = torch.full(
+            (bs, top_k_budget), -1, dtype=torch.int32, device=device
+        )
+        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
 
         for i in range(bs):
-            if not sparse_mask[i]:
-                per_request_indices.append(
-                    torch.empty(0, device=device, dtype=torch.int32)
-                )
-                per_request_lengths.append(0)
+            seq_len_i = int(seq_lens[i].item())
+            if seq_len_i <= 0:
                 continue
 
-            num_pages = int((seq_lens[i].item() + self.page_size - 1) // self.page_size)
-            if num_pages <= self.num_recent_pages:
-                per_request_indices.append(
-                    torch.empty(0, device=device, dtype=torch.int32)
-                )
-                per_request_lengths.append(0)
+            num_pages = int((seq_len_i + self.page_size - 1) // self.page_size)
+            if num_pages <= 0:
                 continue
 
             page_idx = torch.arange(num_pages, device=device)
@@ -320,36 +343,43 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
                 queries[i : i + 1],
             )
 
-            recent_start = max(num_pages - self.num_recent_pages, 0)
+            recent_count = min(self.num_recent_pages, num_pages)
+            recent_start = num_pages - recent_count
             scores = scores.clone()
-            scores[:, recent_start:] = float("-inf")
+            if recent_count > 0:
+                scores[:, recent_start:] = float("-inf")
 
-            history_pages = max(recent_start, 1)
-            k = max(int(history_pages * self.sparsity_ratio), 1)
-            k = min(k, history_pages)
-            topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
+            history_pages = recent_start
+            if history_pages > 0:
+                k = max(int(history_pages * self.sparsity_ratio), 1)
+                k = min(k, history_pages)
+                topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
+            else:
+                topk_idx = torch.empty(0, dtype=torch.int64, device=device)
 
             recent_idx = torch.arange(
-                recent_start, recent_start + self.num_recent_pages, device=device
+                recent_start, num_pages, device=device, dtype=torch.int64
             )
-            recent_idx = recent_idx[recent_idx < num_pages]
+            combined_pages = torch.cat([topk_idx.to(torch.int64), recent_idx], dim=0)
+            combined_pages = torch.unique(combined_pages)
 
-            combined = (
-                torch.cat([topk_idx, recent_idx], dim=0).sort()[0].to(torch.int32)
-            )
+            if self.page_size == 1:
+                token_positions = combined_pages.to(torch.int32)
+            else:
+                page_starts = combined_pages * self.page_size
+                offsets = torch.arange(
+                    self.page_size, device=device, dtype=torch.int64
+                )
+                token_positions = (
+                    page_starts.unsqueeze(1) + offsets.unsqueeze(0)
+                ).reshape(-1)
+                token_positions = token_positions[token_positions < seq_len_i]
+                token_positions = token_positions.to(torch.int32)
 
-            per_request_indices.append(combined)
-            per_request_lengths.append(int(combined.numel()))
-
-        max_len = max(max(per_request_lengths, default=0), 1)
-        out_indices = torch.full((bs, max_len), -1, dtype=torch.int32, device=device)
-        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
-
-        for i, selected in enumerate(per_request_indices):
-            length = per_request_lengths[i]
+            length = min(int(token_positions.numel()), top_k_budget)
             if length == 0:
                 continue
-            out_indices[i, :length] = selected
+            out_indices[i, :length] = token_positions[:length]
             out_lengths[i] = length
 
         return out_indices, out_lengths
