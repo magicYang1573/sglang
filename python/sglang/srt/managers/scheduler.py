@@ -2325,7 +2325,15 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
+        # HiSparse / sparse-decode have their own prefill-to-decode
+        # transition; skip the standard ``merge_batch(last_batch)`` below
+        # because the prefilled reqs need a per-request "admit" step
+        # (staging DMA for DSA, KV backup + device hot buffer alloc for
+        # sparse_decode) before they can safely participate in the next
+        # decode batch.  The admit runs in
+        # ``process_batch_result_prefill`` (i.e. ``pop_and_process``);
+        # admitted reqs are surfaced here via ``collect_ready_reqs`` /
+        # ``collect_admitted_reqs`` and merged into ``running_batch``.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2337,9 +2345,19 @@ class Scheduler(
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
             # Reset batch_is_full so the scheduler can schedule more prefills.
             self.running_batch.batch_is_full = False
+        elif self.enable_sparse_decode:
+            ready_reqs = self.hisparse_coordinator.collect_admitted_reqs()
+            if len(ready_reqs) > 0:
+                new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                if self.running_batch.is_empty():
+                    self.running_batch = new_batch
+                else:
+                    self.running_batch.merge_batch(new_batch)
+                self.running_batch.hisparse_coordinator = self.hisparse_coordinator
+            self.running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not (self.enable_hisparse or self.enable_sparse_decode)
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):

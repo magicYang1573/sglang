@@ -189,6 +189,20 @@ class HiSparseCoordinator:
                 )
             self.algorithm_controller.bind_io(self)
 
+        # Sparse-decode admit-buffer.  ``admit_request_from_gpu`` runs
+        # synchronously inside ``process_batch_result_prefill`` (which fires
+        # in ``pop_and_process``), and that callback runs **after** the
+        # scheduler's ``get_next_batch_to_run`` has already merged the just
+        # prefilled batch into ``running_batch``.  To prevent the next decode
+        # batch from being built before admit completes, ``admit_request_from_gpu``
+        # appends the req to this buffer instead of relying on the
+        # scheduler's standard ``merge_batch(last_batch)`` path; the scheduler
+        # then drains this buffer via :meth:`collect_admitted_reqs` BEFORE
+        # building the next batch.  Mirrors the DSA path's
+        # ``ack_staging_queue`` / ``collect_ready_reqs`` pattern but without
+        # the asynchronous DMA wait (admit is fully synchronous here).
+        self._pending_admit_reqs: List[Req] = []
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -770,6 +784,30 @@ class HiSparseCoordinator:
                 tuple(self.mem_pool_device.k_buffer[layer_id].shape),
                 tuple(self.mem_pool_host.k_buffer[layer_id].shape),
             )
+            # Per-request integrity check: surface uninitialized requests
+            # (admit_request_from_gpu was never called) BEFORE the kernel
+            # dereferences ``host_locs[-1]`` and crashes.
+            for i in range(num_reqs):
+                req_idx = int(req_pool_indices[i].item())
+                seq_len_i = int(seq_lens[i].item())
+                buf_size_i = int(self.req_device_buffer_size[req_idx])
+                # Quest's max(token_position) is seq_len-1 (the newest token,
+                # handled via newest_slot in the kernel).  All non-newest
+                # tokens MUST have host_locs[t] >= 0.
+                row_kv = self.req_to_host_pool[req_idx, : seq_len_i - 1]
+                n_invalid_host = int((row_kv < 0).sum().item())
+                if buf_size_i == 0 or n_invalid_host > 0:
+                    logger.error(
+                        "[SPARSE/coord] !!! UNINITIALIZED REQ DETECTED !!! "
+                        "i=%d req_pool_idx=%d seq_len=%d buf_size=%d "
+                        "n_invalid_host_before_newest=%d. Did "
+                        "admit_request_from_gpu fail to run for this req?",
+                        i,
+                        req_idx,
+                        seq_len_i,
+                        buf_size_i,
+                        n_invalid_host,
+                    )
             for i in range(min(num_reqs, 4)):
                 # Show top_k_result + the matching host_locs lookup so any
                 # ``-1`` host_loc that the swap-in kernel will dereference
@@ -984,4 +1022,24 @@ class HiSparseCoordinator:
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
         self.algorithm_controller.on_prefill_finished(req)
+        # Park the admitted req in the pending-admit buffer so the scheduler
+        # picks it up via ``collect_admitted_reqs`` BEFORE building the next
+        # batch.  This avoids a race where the scheduler's
+        # ``merge_batch(last_batch)`` would otherwise place this req in the
+        # next decode batch before its host pool / device hot buffer state
+        # has been initialized in this very method.
+        self._pending_admit_reqs.append(req)
         logger.debug("HiSparse: admitted request %s from GPU (len=%d)", req.rid, kv_len)
+
+    def collect_admitted_reqs(self) -> List[Req]:
+        """Return and clear the buffer of reqs admitted via
+        :meth:`admit_request_from_gpu` since the last call.
+
+        The scheduler drains this buffer in ``get_next_batch_to_run`` BEFORE
+        merging ``last_batch`` into ``running_batch``, ensuring that the
+        admitted reqs are placed in the running batch only after their per
+        request bookkeeping (host pool indices, device hot buffer rows) has
+        been initialized.
+        """
+        ready, self._pending_admit_reqs = self._pending_admit_reqs, []
+        return ready
