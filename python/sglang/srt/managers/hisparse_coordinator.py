@@ -891,21 +891,63 @@ class HiSparseCoordinator:
             loc_row = locs_cpu[i]
             valid_mask = (token_row >= 0) & (token_row < seq_len_i)
             valid_count = int(valid_mask.sum().item())
-            resolved_count = int((valid_mask & (loc_row >= 0)).sum().item())
-            unresolved = valid_count - resolved_count
-            oob = int(((loc_row >= 0) & (loc_row >= pool_size)).sum().item())
+            valid_locs = loc_row[valid_mask]
+            unique_valid_locs = int(torch.unique(valid_locs).numel()) if valid_count else 0
+
+            buf_locs = self.req_device_buffer_token_locs[layer_id, req_idx].cpu()
+            buf_tokens = self.req_device_buffer_tokens[layer_id, req_idx].cpu()
+            buf_size = int(self.req_device_buffer_size[req_idx])
+            unique_buf_locs = int(torch.unique(buf_locs[:buf_size]).numel()) if buf_size else 0
+
+            valid_tail = valid_locs[max(0, valid_count - 8) :].tolist() if valid_count else []
 
             logger.info(
-                "[SPARSE/diag] swap-in output req=%d seq_len=%d valid=%d resolved=%d "
-                "unresolved=%d oob_device_loc=%d loc_head=%s loc_tail=%s",
+                "[SPARSE/diag] swap-in output req=%d seq_len=%d valid=%d "
+                "unique_locs=%d (collisions=%d) buf_size=%d buf_unique_locs=%d "
+                "newest_slot_loc=%d loc_head=%s loc_tail_valid=%s",
                 req_idx,
                 seq_len_i,
                 valid_count,
-                resolved_count,
-                unresolved,
-                oob,
+                unique_valid_locs,
+                valid_count - unique_valid_locs,
+                buf_size,
+                unique_buf_locs,
+                int(buf_locs[self.device_buffer_size].item())
+                if buf_locs.numel() > self.device_buffer_size
+                else -1,
                 loc_row[:8].tolist(),
-                loc_row[max(0, loc_row.numel() - 8) :].tolist(),
+                valid_tail,
+            )
+
+            if valid_count != unique_valid_locs:
+                vals, counts = torch.unique(valid_locs, return_counts=True)
+                top_dup_idx = torch.topk(counts, k=min(5, vals.numel())).indices
+                top_dup = [(int(vals[j].item()), int(counts[j].item())) for j in top_dup_idx]
+                logger.info(
+                    "[SPARSE/diag] swap-in output req=%d top duplicate device_locs (loc, count)=%s",
+                    req_idx,
+                    top_dup,
+                )
+
+            lru_row = self.lru_slots[layer_id, req_idx].cpu()
+            unique_lru = int(torch.unique(lru_row[:self.device_buffer_size]).numel())
+            logger.info(
+                "[SPARSE/diag] hot-buffer req=%d layer=%d "
+                "lru_slots_unique=%d/%d "
+                "buf_tokens_head=%s buf_tokens_tail=%s "
+                "buf_locs_head=%s buf_locs_tail=%s",
+                req_idx,
+                layer_id,
+                unique_lru,
+                self.device_buffer_size,
+                buf_tokens[:8].tolist(),
+                buf_tokens[
+                    max(0, self.device_buffer_size - 4) : self.device_buffer_size + 1
+                ].tolist(),
+                buf_locs[:8].tolist(),
+                buf_locs[
+                    max(0, self.device_buffer_size - 4) : self.device_buffer_size + 1
+                ].tolist(),
             )
 
     def admit_request_from_gpu(self, req: Req) -> None:

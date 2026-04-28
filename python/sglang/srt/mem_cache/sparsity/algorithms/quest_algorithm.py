@@ -16,6 +16,7 @@ before returning.
 """
 
 import logging
+import os
 
 import torch
 
@@ -24,6 +25,7 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
 )
 
 logger = logging.getLogger(__name__)
+_SPARSE_ACCURACY_DEBUG = os.environ.get("SGLANG_SPARSE_ACCURACY_DEBUG", "0") == "1"
 
 
 class QuestAlgorithm(BaseSparseAlgorithmImpl):
@@ -273,6 +275,31 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             # Reflect actual filled length (may be < min(seq_len, top_k_budget)
             # in pathological cases where dedup shrank the set).
             out_lengths[i] = length
+
+            if _SPARSE_ACCURACY_DEBUG and layer_id == 0 and i == 0:
+                valid_count = int(self.page_valid[layer_id][:num_pages].sum().item())
+                neg_inf_scores = int(
+                    torch.isneginf(scores).sum().item()
+                )
+                topk_idx_unique = (
+                    int(torch.unique(topk_idx).numel()) if topk_idx.numel() > 0 else 0
+                )
+                logger.info(
+                    "[SPARSE/diag] quest req=%d seq_len=%d num_pages=%d page_valid_true=%d "
+                    "history_pages=%d k_pages=%d topk_unique=%d combined_unique=%d "
+                    "tokens_after_truncate=%d top_k_budget=%d recent_count=%d",
+                    int(req_pool_indices[i].item()),
+                    seq_len,
+                    num_pages,
+                    valid_count,
+                    history_pages,
+                    k_pages,
+                    topk_idx_unique,
+                    int(combined_pages.numel()),
+                    length,
+                    top_k_budget,
+                    recent_count,
+                )
 
         return out_tokens, out_lengths
 
