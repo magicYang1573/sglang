@@ -168,5 +168,11 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
             **kwargs,
         )
 
+        # Reshape output back to ``(bs, num_heads * v_head_dim)`` so the
+        # downstream ``o_proj`` linear layer receives a 2-D tensor (matches
+        # the parent class' final reshape; see ``flashattention_backend.py``
+        # line 1292).
+        out = out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
         controller.end_layer_decode(o=out, layer=layer, forward_batch=forward_batch)
         return out
