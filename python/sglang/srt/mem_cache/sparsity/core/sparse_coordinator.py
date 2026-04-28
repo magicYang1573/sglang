@@ -16,6 +16,7 @@ For backward compatibility the module keeps the ``SparseConfig`` and
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -24,6 +25,9 @@ import torch
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
+
+# Set SGLANG_SPARSE_DEBUG=1 in the env to turn on verbose per-step logs.
+_SPARSE_DEBUG = os.environ.get("SGLANG_SPARSE_DEBUG", "0") == "1"
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -188,6 +192,18 @@ class SparseAlgorithmController:
                 "SparseAlgorithmController is not bound to a HiSparseCoordinator"
             )
 
+        debug = _SPARSE_DEBUG and layer.layer_id == 0
+        if debug:
+            logger.info(
+                "[SPARSE/ctl] L0 begin_layer_decode: bs=%d req_pool_indices=%s "
+                "seq_lens=%s q.shape=%s q.dtype=%s",
+                forward_batch.batch_size,
+                forward_batch.req_pool_indices.cpu().tolist(),
+                forward_batch.seq_lens.cpu().tolist(),
+                tuple(q.shape),
+                q.dtype,
+            )
+
         top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
             queries=q,
             layer_id=layer.layer_id,
@@ -195,6 +211,23 @@ class SparseAlgorithmController:
             forward_batch=forward_batch,
             attn_metadata=attn_metadata,
         )
+        if debug:
+            torch.cuda.synchronize()
+            logger.info(
+                "[SPARSE/ctl] L0 retrieve_topk OK: top_k_tokens.shape=%s "
+                "dtype=%s valid_lengths=%s top_k_tokens.min=%d top_k_tokens.max=%d "
+                "row0[:8]=%s row0[length:length+4]=%s",
+                tuple(top_k_tokens.shape),
+                top_k_tokens.dtype,
+                valid_lengths.cpu().tolist(),
+                int(top_k_tokens.min().item()),
+                int(top_k_tokens.max().item()),
+                top_k_tokens[0, :8].cpu().tolist(),
+                top_k_tokens[
+                    0,
+                    int(valid_lengths[0].item()) : int(valid_lengths[0].item()) + 4,
+                ].cpu().tolist(),
+            )
 
         top_k_device_locs = self.io.swap_in_selected_pages(
             req_pool_indices=forward_batch.req_pool_indices,
@@ -202,14 +235,28 @@ class SparseAlgorithmController:
             top_k_result=top_k_tokens,
             layer_id=layer.layer_id,
         )
+        if debug:
+            torch.cuda.synchronize()
+            logger.info(
+                "[SPARSE/ctl] L0 swap_in_selected_pages OK: "
+                "top_k_device_locs.shape=%s min=%d max=%d row0[:8]=%s",
+                tuple(top_k_device_locs.shape),
+                int(top_k_device_locs.min().item()),
+                int(top_k_device_locs.max().item()),
+                top_k_device_locs[0, :8].cpu().tolist(),
+            )
 
-        return self.adapter.build_sparse_call_args(
+        sparse_args = self.adapter.build_sparse_call_args(
             top_k_device_locs=top_k_device_locs,
             valid_lengths=valid_lengths,
             dense_metadata=attn_metadata,
             forward_batch=forward_batch,
             layer_id=layer.layer_id,
         )
+        if debug:
+            torch.cuda.synchronize()
+            logger.info("[SPARSE/ctl] L0 build_sparse_call_args OK")
+        return sparse_args
 
     def end_layer_decode(
         self,
@@ -227,7 +274,26 @@ class SparseAlgorithmController:
         if self.io is None:
             return
         layer_id = layer.layer_id
+        debug = _SPARSE_DEBUG and layer_id == 0
         k_buffer = self._k_buffer_for_update(layer_id)
+        if debug:
+            torch.cuda.synchronize()
+            logger.info(
+                "[SPARSE/ctl] L0 end_layer_decode begin: o.shape=%s "
+                "k_buffer.shape=%s req_pool_indices=%s seq_lens=%s "
+                "states.last_constructed_page[req_pool_indices]=%s "
+                "states.repr_constructed[req_pool_indices]=%s",
+                tuple(o.shape),
+                tuple(k_buffer.shape),
+                forward_batch.req_pool_indices.cpu().tolist(),
+                forward_batch.seq_lens.cpu().tolist(),
+                self.states.last_constructed_page[
+                    forward_batch.req_pool_indices
+                ].cpu().tolist(),
+                self.states.repr_constructed[
+                    forward_batch.req_pool_indices
+                ].cpu().tolist(),
+            )
         self.algorithm.update_representations(
             layer_id=layer_id,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -235,6 +301,9 @@ class SparseAlgorithmController:
             k_buffer=k_buffer,
             forward_batch=forward_batch,
         )
+        if debug:
+            torch.cuda.synchronize()
+            logger.info("[SPARSE/ctl] L0 update_representations OK")
 
     def construct_prefill_representations(
         self,

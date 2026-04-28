@@ -23,6 +23,8 @@ Not imported / held by :class:`ModelRunner` directly.  Registered through
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -33,6 +35,11 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBac
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+logger = logging.getLogger(__name__)
+# Set SGLANG_SPARSE_DEBUG=1 in the env to turn on verbose per-step logs.
+_SPARSE_DEBUG = os.environ.get("SGLANG_SPARSE_DEBUG", "0") == "1"
 
 
 class Fa3SparseDecodeBackend(FlashAttentionBackend):
@@ -93,6 +100,20 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
         # 1. Standard KV write of the *new* token (matches parent class).
         if k is not None and save_kv_cache:
             cache_loc = forward_batch.out_cache_loc
+            if _SPARSE_DEBUG and layer.layer_id == 0:
+                logger.info(
+                    "[SPARSE/backend] L0 set_kv_buffer: bs=%d k.shape=%s v.shape=%s "
+                    "cache_loc.shape=%s cache_loc.dtype=%s out_cache_loc[:8]=%s "
+                    "req_pool_indices[:8]=%s seq_lens[:8]=%s",
+                    forward_batch.batch_size,
+                    tuple(k.shape),
+                    tuple(v.shape),
+                    tuple(cache_loc.shape),
+                    cache_loc.dtype,
+                    cache_loc[:8].cpu().tolist(),
+                    forward_batch.req_pool_indices[:8].cpu().tolist(),
+                    forward_batch.seq_lens[:8].cpu().tolist(),
+                )
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer,
                 cache_loc,
@@ -101,6 +122,9 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
                 layer.k_scale,
                 layer.v_scale,
             )
+            if _SPARSE_DEBUG and layer.layer_id == 0:
+                torch.cuda.synchronize()
+                logger.info("[SPARSE/backend] L0 set_kv_buffer OK")
 
         # 2. Controller produces a sparse FA3 call-arg pack for this layer.
         sparse_args = controller.begin_layer_decode(
@@ -109,6 +133,25 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
             forward_batch=forward_batch,
             attn_metadata=self.forward_metadata,
         )
+        if _SPARSE_DEBUG and layer.layer_id == 0:
+            torch.cuda.synchronize()
+            pt = sparse_args.page_table
+            cs = sparse_args.cache_seqlens
+            logger.info(
+                "[SPARSE/backend] L0 sparse_args: "
+                "page_table.shape=%s page_table.dtype=%s page_table[0,:8]=%s "
+                "page_table.min=%s page_table.max=%s "
+                "cache_seqlens=%s cu_seqlens_q=%s cu_seqlens_k=%s max_seqlen_k=%d",
+                tuple(pt.shape),
+                pt.dtype,
+                pt[0, :8].cpu().tolist(),
+                int(pt.min().item()),
+                int(pt.max().item()),
+                cs.cpu().tolist(),
+                sparse_args.cu_seqlens_q.cpu().tolist(),
+                sparse_args.cu_seqlens_k.cpu().tolist(),
+                int(sparse_args.max_seqlen_k),
+            )
 
         # 3. K/V buffers (page_size=1 makes the view nearly a no-op).
         key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
@@ -120,6 +163,20 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
         value_cache = value_cache.view(
             -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
         )
+        if _SPARSE_DEBUG and layer.layer_id == 0:
+            logger.info(
+                "[SPARSE/backend] L0 kv_cache: key_cache.shape=%s "
+                "value_cache.shape=%s tp_q_head_num=%d tp_k_head_num=%d "
+                "tp_v_head_num=%d head_dim=%d v_head_dim=%d page_size=%d",
+                tuple(key_cache.shape),
+                tuple(value_cache.shape),
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                layer.tp_v_head_num,
+                layer.head_dim,
+                layer.v_head_dim,
+                self.page_size,
+            )
 
         # 4. Direct FA3 sparse call (bypasses the parent's dense metadata path).
         #
@@ -140,6 +197,16 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
             sparse_args.page_table,
             torch.zeros_like(sparse_args.page_table),
         )
+        if _SPARSE_DEBUG and layer.layer_id == 0:
+            torch.cuda.synchronize()
+            logger.info(
+                "[SPARSE/backend] L0 safe_page_table: shape=%s min=%d max=%d "
+                "key_cache.size(0)=%d (max must be < key_cache.size(0))",
+                tuple(safe_page_table.shape),
+                int(safe_page_table.min().item()),
+                int(safe_page_table.max().item()),
+                key_cache.shape[0],
+            )
 
         kwargs = {}
         if sinks is not None:
@@ -167,6 +234,12 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
             ver=self.fa_impl_ver,
             **kwargs,
         )
+        if _SPARSE_DEBUG and layer.layer_id == 0:
+            torch.cuda.synchronize()
+            logger.info(
+                "[SPARSE/backend] L0 flash_attn_with_kvcache OK: out.shape=%s",
+                tuple(out.shape),
+            )
 
         # Reshape output back to ``(bs, num_heads * v_head_dim)`` so the
         # downstream ``o_proj`` linear layer receives a 2-D tensor (matches
@@ -175,4 +248,7 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
         out = out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         controller.end_layer_decode(o=out, layer=layer, forward_batch=forward_batch)
+        if _SPARSE_DEBUG and layer.layer_id == 0:
+            torch.cuda.synchronize()
+            logger.info("[SPARSE/backend] L0 end_layer_decode OK")
         return out

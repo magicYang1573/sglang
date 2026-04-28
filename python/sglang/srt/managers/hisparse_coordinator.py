@@ -5,6 +5,7 @@
 # construction time.
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Type
 
 import torch
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+_SPARSE_DEBUG = os.environ.get("SGLANG_SPARSE_DEBUG", "0") == "1"
 
 
 class HiSparseAct(NamedTuple):
@@ -735,6 +737,33 @@ class HiSparseCoordinator:
         # todo, adjustable for performance
         block_size = 1024
 
+        debug = _SPARSE_DEBUG and layer_id == 0
+        if debug:
+            torch.cuda.synchronize()
+            logger.info(
+                "[SPARSE/coord] L0 swap_in_selected_pages enter: "
+                "num_reqs=%d top_k=%d device_buffer_size=%d num_real_reqs=%d "
+                "req_pool_indices=%s seq_lens=%s top_k_result.shape=%s "
+                "top_k_result.dtype=%s mem_pool_device.k_buffer[0].shape=%s "
+                "host_pool.k_buffer[0].shape=%s",
+                num_reqs,
+                self.top_k,
+                self.device_buffer_size,
+                int(self.num_real_reqs.item()),
+                req_pool_indices.cpu().tolist(),
+                seq_lens.cpu().tolist(),
+                tuple(top_k_result.shape),
+                top_k_result.dtype,
+                tuple(self.mem_pool_device.k_buffer[layer_id].shape),
+                tuple(self.mem_pool_host.k_buffer[layer_id].shape),
+            )
+            for i in range(min(num_reqs, 4)):
+                logger.info(
+                    "[SPARSE/coord] L0   req[%d] top_k_result[:8]=%s",
+                    i,
+                    top_k_result[i, :8].cpu().tolist(),
+                )
+
         if self.mode == "sparse_decode":
             load_cache_to_device_buffer_mha(
                 top_k_tokens=top_k_result,
@@ -774,6 +803,16 @@ class HiSparseCoordinator:
                 page_size=1,
                 block_size=block_size,
                 num_real_reqs=self.num_real_reqs,
+            )
+        if debug:
+            torch.cuda.synchronize()
+            logger.info(
+                "[SPARSE/coord] L0 swap_in kernel OK: "
+                "top_k_indices.min=%d top_k_indices.max=%d "
+                "(must be < device pool size=%d)",
+                int(top_k_indices.min().item()),
+                int(top_k_indices.max().item()),
+                self.mem_pool_device.k_buffer[layer_id].shape[0],
             )
         return top_k_indices
 
