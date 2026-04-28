@@ -122,17 +122,42 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
         )
 
         # 4. Direct FA3 sparse call (bypasses the parent's dense metadata path).
+        #
+        # IMPORTANT signal/mask conventions:
+        #   * ``page_table`` MUST contain valid (non-negative) row indices in
+        #     every slot, even for padded slots beyond ``cache_seqlens[i]``.
+        #     FA3 may speculatively prefetch ``page_table[i, j]`` regardless
+        #     of whether ``j < cache_seqlens[i]`` (cache_seqlens is only used
+        #     for masking attention scores).  A ``-1`` entry would be
+        #     interpreted as an enormous unsigned offset and cause
+        #     ``cudaErrorIllegalAddress``.  We therefore replace ``-1`` with
+        #     ``0`` (slot 0 is always valid in HiSparseMHATokenToKVPool
+        #     because the pool is sized for the full logical space).  The
+        #     attention output for those padded slots is then ignored by the
+        #     ``cache_seqlens`` mask.
+        safe_page_table = torch.where(
+            sparse_args.page_table >= 0,
+            sparse_args.page_table,
+            torch.zeros_like(sparse_args.page_table),
+        )
+
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+        # Note: we deliberately do NOT pass ``cu_seqlens_k_new`` — that
+        # parameter is only needed when FA3 itself is appending new K/V to
+        # the cache (incremental decode with k/v args).  We already wrote the
+        # new token via ``set_kv_buffer`` above, so the cache is up-to-date
+        # and FA3 just reads it.  The plain decode path of the parent class
+        # (``FlashAttentionBackend.forward_decode``, line 1162) follows the
+        # same convention.
         out = flash_attn_with_kvcache(
             q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             k_cache=key_cache,
             v_cache=value_cache,
-            page_table=sparse_args.page_table,
+            page_table=safe_page_table,
             cache_seqlens=sparse_args.cache_seqlens,
             cu_seqlens_q=sparse_args.cu_seqlens_q,
-            cu_seqlens_k_new=sparse_args.cu_seqlens_k,
             max_seqlen_q=1,
             softmax_scale=layer.scaling,
             causal=True,
