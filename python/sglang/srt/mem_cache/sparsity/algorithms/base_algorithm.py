@@ -1,5 +1,3 @@
-import logging
-import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
@@ -7,11 +5,6 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
-logger = logging.getLogger(__name__)
-_SPARSE_DEBUG = os.environ.get("SGLANG_SPARSE_DEBUG", "0") == "1"
-
 
 class BaseSparseAlgorithm(ABC):
     """
@@ -260,49 +253,14 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_decode_or_idle():
             return
 
-        debug = _SPARSE_DEBUG and layer_id == 0
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 update_representations enter: "
-                "page_size=%d req_pool_indices=%s seq_lens=%s",
-                self.page_size,
-                req_pool_indices.cpu().tolist(),
-                seq_lens.cpu().tolist(),
-            )
-
         start_page = self.states.last_constructed_page[req_pool_indices]
         end_page = seq_lens // self.page_size
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 start_page=%s end_page=%s",
-                start_page.cpu().tolist(),
-                end_page.cpu().tolist(),
-            )
         valid_mask = self.states.repr_constructed[req_pool_indices] & (
             start_page < end_page
         )
 
         if not valid_mask.any():
-            if debug:
-                logger.info(
-                    "[SPARSE/algo] L0 update_representations: valid_mask all False, "
-                    "early return"
-                )
             return
-
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 valid_mask=%s, calling _compute_page_representations "
-                "with reqs=%s seq_lens=%s start_page=%s end_page=%s",
-                valid_mask.cpu().tolist(),
-                req_pool_indices[valid_mask].cpu().tolist(),
-                seq_lens[valid_mask].cpu().tolist(),
-                start_page[valid_mask].cpu().tolist(),
-                end_page[valid_mask].cpu().tolist(),
-            )
 
         # Compute page representations by subclass
         self._compute_page_representations(
@@ -313,9 +271,6 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             end_page[valid_mask],
             k_buffer,
         )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info("[SPARSE/algo] L0 _compute_page_representations OK")
 
         # Update tracking states
         if layer_id == self.end_layer - 1:

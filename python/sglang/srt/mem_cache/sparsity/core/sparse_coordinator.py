@@ -26,8 +26,11 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
 
-# Set SGLANG_SPARSE_DEBUG=1 in the env to turn on verbose per-step logs.
-_SPARSE_DEBUG = os.environ.get("SGLANG_SPARSE_DEBUG", "0") == "1"
+# Set SGLANG_SPARSE_ACCURACY_DEBUG=1 to enable targeted accuracy diagnostics.
+_SPARSE_ACCURACY_DEBUG = os.environ.get("SGLANG_SPARSE_ACCURACY_DEBUG", "0") == "1"
+_SPARSE_ACCURACY_DEBUG_MAX_REQS = int(
+    os.environ.get("SGLANG_SPARSE_ACCURACY_DEBUG_MAX_REQS", "4")
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -192,18 +195,6 @@ class SparseAlgorithmController:
                 "SparseAlgorithmController is not bound to a HiSparseCoordinator"
             )
 
-        debug = _SPARSE_DEBUG and layer.layer_id == 0
-        if debug:
-            logger.info(
-                "[SPARSE/ctl] L0 begin_layer_decode: bs=%d req_pool_indices=%s "
-                "seq_lens=%s q.shape=%s q.dtype=%s",
-                forward_batch.batch_size,
-                forward_batch.req_pool_indices.cpu().tolist(),
-                forward_batch.seq_lens.cpu().tolist(),
-                tuple(q.shape),
-                q.dtype,
-            )
-
         top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
             queries=q,
             layer_id=layer.layer_id,
@@ -211,22 +202,12 @@ class SparseAlgorithmController:
             forward_batch=forward_batch,
             attn_metadata=attn_metadata,
         )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/ctl] L0 retrieve_topk OK: top_k_tokens.shape=%s "
-                "dtype=%s valid_lengths=%s top_k_tokens.min=%d top_k_tokens.max=%d "
-                "row0[:8]=%s row0[length:length+4]=%s",
-                tuple(top_k_tokens.shape),
-                top_k_tokens.dtype,
-                valid_lengths.cpu().tolist(),
-                int(top_k_tokens.min().item()),
-                int(top_k_tokens.max().item()),
-                top_k_tokens[0, :8].cpu().tolist(),
-                top_k_tokens[
-                    0,
-                    int(valid_lengths[0].item()) : int(valid_lengths[0].item()) + 4,
-                ].cpu().tolist(),
+        if _SPARSE_ACCURACY_DEBUG and layer.layer_id == 0:
+            self._log_topk_diagnostics(
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                top_k_tokens=top_k_tokens,
+                valid_lengths=valid_lengths,
             )
 
         top_k_device_locs = self.io.swap_in_selected_pages(
@@ -235,17 +216,6 @@ class SparseAlgorithmController:
             top_k_result=top_k_tokens,
             layer_id=layer.layer_id,
         )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/ctl] L0 swap_in_selected_pages OK: "
-                "top_k_device_locs.shape=%s min=%d max=%d row0[:8]=%s",
-                tuple(top_k_device_locs.shape),
-                int(top_k_device_locs.min().item()),
-                int(top_k_device_locs.max().item()),
-                top_k_device_locs[0, :8].cpu().tolist(),
-            )
-
         sparse_args = self.adapter.build_sparse_call_args(
             top_k_device_locs=top_k_device_locs,
             valid_lengths=valid_lengths,
@@ -253,9 +223,6 @@ class SparseAlgorithmController:
             forward_batch=forward_batch,
             layer_id=layer.layer_id,
         )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info("[SPARSE/ctl] L0 build_sparse_call_args OK")
         return sparse_args
 
     def end_layer_decode(
@@ -274,26 +241,7 @@ class SparseAlgorithmController:
         if self.io is None:
             return
         layer_id = layer.layer_id
-        debug = _SPARSE_DEBUG and layer_id == 0
         k_buffer = self._k_buffer_for_update(layer_id)
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/ctl] L0 end_layer_decode begin: o.shape=%s "
-                "k_buffer.shape=%s req_pool_indices=%s seq_lens=%s "
-                "states.last_constructed_page[req_pool_indices]=%s "
-                "states.repr_constructed[req_pool_indices]=%s",
-                tuple(o.shape),
-                tuple(k_buffer.shape),
-                forward_batch.req_pool_indices.cpu().tolist(),
-                forward_batch.seq_lens.cpu().tolist(),
-                self.states.last_constructed_page[
-                    forward_batch.req_pool_indices
-                ].cpu().tolist(),
-                self.states.repr_constructed[
-                    forward_batch.req_pool_indices
-                ].cpu().tolist(),
-            )
         self.algorithm.update_representations(
             layer_id=layer_id,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -301,9 +249,6 @@ class SparseAlgorithmController:
             k_buffer=k_buffer,
             forward_batch=forward_batch,
         )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info("[SPARSE/ctl] L0 update_representations OK")
 
     def construct_prefill_representations(
         self,
@@ -355,6 +300,85 @@ class SparseAlgorithmController:
         if self.io is None:
             raise RuntimeError("controller.io not bound")
         return self.io.mem_pool_device.get_key_buffer(layer_id)
+
+    def _log_topk_diagnostics(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+        valid_lengths: torch.Tensor,
+    ) -> None:
+        if top_k_tokens.dim() != 2:
+            return
+
+        top_k_budget = top_k_tokens.shape[1]
+        sample_n = min(req_pool_indices.shape[0], _SPARSE_ACCURACY_DEBUG_MAX_REQS)
+        if sample_n <= 0:
+            return
+
+        sampled_reqs = req_pool_indices[:sample_n]
+        sampled_seq_lens = seq_lens[:sample_n]
+        sampled_valid = valid_lengths[:sample_n]
+        expected_valid = sampled_seq_lens.clamp(max=top_k_budget).to(sampled_valid.dtype)
+        mismatch = int((sampled_valid != expected_valid).sum().item())
+
+        logger.info(
+            "[SPARSE/diag] topk summary: sample=%d top_k=%d valid_mismatch=%d "
+            "req_pool_indices=%s seq_lens=%s valid_lengths=%s expected=%s",
+            sample_n,
+            top_k_budget,
+            mismatch,
+            sampled_reqs.cpu().tolist(),
+            sampled_seq_lens.cpu().tolist(),
+            sampled_valid.cpu().tolist(),
+            expected_valid.cpu().tolist(),
+        )
+
+        top_k_cpu = top_k_tokens[:sample_n].cpu()
+        seq_lens_cpu = sampled_seq_lens.cpu().tolist()
+        valid_cpu = sampled_valid.cpu().tolist()
+        req_cpu = sampled_reqs.cpu().tolist()
+
+        for i in range(sample_n):
+            seq_len_i = int(seq_lens_cpu[i])
+            valid_i = max(0, min(int(valid_cpu[i]), top_k_budget))
+            row = top_k_cpu[i, :valid_i]
+
+            if valid_i == 0:
+                logger.info(
+                    "[SPARSE/diag] topk req=%d seq_len=%d valid=0",
+                    req_cpu[i],
+                    seq_len_i,
+                )
+                continue
+
+            unique_i = int(torch.unique(row).numel())
+            oob_i = int(((row < 0) | (row >= seq_len_i)).sum().item())
+            newest = seq_len_i - 1
+            has_newest = bool((row == newest).any().item()) if newest >= 0 else False
+
+            dense_equivalent = None
+            if seq_len_i <= top_k_budget:
+                dense_equivalent = bool(
+                    torch.equal(
+                        torch.sort(row).values,
+                        torch.arange(seq_len_i, dtype=torch.int32),
+                    )
+                )
+
+            logger.info(
+                "[SPARSE/diag] topk req=%d seq_len=%d valid=%d unique=%d oob=%d "
+                "has_newest=%s dense_equivalent=%s head=%s tail=%s",
+                req_cpu[i],
+                seq_len_i,
+                valid_i,
+                unique_i,
+                oob_i,
+                has_newest,
+                dense_equivalent,
+                row[:8].tolist(),
+                row[max(0, valid_i - 8) : valid_i].tolist(),
+            )
 
 
 __all__ = ["RequestTrackers", "SparseConfig", "SparseAlgorithmController"]

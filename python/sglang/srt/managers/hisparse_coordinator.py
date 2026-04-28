@@ -37,7 +37,10 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-_SPARSE_DEBUG = os.environ.get("SGLANG_SPARSE_DEBUG", "0") == "1"
+_SPARSE_ACCURACY_DEBUG = os.environ.get("SGLANG_SPARSE_ACCURACY_DEBUG", "0") == "1"
+_SPARSE_ACCURACY_DEBUG_MAX_REQS = int(
+    os.environ.get("SGLANG_SPARSE_ACCURACY_DEBUG_MAX_REQS", "4")
+)
 
 
 class HiSparseAct(NamedTuple):
@@ -495,25 +498,12 @@ class HiSparseCoordinator:
         # Build the list of batch positions that need a host backup.
         # Skip the first decode step after staging (prefill already backed up).
         backup_indices = []
-        skipped_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
             if self._skip_first_backup[req_idx]:
                 self._skip_first_backup[req_idx] = False
-                skipped_indices.append((req_idx, int(seq_lens_cpu[i])))
                 continue
             backup_indices.append(i)
-        if _SPARSE_DEBUG and (skipped_indices or backup_indices):
-            logger.info(
-                "[SPARSE/coord] _eager_backup_previous_token: "
-                "bs=%d skipped(first-backup)=%s will_backup=%s",
-                len(seq_lens_cpu),
-                skipped_indices,
-                [
-                    (int(req_pool_indices_cpu[i]), int(seq_lens_cpu[i]))
-                    for i in backup_indices
-                ],
-            )
 
         if not backup_indices:
             return
@@ -764,102 +754,12 @@ class HiSparseCoordinator:
         # todo, adjustable for performance
         block_size = 1024
 
-        debug = _SPARSE_DEBUG and layer_id == 0
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/coord] L0 swap_in_selected_pages enter: "
-                "num_reqs=%d top_k=%d device_buffer_size=%d num_real_reqs=%d "
-                "req_pool_indices=%s seq_lens=%s top_k_result.shape=%s "
-                "top_k_result.dtype=%s mem_pool_device.k_buffer[0].shape=%s "
-                "host_pool.k_buffer[0].shape=%s",
-                num_reqs,
-                self.top_k,
-                self.device_buffer_size,
-                int(self.num_real_reqs.item()),
-                req_pool_indices.cpu().tolist(),
-                seq_lens.cpu().tolist(),
-                tuple(top_k_result.shape),
-                top_k_result.dtype,
-                tuple(self.mem_pool_device.k_buffer[layer_id].shape),
-                tuple(self.mem_pool_host.k_buffer[layer_id].shape),
+        if _SPARSE_ACCURACY_DEBUG and layer_id == 0:
+            self._log_swap_in_diagnostics_before(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                top_k_result=top_k_result,
             )
-            # Per-request integrity check: surface uninitialized requests
-            # (admit_request_from_gpu was never called) BEFORE the kernel
-            # dereferences ``host_locs[-1]`` and crashes.
-            for i in range(num_reqs):
-                req_idx = int(req_pool_indices[i].item())
-                seq_len_i = int(seq_lens[i].item())
-                buf_size_i = int(self.req_device_buffer_size[req_idx])
-                # Quest's max(token_position) is seq_len-1 (the newest token,
-                # handled via newest_slot in the kernel).  All non-newest
-                # tokens MUST have host_locs[t] >= 0.
-                row_kv = self.req_to_host_pool[req_idx, : seq_len_i - 1]
-                n_invalid_host = int((row_kv < 0).sum().item())
-                if buf_size_i == 0 or n_invalid_host > 0:
-                    logger.error(
-                        "[SPARSE/coord] !!! UNINITIALIZED REQ DETECTED !!! "
-                        "i=%d req_pool_idx=%d seq_len=%d buf_size=%d "
-                        "n_invalid_host_before_newest=%d. Did "
-                        "admit_request_from_gpu fail to run for this req?",
-                        i,
-                        req_idx,
-                        seq_len_i,
-                        buf_size_i,
-                        n_invalid_host,
-                    )
-            for i in range(min(num_reqs, 4)):
-                # Show top_k_result + the matching host_locs lookup so any
-                # ``-1`` host_loc that the swap-in kernel will dereference
-                # surfaces here BEFORE the kernel is launched.
-                tk = top_k_result[i].cpu().tolist()
-                req_idx = int(req_pool_indices[i].item())
-                seq_len_i = int(seq_lens[i].item())
-                host_locs_row = self.req_to_host_pool[req_idx].cpu()
-                # Distinct token positions that swap-in will dereference.
-                miss_tokens = sorted(
-                    set(
-                        t for t in tk
-                        if 0 <= t < seq_len_i and t != seq_len_i - 1
-                    )
-                )
-                # Look up the host_loc each miss token will resolve to.
-                bad_tokens = [
-                    t for t in miss_tokens
-                    if int(host_locs_row[t].item()) < 0
-                ]
-                # device_buffer state for this req
-                dev_bt = self.req_device_buffer_tokens[layer_id, req_idx].cpu()
-                dev_bl = self.req_device_buffer_token_locs[layer_id, req_idx].cpu()
-                dev_buffer_size = int(self.req_device_buffer_size[req_idx])
-                logger.info(
-                    "[SPARSE/coord] L0   req[%d] req_idx=%d seq_len=%d "
-                    "top_k_result[:8]=%s n_miss=%d "
-                    "host_locs_row[:5]=%s host_locs_row[seq_len-3:seq_len+2]=%s "
-                    "bad_miss_tokens(host_loc<0)=%s "
-                    "req_device_buffer_size=%d "
-                    "device_buffer_tokens[:5]=%s device_buffer_tokens[buf_size-2:buf_size+2]=%s "
-                    "device_buffer_locs[:5]=%s device_buffer_locs[buf_size-2:buf_size+2]=%s",
-                    i,
-                    req_idx,
-                    seq_len_i,
-                    tk[:8],
-                    len(miss_tokens),
-                    host_locs_row[:5].tolist(),
-                    host_locs_row[
-                        max(0, seq_len_i - 3) : seq_len_i + 2
-                    ].tolist(),
-                    bad_tokens[:10],
-                    dev_buffer_size,
-                    dev_bt[:5].tolist(),
-                    dev_bt[
-                        max(0, dev_buffer_size - 2) : dev_buffer_size + 2
-                    ].tolist(),
-                    dev_bl[:5].tolist(),
-                    dev_bl[
-                        max(0, dev_buffer_size - 2) : dev_buffer_size + 2
-                    ].tolist(),
-                )
 
         if self.mode == "sparse_decode":
             load_cache_to_device_buffer_mha(
@@ -901,17 +801,112 @@ class HiSparseCoordinator:
                 block_size=block_size,
                 num_real_reqs=self.num_real_reqs,
             )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/coord] L0 swap_in kernel OK: "
-                "top_k_indices.min=%d top_k_indices.max=%d "
-                "(must be < device pool size=%d)",
-                int(top_k_indices.min().item()),
-                int(top_k_indices.max().item()),
-                self.mem_pool_device.k_buffer[layer_id].shape[0],
+        if _SPARSE_ACCURACY_DEBUG and layer_id == 0:
+            self._log_swap_in_diagnostics_after(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                top_k_result=top_k_result,
+                top_k_indices=top_k_indices,
+                layer_id=layer_id,
             )
         return top_k_indices
+
+    def _log_swap_in_diagnostics_before(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+    ) -> None:
+        sample_n = min(req_pool_indices.shape[0], _SPARSE_ACCURACY_DEBUG_MAX_REQS)
+        if sample_n <= 0:
+            return
+
+        logger.info(
+            "[SPARSE/diag] swap-in input: sample=%d top_k=%d num_real_reqs=%d",
+            sample_n,
+            self.top_k,
+            int(self.num_real_reqs.item()),
+        )
+
+        req_cpu = req_pool_indices[:sample_n].cpu().tolist()
+        seq_cpu = seq_lens[:sample_n].cpu().tolist()
+        topk_cpu = top_k_result[:sample_n].cpu()
+
+        for i in range(sample_n):
+            req_idx = int(req_cpu[i])
+            seq_len_i = int(seq_cpu[i])
+            row = topk_cpu[i]
+            valid_mask = (row >= 0) & (row < seq_len_i)
+            valid_tokens = row[valid_mask]
+            unique_valid = int(torch.unique(valid_tokens).numel())
+            newest = seq_len_i - 1
+            miss_tokens = valid_tokens[valid_tokens != newest]
+
+            if miss_tokens.numel() > 0:
+                host_row = self.req_to_host_pool[req_idx].cpu()
+                host_rows = host_row[miss_tokens.long()]
+                missing_host = int((host_rows < 0).sum().item())
+            else:
+                missing_host = 0
+
+            logger.info(
+                "[SPARSE/diag] swap-in input req=%d seq_len=%d valid=%d unique=%d "
+                "missing_host=%d token_head=%s token_tail=%s",
+                req_idx,
+                seq_len_i,
+                int(valid_tokens.numel()),
+                unique_valid,
+                missing_host,
+                valid_tokens[:8].tolist(),
+                valid_tokens[max(0, valid_tokens.numel() - 8) :].tolist(),
+            )
+
+    def _log_swap_in_diagnostics_after(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        sample_n = min(req_pool_indices.shape[0], _SPARSE_ACCURACY_DEBUG_MAX_REQS)
+        if sample_n <= 0:
+            return
+
+        pool_size = int(self.mem_pool_device.k_buffer[layer_id].shape[0])
+        req_cpu = req_pool_indices[:sample_n].cpu().tolist()
+        seq_cpu = seq_lens[:sample_n].cpu().tolist()
+        topk_cpu = top_k_result[:sample_n].cpu()
+        locs_cpu = top_k_indices[:sample_n].cpu()
+
+        logger.info(
+            "[SPARSE/diag] swap-in output: sample=%d pool_size=%d",
+            sample_n,
+            pool_size,
+        )
+        for i in range(sample_n):
+            req_idx = int(req_cpu[i])
+            seq_len_i = int(seq_cpu[i])
+            token_row = topk_cpu[i]
+            loc_row = locs_cpu[i]
+            valid_mask = (token_row >= 0) & (token_row < seq_len_i)
+            valid_count = int(valid_mask.sum().item())
+            resolved_count = int((valid_mask & (loc_row >= 0)).sum().item())
+            unresolved = valid_count - resolved_count
+            oob = int(((loc_row >= 0) & (loc_row >= pool_size)).sum().item())
+
+            logger.info(
+                "[SPARSE/diag] swap-in output req=%d seq_len=%d valid=%d resolved=%d "
+                "unresolved=%d oob_device_loc=%d loc_head=%s loc_tail=%s",
+                req_idx,
+                seq_len_i,
+                valid_count,
+                resolved_count,
+                unresolved,
+                oob,
+                loc_row[:8].tolist(),
+                loc_row[max(0, loc_row.numel() - 8) :].tolist(),
+            )
 
     def admit_request_from_gpu(self, req: Req) -> None:
         """Single-instance counterpart of :meth:`admit_request_into_staging`.
@@ -969,22 +964,18 @@ class HiSparseCoordinator:
         host_indices = host_indices.to(device=self.device)
         self.req_to_host_pool[req.req_pool_idx, :kv_len] = host_indices
 
-        if _SPARSE_DEBUG:
+        if _SPARSE_ACCURACY_DEBUG:
             host_min = int(host_indices.min().item())
             host_max = int(host_indices.max().item())
             logger.info(
-                "[SPARSE/coord] admit_request_from_gpu: req=%s req_pool_idx=%d "
-                "kv_len=%d host_indices.min=%d host_indices.max=%d "
-                "host_pool.size=%d req_to_host_pool[req_idx, kv_len-1]=%d "
-                "req_to_host_pool[req_idx, kv_len]=%d (must be -1)",
+                "[SPARSE/diag] admit req=%s req_pool_idx=%d kv_len=%d "
+                "host_idx_range=[%d,%d] device_buffer_size=%d",
                 req.rid,
                 req.req_pool_idx,
                 kv_len,
                 host_min,
                 host_max,
-                self.mem_pool_host.size,
-                int(self.req_to_host_pool[req.req_pool_idx, kv_len - 1].item()),
-                int(self.req_to_host_pool[req.req_pool_idx, kv_len].item()) if kv_len < self.req_to_host_pool.shape[1] else -999,
+                int(self.req_device_buffer_size[req.req_pool_idx]),
             )
 
         self.mem_pool_host.backup_from_device_all_layer(

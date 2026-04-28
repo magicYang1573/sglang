@@ -16,7 +16,6 @@ before returning.
 """
 
 import logging
-import os
 
 import torch
 
@@ -25,7 +24,6 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
 )
 
 logger = logging.getLogger(__name__)
-_SPARSE_DEBUG = os.environ.get("SGLANG_SPARSE_DEBUG", "0") == "1"
 
 
 class QuestAlgorithm(BaseSparseAlgorithmImpl):
@@ -71,7 +69,6 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         end_page: torch.Tensor,
         k_buffer: torch.Tensor,
     ):
-        debug = _SPARSE_DEBUG and layer_id == 0
         if isinstance(start_page, int):
             start_page = torch.full_like(end_page, start_page)
 
@@ -79,21 +76,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         req_to_token = self.req_to_token_pool.req_to_token
         n = reqs.shape[0]
         max_pages = int((end_page - start_page).max().item())
-        if debug:
-            logger.info(
-                "[SPARSE/algo] L0 _compute_page_representations: n=%d max_pages=%d "
-                "page_size=%d k_buffer.shape=%s req_to_token.shape=%s "
-                "page_k_min.shape=%s",
-                n,
-                max_pages,
-                self.page_size,
-                tuple(k_buffer.shape),
-                tuple(req_to_token.shape),
-                tuple(self.page_k_min[layer_id].shape),
-            )
         if max_pages <= 0:
-            if debug:
-                logger.info("[SPARSE/algo] L0 max_pages<=0, return early")
             return
 
         pg_off = torch.arange(max_pages, device=device).unsqueeze(0)
@@ -108,42 +91,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             < (tok_start + self.page_size).clamp(max=seq_lens.unsqueeze(1)).unsqueeze(2)
         ) & pg_mask.unsqueeze(2)
 
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 pg_id.shape=%s tok_pos.shape=%s "
-                "tok_pos.min=%d tok_pos.max=%d tok_pos clamp ub=%d",
-                tuple(pg_id.shape),
-                tuple(tok_pos.shape),
-                int(tok_pos.min().item()),
-                int(tok_pos.max().item()),
-                req_to_token.shape[1] - 1,
-            )
-
         phys_tok = req_to_token[
             reqs.view(n, 1, 1).expand(n, max_pages, self.page_size),
             tok_pos.clamp(0, req_to_token.shape[1] - 1),
         ].clamp(0, k_buffer.shape[0] - 1)
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 phys_tok.shape=%s phys_tok.min=%d phys_tok.max=%d "
-                "(must be < k_buffer.shape[0]=%d)",
-                tuple(phys_tok.shape),
-                int(phys_tok.min().item()),
-                int(phys_tok.max().item()),
-                k_buffer.shape[0],
-            )
 
         keys = k_buffer[phys_tok].to(torch.float32)
         mask = tok_mask.unsqueeze(-1).unsqueeze(-1)
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 keys.shape=%s mask.shape=%s",
-                tuple(keys.shape),
-                tuple(mask.shape),
-            )
 
         page_min = torch.where(mask, keys, torch.full_like(keys, float("inf"))).amin(
             dim=2
@@ -159,43 +113,17 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             ]
             // self.page_size
         )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 phys_pg.shape=%s phys_pg.min=%d phys_pg.max=%d "
-                "page_k_min.shape[0]=%d",
-                tuple(phys_pg.shape),
-                int(phys_pg.min().item()),
-                int(phys_pg.max().item()),
-                self.page_k_min[layer_id].shape[0],
-            )
 
         idx = pg_mask.nonzero(as_tuple=False)
         if idx.numel() == 0:
-            if debug:
-                logger.info("[SPARSE/algo] L0 idx empty, return")
             return
 
         target_pages = phys_pg[idx[:, 0], idx[:, 1]].clamp(
             0, self.page_k_min[layer_id].shape[0] - 1
         )
-        if debug:
-            torch.cuda.synchronize()
-            logger.info(
-                "[SPARSE/algo] L0 idx.shape=%s target_pages.shape=%s "
-                "target_pages.min=%d target_pages.max=%d page_min[idx].shape=%s",
-                tuple(idx.shape),
-                tuple(target_pages.shape),
-                int(target_pages.min().item()),
-                int(target_pages.max().item()),
-                tuple(page_min[idx[:, 0], idx[:, 1]].shape),
-            )
         self.page_k_min[layer_id][target_pages] = page_min[idx[:, 0], idx[:, 1]]
         self.page_k_max[layer_id][target_pages] = page_max[idx[:, 0], idx[:, 1]]
         self.page_valid[layer_id][target_pages] = True
-        if debug:
-            torch.cuda.synchronize()
-            logger.info("[SPARSE/algo] L0 page_k_min/max/valid scatter OK")
 
     def retrieve_topk(
         self,
