@@ -167,6 +167,9 @@ class SparseAlgorithmController:
         if req.req_pool_idx is None:
             return
         self.states.clear(req.req_pool_idx)
+        # Release any per-request tensors held by the algorithm (e.g. Quest's
+        # lazily-allocated page_k_min/max/valid).
+        self.algorithm.release_request_pool(req.req_pool_idx)
 
     def before_decode_step(self, forward_batch: "ForwardBatch") -> None:
         """Per-decode-step pre-forward hook.  Currently a no-op."""

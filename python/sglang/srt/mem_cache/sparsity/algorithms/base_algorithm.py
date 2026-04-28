@@ -284,104 +284,24 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         req_pool_indices: torch.Tensor,
         **kwargs,
     ) -> tuple:
+        """Default TopK retrieval is now provided by subclasses.
+
+        The previous default that depended on ``_retrieve_page_scores`` taking
+        physical-page indices has been removed because page indexing is now
+        per-request (see :class:`QuestAlgorithm`).  Subclasses must override
+        :meth:`retrieve_topk` directly.
         """
-        Default TopK retrieval: score-based selection + recent pages.
-        Subclasses can override for query-dependent retrieval.
-
-        Returns ``(top_k_tokens, valid_lengths)`` matching the contract in
-        :meth:`BaseSparseAlgorithm.retrieve_topk`.  Specifically:
-        - Output shape is ``(bs, top_k_budget)`` with top_k_budget set
-          from ``self.config.top_k`` (NOT from per-batch max_len).
-        - Short requests (seq_len <= top_k_budget) report
-          ``valid_lengths[i] = seq_len[i]`` and the output positions cover
-          every valid page (recent window saturates) → equivalent to dense.
-
-        TODO:
-            1. Using triton kernel to speed up this function
-            2. Support CUDA Graph (requires removing the Python for-loop and
-               dynamic-shape ops)
-        """
-        bs, device = queries.shape[0], queries.device
-        top_k_budget = int(self.config.top_k)
-
-        seq_lens_source = kwargs.get("forward_batch", None)
-        if seq_lens_source is None or not hasattr(seq_lens_source, "seq_lens"):
-            raise ValueError(
-                "forward_batch with seq_lens is required for TopK retrieval"
-            )
-        seq_lens = seq_lens_source.seq_lens.to(device)
-
-        req_to_token = self.req_to_token_pool.req_to_token
-        max_req_tokens = req_to_token.shape[1]
-
-        out_indices = torch.full(
-            (bs, top_k_budget), -1, dtype=torch.int32, device=device
+        raise NotImplementedError(
+            "Subclasses must override retrieve_topk; there is no shared default."
         )
-        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
 
-        for i in range(bs):
-            seq_len_i = int(seq_lens[i].item())
-            if seq_len_i <= 0:
-                continue
+    def release_request_pool(self, req_pool_idx: int) -> None:
+        """Free per-request representation tensors when a request ends.
 
-            num_pages = int((seq_len_i + self.page_size - 1) // self.page_size)
-            if num_pages <= 0:
-                continue
-
-            page_idx = torch.arange(num_pages, device=device)
-            page_start_token = req_to_token[
-                req_pool_indices[i],
-                (page_idx * self.page_size).clamp(0, max_req_tokens - 1),
-            ]
-            phys_pages = (page_start_token // self.page_size).unsqueeze(0)
-
-            scores = self._retrieve_page_scores(
-                layer_id,
-                phys_pages,
-                req_pool_indices[i : i + 1],
-                queries[i : i + 1],
-            )
-
-            recent_count = min(self.num_recent_pages, num_pages)
-            recent_start = num_pages - recent_count
-            scores = scores.clone()
-            if recent_count > 0:
-                scores[:, recent_start:] = float("-inf")
-
-            history_pages = recent_start
-            if history_pages > 0:
-                k = max(int(history_pages * self.sparsity_ratio), 1)
-                k = min(k, history_pages)
-                topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
-            else:
-                topk_idx = torch.empty(0, dtype=torch.int64, device=device)
-
-            recent_idx = torch.arange(
-                recent_start, num_pages, device=device, dtype=torch.int64
-            )
-            combined_pages = torch.cat([topk_idx.to(torch.int64), recent_idx], dim=0)
-            combined_pages = torch.unique(combined_pages)
-
-            if self.page_size == 1:
-                token_positions = combined_pages.to(torch.int32)
-            else:
-                page_starts = combined_pages * self.page_size
-                offsets = torch.arange(
-                    self.page_size, device=device, dtype=torch.int64
-                )
-                token_positions = (
-                    page_starts.unsqueeze(1) + offsets.unsqueeze(0)
-                ).reshape(-1)
-                token_positions = token_positions[token_positions < seq_len_i]
-                token_positions = token_positions.to(torch.int32)
-
-            length = min(int(token_positions.numel()), top_k_budget)
-            if length == 0:
-                continue
-            out_indices[i, :length] = token_positions[:length]
-            out_lengths[i] = length
-
-        return out_indices, out_lengths
+        Default implementation is a no-op.  Subclasses (e.g. Quest) override
+        to release lazily-allocated state.
+        """
+        return
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
@@ -399,14 +319,4 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         k_buffer: torch.Tensor,
     ):
         """Compute and store page representations for given page range."""
-        raise NotImplementedError
-
-    def _retrieve_page_scores(
-        self,
-        layer_id: int,
-        phys_pages: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        queries: torch.Tensor,
-    ) -> torch.Tensor:
-        """Retrieve page scores for TopK selection."""
         raise NotImplementedError
