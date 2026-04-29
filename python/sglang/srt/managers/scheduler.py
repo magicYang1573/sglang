@@ -2325,8 +2325,17 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
-        if self.enable_hisparse:
+        native_hisparse = (
+            self.enable_hisparse
+            and self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.mode != "sparse_decode"
+        )
+
+        # Native DSA HiSparse has its own async staging transition; skip
+        # last_batch merge only for that path. Non-native sparse_decode admits
+        # requests synchronously from local GPU KV and should use the normal
+        # prefill->decode merge.
+        if native_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -2339,7 +2348,7 @@ class Scheduler(
             self.running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not native_hisparse
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):

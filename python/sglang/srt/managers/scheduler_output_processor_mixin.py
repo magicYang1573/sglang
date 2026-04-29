@@ -197,9 +197,15 @@ class SchedulerOutputProcessorMixin:
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
-                        if self.enable_hisparse:
+                        if (
+                            self.enable_hisparse
+                            and self.hisparse_coordinator.mode != "sparse_decode"
+                        ):
                             self.hisparse_coordinator.admit_request_into_staging(req)
-                        elif self.enable_sparse_decode:
+                        elif self.enable_sparse_decode or (
+                            self.enable_hisparse
+                            and self.hisparse_coordinator.mode == "sparse_decode"
+                        ):
                             # Single-instance path: migrate the full GPU KV to
                             # host and allocate the hot buffer in one shot.
                             self.hisparse_coordinator.admit_request_from_gpu(req)
