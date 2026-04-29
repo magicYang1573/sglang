@@ -25,6 +25,9 @@
 #   ROUND2_OUTPUT_MIN, ROUND2_OUTPUT_MAX (defaults fixed 1k)
 #   HF_ENDPOINT, RESULTS_DIR, SERVER_STARTUP_WAIT, SKIP_SERVER
 #   SGLANG_ENV_SCRIPT, PYTHON_BIN, E2E_FAST
+#   SERVER_SHUTDOWN_WAIT (default 120): seconds to wait after SIGTERM before SIGKILL tree
+#   WAIT_PORTS_RELEASED (default 180): max seconds to wait for HTTP+DP ZMQ ports to free
+#   KILL_SERVER_POST_SLEEP (default 3): sleep after ports are free before returning
 #
 # Resume: existing per-case JSON under RESULTS_DIR is skipped unless FORCE_RERUN=1.
 #
@@ -55,6 +58,9 @@ ROUND2_OUTPUT_MAX="${ROUND2_OUTPUT_MAX:-1024}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-600}"
 SKIP_SERVER="${SKIP_SERVER:-0}"
+SERVER_SHUTDOWN_WAIT="${SERVER_SHUTDOWN_WAIT:-120}"
+WAIT_PORTS_RELEASED="${WAIT_PORTS_RELEASED:-180}"
+KILL_SERVER_POST_SLEEP="${KILL_SERVER_POST_SLEEP:-3}"
 
 SGLANG_ENV_SCRIPT="${SGLANG_ENV_SCRIPT:-${HOME}/env.sh}"
 PYTHON_BIN="${PYTHON_BIN:-/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python}"
@@ -133,13 +139,88 @@ wait_for_server() {
   echo "  Server ready (waited ${waited}s)"
 }
 
+# Depth-first: children first so worker binds release before the parent on SIGKILL.
+_kill_process_tree() {
+  local pid="$1"
+  local sig="$2"
+  local children
+  children="$(pgrep -P "${pid}" 2>/dev/null || true)"
+  for c in ${children}; do
+    _kill_process_tree "${c}" "${sig}"
+  done
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -"${sig}" "${pid}" 2>/dev/null || true
+  fi
+}
+
+_wait_pid_gone() {
+  local pid="$1"
+  local max_sec="$2"
+  local i=0
+  while [[ "${i}" -lt "${max_sec}" ]]; do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# DP attention single-node: dist_init=PORT+233 .. scheduler=PORT+238 (see server_args.ZMQ_TCP_PORT_DELTA).
+_wait_dp_http_zmq_ports_free() {
+  local max_w="$1"
+  "${PYTHON_BIN}" - "${PORT}" "${max_w}" <<'PY' || return 1
+import socket, sys, time
+
+port, max_w = int(sys.argv[1]), float(sys.argv[2])
+ports = [port] + list(range(port + 233, port + 239))
+deadline = time.time() + max_w
+while time.time() < deadline:
+    busy = []
+    for p in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", p))
+        except OSError:
+            busy.append(p)
+        finally:
+            s.close()
+    if not busy:
+        sys.exit(0)
+    time.sleep(0.25)
+print(f"  WARNING: ports still busy after {max_w}s: {busy}", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
 kill_server() {
+  local ran_stop=0
   if [[ -n "${SERVER_PID:-}" ]]; then
+    ran_stop=1
     echo "  Stopping server (PID=${SERVER_PID})..."
-    kill "${SERVER_PID}" 2>/dev/null || true
+    kill -TERM "${SERVER_PID}" 2>/dev/null || true
+    if ! _wait_pid_gone "${SERVER_PID}" "${SERVER_SHUTDOWN_WAIT}"; then
+      echo "  Server still up after ${SERVER_SHUTDOWN_WAIT}s SIGTERM; sending SIGKILL to process tree..."
+      _kill_process_tree "${SERVER_PID}" KILL
+      _wait_pid_gone "${SERVER_PID}" 30 || true
+    fi
     wait "${SERVER_PID}" 2>/dev/null || true
     unset SERVER_PID
-    sleep 5
+  fi
+
+  if ! _wait_dp_http_zmq_ports_free "${WAIT_PORTS_RELEASED}"; then
+    ran_stop=1
+    echo "  Forcing pkill -KILL on sglang.launch_server for --port ${PORT} ..."
+    pkill -KILL -f "sglang\\.launch_server.*--port ${PORT}([[:space:]]|$)" 2>/dev/null || true
+    sleep 2
+    if ! _wait_dp_http_zmq_ports_free 90; then
+      echo "  ERROR: HTTP/ZMQ ports for PORT=${PORT} not released; next start may fail." >&2
+    fi
+  fi
+  if [[ "${ran_stop}" -eq 1 ]]; then
+    sleep "${KILL_SERVER_POST_SLEEP}"
   fi
 }
 
