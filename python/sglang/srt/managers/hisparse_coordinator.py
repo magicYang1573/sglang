@@ -478,7 +478,9 @@ class HiSparseCoordinator:
         if self.algorithm_controller is not None:
             self._all_dense_this_step = (
                 self.algorithm_controller.compute_all_dense_flag(
-                    req_pool_indices_cpu.tolist()
+                    req_pool_indices_cpu.tolist(),
+                    seq_lens_cpu=seq_lens_cpu,
+                    device_buffer_size=self.device_buffer_size,
                 )
             )
         else:

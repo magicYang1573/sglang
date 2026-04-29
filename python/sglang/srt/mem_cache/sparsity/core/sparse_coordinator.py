@@ -185,7 +185,9 @@ class SparseAlgorithmController:
         """Per-decode-step pre-forward hook.  Currently a no-op."""
         return
 
-    def compute_all_dense_flag(self, req_pool_indices_cpu) -> bool:
+    def compute_all_dense_flag(
+        self, req_pool_indices_cpu, seq_lens_cpu=None, device_buffer_size=None
+    ) -> bool:
         """Return True if no request in the batch needs sparse attention.
 
         Purely CPU-side (reads ``RequestTrackers.prompt_lens_cpu``) so that
@@ -200,10 +202,16 @@ class SparseAlgorithmController:
             # No threshold configured → every request goes through sparse.
             return False
         prompt_lens_cpu = self.states.prompt_lens_cpu
-        for req_idx in req_pool_indices_cpu:
+        seq_lens_list = (
+            seq_lens_cpu.tolist() if seq_lens_cpu is not None else [None] * len(req_pool_indices_cpu)
+        )
+        for req_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_list):
             prompt_len = prompt_lens_cpu.get(int(req_idx), 0)
             if prompt_len >= min_len:
                 return False
+            if device_buffer_size is not None and seq_len is not None:
+                if int(seq_len) > int(device_buffer_size):
+                    return False
         return True
 
     def begin_layer_decode(
@@ -294,13 +302,16 @@ class SparseAlgorithmController:
         if page_table is None or self.io is None:
             return attn_metadata
 
-        mapping = self.io.mem_pool_device.full_to_hisparse_device_index_mapping
         max_seq_len = page_table.shape[1]
-        translated = mapping[page_table.to(mapping.device)].to(page_table.device)
-        translated = torch.where(translated > 0, translated, page_table)
-
         cols = torch.arange(max_seq_len, device=page_table.device).view(1, -1)
         valid = cols < forward_batch.seq_lens.to(page_table.device).view(-1, 1)
+        buffer_cols = cols.clamp(max=self.io.device_buffer_size).expand(
+            forward_batch.req_pool_indices.shape[0], max_seq_len
+        )
+        translated = self.io.req_to_device_buffer[
+            forward_batch.req_pool_indices.to(self.io.req_to_device_buffer.device).view(-1, 1),
+            buffer_cols.to(self.io.req_to_device_buffer.device),
+        ].to(page_table.device)
         page_table.copy_(torch.where(valid, translated.to(page_table.dtype), page_table))
         return attn_metadata
 
