@@ -1,36 +1,32 @@
 #!/bin/bash
 # =============================================================================
-# DeepSeek-V3.2 full-GPU (no HiSparse) — context × concurrency throughput sweep
+# DeepSeek-V3.2 full-GPU (no HiSparse) — tiered context × concurrency (e2e_bench_fast)
 # =============================================================================
 #
-# Goal:
-#   - Do NOT use HiSparse / RDMA pool.
-#   - Benchmark context lengths: 16k, 32k, 64k, 128k
-#   - Benchmark max-concurrency: 8,16,32,48,64,80,96
-#   - For each context length, stop running higher concurrencies when throughput
-#     gain is negligible ("almost no improvement").
+# Matrix (num-requests = max_concurrency × NUM_REQUESTS_MULT, default mult=2):
+#   Run order: 32k → 64k → 128k → 16k (long context first; 16k last).
+#   32k  ctx: conc 8, 16, 32
+#   64k  ctx: conc 8, 16
+#   128k ctx: conc 8
+#   16k  ctx: conc 8, 16, 32, 48, 64
 #
-# Notes:
-#   - Radix cache remains enabled by default (we do NOT pass --disable-radix-cache).
-#   - Per case: start server -> /health -> e2e_bench_fast -> stop server.
-#   - Resume supported: existing JSON under RESULTS_DIR is reused unless
-#     FORCE_RERUN=1.
+# Client: e2e_bench_fast.py (two-round warmup + measurement).
+# Per case: start server -> /health -> e2e_bench_fast -> stop server.
 #
 # Usage:
 #   export MODEL_PATH=/path/to/DeepSeek-V3.2-AWQ
-#   bash test/cxl_utils/run_deepseek_v32_gpu_concurrency_autostop.sh
+#   bash test/cxl_utils/run_deepseek_v32_gpu_e2e_tiered_conc.sh
 #
 # Optional env:
 #   MODEL_CLIENT, PORT, TP, DP_SIZE, MEM_FRACTION_STATIC, MAX_TOTAL_TOKENS
-#   NUM_REQUESTS_MULT (num-requests = max_concurrency x this, default 2 → conc×2)
+#   NUM_REQUESTS_MULT (default 2 → conc×2)
 #   NUM_UNIQUE_PROMPTS, OUTPUT_TOKENS
 #   REQUEST_RATE, REPEAT_MODE, PROMPT_MODE, SEED, PAUSE_BETWEEN_ROUNDS
 #   ROUND2_OUTPUT_MIN, ROUND2_OUTPUT_MAX (defaults fixed 1k)
-#   EARLY_STOP_ENABLE (default 1)
-#   EARLY_STOP_MIN_IMPROVEMENT (default 0.05, i.e. <5% gain => stop)
-#   EARLY_STOP_CHECK_FROM_CONC (default 32)
 #   HF_ENDPOINT, RESULTS_DIR, SERVER_STARTUP_WAIT, SKIP_SERVER
-#   SGLANG_ENV_SCRIPT, PYTHON_BIN
+#   SGLANG_ENV_SCRIPT, PYTHON_BIN, E2E_FAST
+#
+# Resume: existing per-case JSON under RESULTS_DIR is skipped unless FORCE_RERUN=1.
 #
 # =============================================================================
 
@@ -53,13 +49,8 @@ PROMPT_MODE="${PROMPT_MODE:-synthetic}"
 SEED="${SEED:-42}"
 PAUSE_BETWEEN_ROUNDS="${PAUSE_BETWEEN_ROUNDS:-3.0}"
 
-# Fixed 1k Round-2 decode by default (same style as phased req512 scripts).
 ROUND2_OUTPUT_MIN="${ROUND2_OUTPUT_MIN:-1024}"
 ROUND2_OUTPUT_MAX="${ROUND2_OUTPUT_MAX:-1024}"
-
-EARLY_STOP_ENABLE="${EARLY_STOP_ENABLE:-1}"
-EARLY_STOP_MIN_IMPROVEMENT="${EARLY_STOP_MIN_IMPROVEMENT:-0.05}"
-EARLY_STOP_CHECK_FROM_CONC="${EARLY_STOP_CHECK_FROM_CONC:-32}"
 
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-600}"
@@ -72,11 +63,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 E2E_FAST="${E2E_FAST:-${SCRIPT_DIR}/e2e_bench_fast.py}"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results_deepseek_v32_gpu_conc_autostop_${TIMESTAMP}}"
+RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results_deepseek_v32_gpu_e2e_tiered_${TIMESTAMP}}"
 
-CONTEXT_LENGTHS=(16384 32768 65536 131072)
-CONCURRENCIES=(8 16 32 48 64 80 96)
-MAX_CASES=$(( ${#CONTEXT_LENGTHS[@]} * ${#CONCURRENCIES[@]} ))
+# Order: 32k, 64k, 128k, then 16k — conc lists per context (tokens).
+CONTEXT_LENGTHS=(32768 65536 131072 16384)
+TOTAL_CASES=11
+
+conc_list_for_ctx() {
+  case "$1" in
+    16384)  printf '%s' "8 16 32 48 64" ;;
+    32768)  printf '%s' "8 16 32" ;;
+    65536)  printf '%s' "8 16" ;;
+    131072) printf '%s' "8" ;;
+    *)      printf '%s' "" ;;
+  esac
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -96,7 +97,7 @@ while [[ $# -gt 0 ]]; do
     --env-script) SGLANG_ENV_SCRIPT="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
     -h|--help)
-      sed -n '1,42p' "$0"
+      sed -n '1,38p' "$0"
       exit 0
       ;;
     *) echo "Unknown argument: $1"; exit 1 ;;
@@ -115,7 +116,6 @@ fi
 
 mkdir -p "${RESULTS_DIR}"
 META_FILE="${RESULTS_DIR}/run_meta.txt"
-EARLY_STOP_FILE="${RESULTS_DIR}/early_stop_notes.txt"
 
 wait_for_server() {
   local url="http://127.0.0.1:${PORT}/health"
@@ -202,63 +202,23 @@ run_e2e_fast() {
     2>&1 | tee "${out_json%.json}.log"
 }
 
-extract_r2_output_throughput() {
-  local json_file="$1"
-  "${PYTHON_BIN}" - "${json_file}" <<'PY'
-import json, math, sys
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        d = json.load(f)
-    v = d.get("round2", {}).get("metrics", {}).get("output_throughput_tok_s", float("nan"))
-    v = float(v)
-    if math.isfinite(v):
-        print(f"{v:.6f}")
-    else:
-        print("nan")
-except Exception:
-    print("nan")
-PY
-}
-
-calc_improvement_ratio() {
-  local prev="$1"
-  local curr="$2"
-  "${PYTHON_BIN}" - "${prev}" "${curr}" <<'PY'
-import math, sys
-prev = float(sys.argv[1])
-curr = float(sys.argv[2])
-if (not math.isfinite(prev)) or prev <= 0.0 or (not math.isfinite(curr)):
-    print("inf")
-else:
-    print(f"{(curr - prev) / prev:.6f}")
-PY
-}
-
 {
-  echo "run_deepseek_v32_gpu_concurrency_autostop.sh"
+  echo "run_deepseek_v32_gpu_e2e_tiered_conc.sh"
   echo "timestamp=${TIMESTAMP}"
   echo "MODEL_PATH=${MODEL_PATH} MODEL_CLIENT=${MODEL_CLIENT}"
   echo "TP=${TP} DP_SIZE=${DP_SIZE} PORT=${PORT}"
-  echo "CONTEXT_LENGTHS=${CONTEXT_LENGTHS[*]}"
-  echo "CONCURRENCIES=${CONCURRENCIES[*]}"
-  echo "NUM_REQUESTS_MULT=${NUM_REQUESTS_MULT}"
+  echo "Order: 32k -> 64k -> 128k -> 16k"
+  echo "Matrix: 32k -> 8,16,32 | 64k -> 8,16 | 128k -> 8 | 16k -> 8,16,32,48,64"
+  echo "NUM_REQUESTS_MULT=${NUM_REQUESTS_MULT} (num-req = conc × mult)"
   echo "ROUND2_OUTPUT_MIN=${ROUND2_OUTPUT_MIN} ROUND2_OUTPUT_MAX=${ROUND2_OUTPUT_MAX}"
-  echo "EARLY_STOP_ENABLE=${EARLY_STOP_ENABLE}"
-  echo "EARLY_STOP_MIN_IMPROVEMENT=${EARLY_STOP_MIN_IMPROVEMENT}"
-  echo "EARLY_STOP_CHECK_FROM_CONC=${EARLY_STOP_CHECK_FROM_CONC}"
-  echo "MAX_CASES=${MAX_CASES}"
+  echo "TOTAL_CASES=${TOTAL_CASES}"
   echo "RESULTS_DIR=${RESULTS_DIR}"
-  echo "PYTHON_BIN=${PYTHON_BIN}"
-  echo "NOTE=Radix cache is enabled by default (no --disable-radix-cache)."
+  echo "PYTHON_BIN=${PYTHON_BIN} E2E_FAST=${E2E_FAST}"
 } > "${META_FILE}"
 
-: > "${EARLY_STOP_FILE}"
-
 echo "============================================================"
-echo "DeepSeek-V3.2 full-GPU context × concurrency sweep -> ${RESULTS_DIR}/"
-echo "  No HiSparse. Radix cache uses default (enabled)."
-echo "  Max possible cases: ${MAX_CASES}"
+echo "DeepSeek-V3.2 GPU e2e (tiered conc) -> ${RESULTS_DIR}/"
+echo "  Cases: ${TOTAL_CASES}  |  e2e_bench_fast  |  num-req = conc×${NUM_REQUESTS_MULT}"
 echo "============================================================"
 
 CASE_IDX=0
@@ -266,78 +226,62 @@ RAN_CASES=0
 
 for tin in "${CONTEXT_LENGTHS[@]}"; do
   tag="$(ctx_tag "${tin}")"
-  prev_tput="nan"
-  prev_conc=0
+  clist="$(conc_list_for_ctx "${tin}")"
+  if [[ -z "${clist}" ]]; then
+    echo "ERROR: no concurrency list for ctx=${tin}" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2206
+  CONCS=( ${clist} )
 
   echo ""
-  echo "######################## Context ${tag} ########################"
-  for conc in "${CONCURRENCIES[@]}"; do
+  echo "######################## Context ${tag} (conc: ${clist}) ########################"
+
+  for conc in "${CONCS[@]}"; do
     CASE_IDX=$((CASE_IDX + 1))
     nreq=$(( conc * NUM_REQUESTS_MULT ))
-    base="gpu_full_v32_ctx${tag}_conc${conc}_r2_${ROUND2_OUTPUT_MIN}_${ROUND2_OUTPUT_MAX}_n${nreq}"
+    base="gpu_e2e_tiered_ctx${tag}_conc${conc}_r2_${ROUND2_OUTPUT_MIN}_${ROUND2_OUTPUT_MAX}_n${nreq}"
     out_file="${RESULTS_DIR}/${base}.json"
     srv_log="${RESULTS_DIR}/server_${base}.log"
 
     if [[ "${FORCE_RERUN:-0}" != "1" ]] && [[ -f "${out_file}" ]]; then
       echo ""
       echo "################################################################"
-      echo "  SKIP ${CASE_IDX}/${MAX_CASES}: existing ${out_file##*/}"
+      echo "  SKIP ${CASE_IDX}/${TOTAL_CASES}: existing ${out_file##*/}"
       echo "################################################################"
+      continue
+    fi
+
+    echo ""
+    echo "################################################################"
+    echo "  CASE ${CASE_IDX}/${TOTAL_CASES}: ctx=${tin} (${tag}) conc=${conc} num-req=${nreq} (=conc×${NUM_REQUESTS_MULT})"
+    echo "################################################################"
+
+    if [[ "${SKIP_SERVER}" == "1" ]]; then
+      echo "  SKIP_SERVER=1 — client only"
     else
-      echo ""
-      echo "################################################################"
-      echo "  CASE ${CASE_IDX}/${MAX_CASES}: ctx=${tin} (${tag}) conc=${conc} num-req=${nreq} (=conc×${NUM_REQUESTS_MULT})"
-      echo "################################################################"
-
-      if [[ "${SKIP_SERVER}" == "1" ]]; then
-        echo "  SKIP_SERVER=1 -> client only"
-      else
-        kill_server 2>/dev/null || true
-        start_server_gpu "${srv_log}"
-        if ! wait_for_server; then
-          echo "  ERROR: server failed to start, skip this case"
-          kill_server
-          continue
-        fi
-      fi
-
-      echo "  --- client -> ${out_file##*/} ---"
-      run_e2e_fast "${out_file}" "${tin}" "${nreq}" "${conc}"
-      RAN_CASES=$((RAN_CASES + 1))
-
-      if [[ "${SKIP_SERVER}" != "1" ]]; then
+      kill_server 2>/dev/null || true
+      start_server_gpu "${srv_log}"
+      if ! wait_for_server; then
+        echo "  ERROR: server failed to start — skipping"
         kill_server
+        continue
       fi
     fi
 
-    curr_tput="$(extract_r2_output_throughput "${out_file}")"
-    echo "  Round2 output throughput: ${curr_tput} tok/s"
+    echo "  --- client -> ${out_file##*/} ---"
+    run_e2e_fast "${out_file}" "${tin}" "${nreq}" "${conc}"
+    RAN_CASES=$((RAN_CASES + 1))
 
-    if [[ "${EARLY_STOP_ENABLE}" == "1" ]] && [[ "${prev_conc}" -gt 0 ]] && [[ "${conc}" -ge "${EARLY_STOP_CHECK_FROM_CONC}" ]]; then
-      improve_ratio="$(calc_improvement_ratio "${prev_tput}" "${curr_tput}")"
-      echo "  Throughput gain vs conc=${prev_conc}: ${improve_ratio}"
-      if awk -v imp="${improve_ratio}" -v thr="${EARLY_STOP_MIN_IMPROVEMENT}" 'BEGIN { exit !(imp < thr) }'; then
-        note="ctx=${tag}: stop after conc=${conc}; gain_vs_${prev_conc}=${improve_ratio} < threshold=${EARLY_STOP_MIN_IMPROVEMENT}"
-        echo "  EARLY STOP: ${note}"
-        echo "${note}" | tee -a "${EARLY_STOP_FILE}"
-        break
-      fi
+    if [[ "${SKIP_SERVER}" != "1" ]]; then
+      kill_server
     fi
-
-    prev_tput="${curr_tput}"
-    prev_conc="${conc}"
   done
 done
 
 echo ""
 echo "Done. Results under: ${RESULTS_DIR}/"
-echo "Executed new client runs: ${RAN_CASES}"
-if [[ -s "${EARLY_STOP_FILE}" ]]; then
-  echo "Early-stop notes:"
-  cat "${EARLY_STOP_FILE}"
-else
-  echo "Early-stop notes: (none)"
-fi
+echo "New client runs this session: ${RAN_CASES}"
 
 export RESULTS_DIR
 "${PYTHON_BIN}" << 'PY'
@@ -347,7 +291,7 @@ results_dir = os.environ.get("RESULTS_DIR", "")
 if not results_dir or not os.path.isdir(results_dir):
     sys.exit(0)
 
-pat = re.compile(r"gpu_full_v32_ctx([0-9]+k)_conc([0-9]+)_")
+pat = re.compile(r"gpu_e2e_tiered_ctx([0-9]+k)_conc([0-9]+)_")
 rows = []
 for p in glob.glob(os.path.join(results_dir, "*.json")):
     bn = os.path.basename(p)
