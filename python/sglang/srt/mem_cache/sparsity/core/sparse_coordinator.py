@@ -232,12 +232,14 @@ class SparseAlgorithmController:
         if layer.layer_id == self.start_layer:
             self.adapter.save_original_metadata(attn_metadata)
 
-        # Fast path: every request in this decode batch stays dense
-        # (e.g. all sequences shorter than ``min_sparse_prompt_len``).
-        # Skip retrieve_topk + swap_in + metadata rewrite entirely; FA3 will
-        # see the unchanged dense metadata.  The flag is populated once per
-        # step by :meth:`HiSparseCoordinator.map_last_loc_to_buffer`.
+        # Dense fallback: every request attends to all tokens, but the KV rows
+        # still live in the HiSparse hot buffer after prefill admission /
+        # decode writes.  Therefore FA3 must see translated physical rows, not
+        # the original logical ``req_to_token`` rows.
         if getattr(self.io, "_all_dense_this_step", False):
+            attn_metadata = self._translate_dense_metadata_for_hisparse(
+                attn_metadata, forward_batch
+            )
             self._maybe_log_all_dense_debug(
                 layer_id=layer.layer_id,
                 forward_batch=forward_batch,
@@ -282,6 +284,25 @@ class SparseAlgorithmController:
             page_size=(self.config.page_size or 1),
             layer_id=layer.layer_id,
         )
+
+    def _translate_dense_metadata_for_hisparse(
+        self,
+        attn_metadata: Any,
+        forward_batch: "ForwardBatch",
+    ) -> Any:
+        page_table = getattr(attn_metadata, "page_table", None)
+        if page_table is None or self.io is None:
+            return attn_metadata
+
+        mapping = self.io.mem_pool_device.full_to_hisparse_device_index_mapping
+        max_seq_len = page_table.shape[1]
+        translated = mapping[page_table.to(mapping.device)].to(page_table.device)
+        translated = torch.where(translated > 0, translated, page_table)
+
+        cols = torch.arange(max_seq_len, device=page_table.device).view(1, -1)
+        valid = cols < forward_batch.seq_lens.to(page_table.device).view(-1, 1)
+        page_table.copy_(torch.where(valid, translated.to(page_table.dtype), page_table))
+        return attn_metadata
 
     def _maybe_log_decode_debug(
         self,
