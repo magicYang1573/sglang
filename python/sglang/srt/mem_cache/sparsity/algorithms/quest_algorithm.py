@@ -57,8 +57,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         max_context_len = self.req_to_token_pool.max_context_len
         self.max_context_pages = (max_context_len + self.page_size - 1) // self.page_size
         max_history_pages = max(self.max_context_pages - self.num_recent_pages, 0)
+        max_history_pages_by_budget = (int(self.config.top_k) + self.page_size - 1) // self.page_size
         self.topk_pages_budget = (
-            min(max(int(max_history_pages * self.sparsity_ratio), 1), max_history_pages)
+            min(
+                max(int(max_history_pages * self.sparsity_ratio), 1),
+                max_history_pages,
+                max_history_pages_by_budget,
+            )
             if max_history_pages > 0
             else 0
         )
@@ -200,6 +205,20 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             num_pages, torch.full_like(num_pages, self.num_recent_pages)
         )
         recent_start = num_pages - recent_count
+        recent_token_start = recent_start * self.page_size
+        recent_token_count = (seq_lens - recent_token_start).clamp(min=0)
+        recent_token_count = torch.where(
+            sparse_mask.to(device=device, dtype=torch.bool),
+            recent_token_count,
+            torch.zeros_like(recent_token_count),
+        )
+        recent_token_count = recent_token_count.clamp(max=top_k_budget)
+        history_token_budget = (
+            torch.full_like(seq_lens, top_k_budget) - recent_token_count
+        ).clamp(min=0)
+        history_page_budget = (
+            history_token_budget + self.page_size - 1
+        ) // self.page_size
 
         logical_pages = page_ids.view(1, -1).expand(bs, max_context_pages)
         page_valid = logical_pages < num_pages.unsqueeze(1)
@@ -233,6 +252,7 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         )
         k_pages = torch.where(history_pages > 0, torch.clamp(k_pages, min=1), k_pages)
         k_pages = torch.minimum(k_pages, history_pages)
+        k_pages = torch.minimum(k_pages, history_page_budget)
 
         if self.topk_pages_budget > 0:
             k_select = self.topk_pages_budget
@@ -294,6 +314,13 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             selected_page_valid.unsqueeze(2)
             & (token_positions.view(bs, -1, self.page_size) < seq_lens.view(bs, 1, 1))
         ).reshape(bs, -1)
+        token_is_recent = token_positions >= recent_token_start.view(bs, 1)
+        history_token_valid = token_valid & (~token_is_recent)
+        history_token_rank = torch.cumsum(history_token_valid.to(torch.int64), dim=1) - 1
+        token_valid = token_valid & (
+            token_is_recent
+            | (history_token_rank < history_token_budget.view(bs, 1))
+        )
 
         total_token_slots = token_positions.shape[1]
         token_order = torch.arange(total_token_slots, dtype=torch.int64, device=device)
