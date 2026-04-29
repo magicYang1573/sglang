@@ -1,0 +1,11 @@
+run_deepseek_v32_gpu_e2e_tiered_conc.sh
+timestamp=20260429_194302
+MODEL_PATH=/data3/yt/models/DeepSeek-V3.2-AWQ MODEL_CLIENT=deepseek-ai/DeepSeek-V3.2
+TP=8 DP_SIZE=8 PORT=46688
+Order: 32k -> 64k -> 128k -> 16k
+Matrix: 32k -> 8,16,32 | 64k -> 8,16 | 128k -> 8 | 16k -> 8,16,32,48,64
+NUM_REQUESTS_MULT=2 (num-req = conc × mult)
+ROUND2_OUTPUT_MIN=1024 ROUND2_OUTPUT_MAX=1024
+TOTAL_CASES=11
+RESULTS_DIR=exp-new/gpu-0429
+PYTHON_BIN=/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python E2E_FAST=/data2/ljr/a/sglang/test/cxl_utils/e2e_bench_fast.py
