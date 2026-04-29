@@ -31,6 +31,16 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
+        self.quest_page_size = int(
+            config.sparse_extra_config.get("quest_page_size", self.page_size)
+        )
+        if self.quest_page_size <= 0:
+            raise ValueError(
+                f"Quest quest_page_size must be positive, got {self.quest_page_size}"
+            )
+        # Quest's page controls only the algorithm's score / representation
+        # granularity. The FA3/KV backend page size remains config.page_size.
+        self.page_size = self.quest_page_size
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}

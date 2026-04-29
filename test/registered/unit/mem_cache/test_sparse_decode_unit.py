@@ -22,13 +22,18 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
 
 # ---------------------------------------------------------------------------
 # SparseConfig parsing
 # ---------------------------------------------------------------------------
 
 
-class TestSparseConfigFactory(unittest.TestCase):
+class TestSparseConfigFactory(CustomTestCase):
     def test_parse_sparse_decode_config_defaults(self):
         from sglang.srt.mem_cache.sparsity import parse_sparse_decode_config
 
@@ -49,7 +54,8 @@ class TestSparseConfigFactory(unittest.TestCase):
         raw = (
             '{"top_k": 128, "device_buffer_size": 256, "host_to_device_ratio": 3, '
             '"min_sparse_prompt_len": 1024, '
-            '"sparse_extra_config": {"sparsity_ratio": 0.3, "num_recent_pages": 2}}'
+            '"sparse_extra_config": {"sparsity_ratio": 0.3, "num_recent_pages": 2, '
+            '"quest_page_size": 4}}'
         )
         args = SimpleNamespace(sparse_decode_config=raw)
         cfg = parse_sparse_decode_config(args)
@@ -60,7 +66,7 @@ class TestSparseConfigFactory(unittest.TestCase):
         self.assertEqual(cfg.min_sparse_prompt_len, 1024)
         self.assertEqual(
             cfg.sparse_extra_config,
-            {"sparsity_ratio": 0.3, "num_recent_pages": 2},
+            {"sparsity_ratio": 0.3, "num_recent_pages": 2, "quest_page_size": 4},
         )
 
     def test_device_buffer_size_must_exceed_top_k(self):
@@ -113,7 +119,7 @@ class _FakeStates:
         self.last_constructed_page[idx] = 0
 
 
-class TestQuestRetrieveTopK(unittest.TestCase):
+class TestQuestRetrieveTopK(CustomTestCase):
     def setUp(self):
         from sglang.srt.mem_cache.sparsity import QuestAlgorithm, SparseConfig
 
@@ -133,7 +139,11 @@ class TestQuestRetrieveTopK(unittest.TestCase):
             backend="fa3",
             page_size=1,
             min_sparse_prompt_len=0,
-            sparse_extra_config={"sparsity_ratio": 0.5, "num_recent_pages": 2},
+            sparse_extra_config={
+                "sparsity_ratio": 0.5,
+                "num_recent_pages": 2,
+                "quest_page_size": 4,
+            },
         )
         self.algorithm = QuestAlgorithm(self.config, self.device)
 
@@ -169,7 +179,9 @@ class TestQuestRetrieveTopK(unittest.TestCase):
         reqs = torch.tensor([req_idx], dtype=torch.int64, device=self.device)
         seq_lens = torch.tensor([seq_len], dtype=torch.int64, device=self.device)
         num_pages = torch.tensor(
-            [seq_len // self.config.page_size], dtype=torch.int64, device=self.device
+            [(seq_len + self.algorithm.page_size - 1) // self.algorithm.page_size],
+            dtype=torch.int64,
+            device=self.device,
         )
         self.algorithm._compute_page_representations(
             layer_id=0,
@@ -179,6 +191,12 @@ class TestQuestRetrieveTopK(unittest.TestCase):
             end_page=num_pages,
             k_buffer=self.kv_pool.get_key_buffer(0),
         )
+
+    def test_quest_page_size_is_independent_from_kv_page_size(self):
+        self.assertEqual(self.config.page_size, 1)
+        self.assertEqual(self.algorithm.kv_page_size, 1)
+        self.assertEqual(self.algorithm.quest_page_size, 4)
+        self.assertEqual(self.algorithm.page_size, 4)
 
     def test_output_shape_and_dtype(self):
         seq_len = 32
@@ -217,6 +235,36 @@ class TestQuestRetrieveTopK(unittest.TestCase):
         if length < self.top_k_budget:
             self.assertTrue(torch.all(top_k_tokens[0, length:] == -1))
 
+    def test_partial_quest_page_expands_to_token_positions(self):
+        seq_len = 18
+        req_idx = 2
+        self.states.register(req_idx, seq_len)
+        self._run_construct(req_idx, seq_len)
+
+        queries = torch.randn(
+            1, self.head_num * self.head_dim, dtype=torch.float32, device=self.device
+        )
+        fwd = SimpleNamespace(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=self.device)
+        )
+        top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
+            queries=queries,
+            layer_id=0,
+            req_pool_indices=torch.tensor(
+                [req_idx], dtype=torch.int64, device=self.device
+            ),
+            sparse_mask=torch.ones(1, dtype=torch.bool, device=self.device),
+            forward_batch=fwd,
+        )
+
+        length = int(valid_lengths[0].item())
+        self.assertGreater(length, 0)
+        valid_tokens = top_k_tokens[0, :length]
+        self.assertTrue(torch.all(valid_tokens >= 0))
+        self.assertTrue(torch.all(valid_tokens < seq_len))
+        self.assertIn(16, valid_tokens.tolist())
+        self.assertIn(17, valid_tokens.tolist())
+
     def test_sparse_mask_false_returns_minus_one_row(self):
         seq_len = 16
         req_idx = 0
@@ -254,9 +302,10 @@ class _FakeFlashAttentionMetadata:
             torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
         )
         self.max_seq_len_k = int(cache_seqlens_int32.max().item())
+        self.scheduler_metadata = torch.ones(1, dtype=torch.int32)
 
 
-class TestFa3SparseDecodeAdapter(unittest.TestCase):
+class TestFa3SparseDecodeAdapter(CustomTestCase):
     def setUp(self):
         from sglang.srt.mem_cache.sparsity.backend.fa3_sparse_decode_adapter import (
             Fa3SparseDecodeAdapter,
@@ -297,6 +346,7 @@ class TestFa3SparseDecodeAdapter(unittest.TestCase):
         )
         torch.testing.assert_close(out.page_table, self.page_table_dense)
         torch.testing.assert_close(out.cache_seqlens_int32, self.cache_seqlens)
+        self.assertIsNotNone(out.scheduler_metadata)
 
     def test_sparse_rows_overwritten_with_top_k(self):
         self.adapter.save_original_metadata(self.meta)
@@ -346,6 +396,7 @@ class TestFa3SparseDecodeAdapter(unittest.TestCase):
         expected_cu = torch.tensor([0, 10, 13, 17], dtype=torch.int32)
         torch.testing.assert_close(out.cu_seqlens_k, expected_cu)
         self.assertEqual(out.max_seq_len_k, 10)
+        self.assertIsNone(out.scheduler_metadata)
 
     def test_consecutive_layers_reset_from_snapshot(self):
         """Each layer must restart from the original dense metadata."""
@@ -457,7 +508,7 @@ class _MockCoord:
         return top_k_result
 
 
-class TestSparseAlgorithmController(unittest.TestCase):
+class TestSparseAlgorithmController(CustomTestCase):
     def setUp(self):
         from sglang.srt.mem_cache.sparsity import SparseAlgorithmController, SparseConfig
 

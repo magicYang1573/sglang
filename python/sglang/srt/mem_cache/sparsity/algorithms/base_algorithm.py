@@ -164,7 +164,10 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         super().__init__(config, device, **kwargs)
         self.sparsity_ratio = config.sparse_extra_config.get("sparsity_ratio", 0.7)
         self.num_recent_pages = config.sparse_extra_config.get("num_recent_pages", 4)
-        self.page_size = config.page_size
+        self.kv_page_size = config.page_size
+        self.page_size = config.sparse_extra_config.get(
+            "algorithm_page_size", config.page_size
+        )
 
     def initialize_representation_pool(
         self,
@@ -198,7 +201,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         if not forward_batch.forward_mode.is_extend():
             return
 
-        num_pages = seq_lens // self.page_size
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
         valid_mask = (
             ~self.states.repr_constructed[req_pool_indices]
             & (seq_lens >= self.states.prompt_lens[req_pool_indices])
@@ -236,7 +239,7 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             return
 
         start_page = self.states.last_constructed_page[req_pool_indices]
-        end_page = seq_lens // self.page_size
+        end_page = (seq_lens + self.page_size - 1) // self.page_size
         valid_mask = self.states.repr_constructed[req_pool_indices] & (
             start_page < end_page
         )

@@ -87,6 +87,11 @@ class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
                 meta.cu_seqlens_k = self._snapshot["cu_seqlens_k"].clone()
             return meta
 
+        # Dense FA3 scheduler metadata was computed from the original full
+        # context. Once page_table/cache_seqlens are sparsified it is no
+        # longer valid; let FA3 take its regular no-scheduler path.
+        meta.scheduler_metadata = None
+
         top_k_device_locs = selected_indices  # [bs, top_k] int32
         bs, top_k = top_k_device_locs.shape
         device = meta.page_table.device
