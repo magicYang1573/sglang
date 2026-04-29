@@ -16,7 +16,6 @@ For backward compatibility the module keeps the ``SparseConfig`` and
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -33,13 +32,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
 
 
 class RequestTrackers:
@@ -129,9 +121,6 @@ class SparseAlgorithmController:
         self.device = device
         self.start_layer = start_layer
         self.end_layer = end_layer
-        self._debug_enabled = _env_int("SGLANG_SPARSE_DECODE_DEBUG", 0) > 0
-        self._debug_max_logs = _env_int("SGLANG_SPARSE_DECODE_DEBUG_MAX_LOGS", 20)
-        self._debug_log_count = 0
 
         # Will be bound later by HiSparseCoordinator.__init__.
         self.io: Optional["HiSparseCoordinator"] = None
@@ -248,11 +237,6 @@ class SparseAlgorithmController:
             attn_metadata = self._translate_dense_metadata_for_hisparse(
                 attn_metadata, forward_batch
             )
-            self._maybe_log_all_dense_debug(
-                layer_id=layer.layer_id,
-                forward_batch=forward_batch,
-                attn_metadata=attn_metadata,
-            )
             return attn_metadata
 
         sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
@@ -271,15 +255,6 @@ class SparseAlgorithmController:
             seq_lens=forward_batch.seq_lens,
             top_k_result=top_k_tokens,
             layer_id=layer.layer_id,
-        )
-
-        self._maybe_log_decode_debug(
-            layer_id=layer.layer_id,
-            forward_batch=forward_batch,
-            sparse_mask=sparse_mask,
-            top_k_tokens=top_k_tokens,
-            valid_lengths=valid_lengths,
-            top_k_device_locs=top_k_device_locs,
         )
 
         return self.adapter.adapt_for_attn_metadata(
@@ -314,154 +289,6 @@ class SparseAlgorithmController:
         ].to(page_table.device)
         page_table.copy_(torch.where(valid, translated.to(page_table.dtype), page_table))
         return attn_metadata
-
-    def _maybe_log_decode_debug(
-        self,
-        *,
-        layer_id: int,
-        forward_batch: "ForwardBatch",
-        sparse_mask: torch.Tensor,
-        top_k_tokens: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        top_k_device_locs: torch.Tensor,
-    ) -> None:
-        if (
-            not self._debug_enabled
-            or self._debug_log_count >= self._debug_max_logs
-            or top_k_tokens.shape[0] == 0
-        ):
-            return
-
-        row = 0
-        valid_len = int(valid_lengths[row].item())
-        prefix_len = min(valid_len, 16)
-        token_prefix = (
-            top_k_tokens[row, :prefix_len].detach().cpu().tolist()
-            if prefix_len > 0
-            else []
-        )
-        loc_prefix = (
-            top_k_device_locs[row, :prefix_len].detach().cpu().tolist()
-            if prefix_len > 0
-            else []
-        )
-        invalid_in_valid = int((top_k_device_locs[row, :valid_len] < 0).sum().item())
-        logger.warning(
-            "SparseDecodeDebug Controller #%d: layer=%d bs=%d "
-            "row0(req_pool=%d seq_len=%d sparse=%s valid_len=%d "
-            "invalid_device_locs_in_valid=%d token_prefix=%s device_loc_prefix=%s)",
-            self._debug_log_count,
-            layer_id,
-            top_k_tokens.shape[0],
-            int(forward_batch.req_pool_indices[row].item()),
-            int(forward_batch.seq_lens[row].item()),
-            bool(sparse_mask[row].item()),
-            valid_len,
-            invalid_in_valid,
-            token_prefix,
-            loc_prefix,
-        )
-        self._debug_log_count += 1
-
-    def _maybe_log_all_dense_debug(
-        self,
-        *,
-        layer_id: int,
-        forward_batch: "ForwardBatch",
-        attn_metadata: Any,
-    ) -> None:
-        if (
-            not self._debug_enabled
-            or self._debug_log_count >= self._debug_max_logs
-            or forward_batch.req_pool_indices.shape[0] == 0
-            or self.io is None
-        ):
-            return
-
-        row = 0
-        req_idx = int(forward_batch.req_pool_indices[row].item())
-        seq_len = int(forward_batch.seq_lens[row].item())
-        prefix_len = min(seq_len, 16)
-        suffix_len = min(seq_len, 16)
-
-        req_to_token = self.req_to_token_pool.req_to_token
-        logical_prefix = (
-            req_to_token[req_idx, :prefix_len].detach().cpu().tolist()
-            if prefix_len > 0
-            else []
-        )
-        logical_suffix = (
-            req_to_token[req_idx, seq_len - suffix_len : seq_len]
-            .detach()
-            .cpu()
-            .tolist()
-            if suffix_len > 0
-            else []
-        )
-        hot_prefix = (
-            self.io.req_to_device_buffer[req_idx, :prefix_len].detach().cpu().tolist()
-            if prefix_len > 0
-            else []
-        )
-        hot_suffix = (
-            self.io.req_to_device_buffer[req_idx, seq_len - suffix_len : seq_len]
-            .detach()
-            .cpu()
-            .tolist()
-            if suffix_len > 0 and seq_len <= self.io.device_buffer_size
-            else []
-        )
-
-        page_table = getattr(attn_metadata, "page_table", None)
-        page_table_prefix = (
-            page_table[row, :prefix_len].detach().cpu().tolist()
-            if page_table is not None and prefix_len > 0
-            else []
-        )
-        page_table_suffix = (
-            page_table[row, seq_len - suffix_len : seq_len].detach().cpu().tolist()
-            if page_table is not None and suffix_len > 0
-            else []
-        )
-        cache_seqlen = getattr(attn_metadata, "cache_seqlens_int32", None)
-        cache_seqlen_value = (
-            int(cache_seqlen[row].item()) if cache_seqlen is not None else -1
-        )
-
-        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
-        out_loc = int(out_cache_loc[row].item()) if out_cache_loc is not None else -1
-        mapped_out_loc = -1
-        if out_loc >= 0:
-            mapped_out_loc = int(
-                self.io.mem_pool_device.full_to_hisparse_device_index_mapping[
-                    out_loc
-                ].item()
-            )
-
-        logger.warning(
-            "SparseDecodeDebug AllDense #%d: layer=%d bs=%d "
-            "row0(req_pool=%d seq_len=%d prompt_len=%d cache_seqlen=%d "
-            "out_cache_loc=%d mapped_out_cache_loc=%d device_buffer_size=%d "
-            "logical_prefix=%s hot_prefix=%s page_table_prefix=%s "
-            "logical_suffix=%s hot_suffix=%s page_table_suffix=%s)",
-            self._debug_log_count,
-            layer_id,
-            forward_batch.req_pool_indices.shape[0],
-            req_idx,
-            seq_len,
-            self.states.prompt_lens_cpu.get(req_idx, -1),
-            cache_seqlen_value,
-            out_loc,
-            mapped_out_loc,
-            self.io.device_buffer_size,
-            logical_prefix,
-            hot_prefix,
-            page_table_prefix,
-            logical_suffix,
-            hot_suffix,
-            page_table_suffix,
-        )
-        self._debug_log_count += 1
 
     def end_layer_decode(
         self,

@@ -10,7 +10,6 @@ slots.  It knows nothing about Quest / H2O / SnapKV etc.
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -23,13 +22,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
 
 
 class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
@@ -48,9 +40,6 @@ class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
     def __init__(self, device: torch.device):
         super().__init__(device)
         self._snapshot: Optional[dict] = None
-        self._debug_enabled = _env_int("SGLANG_SPARSE_DECODE_DEBUG", 0) > 0
-        self._debug_max_logs = _env_int("SGLANG_SPARSE_DECODE_DEBUG_MAX_LOGS", 20)
-        self._debug_log_count = 0
 
     def save_original_metadata(self, metadata: "FlashAttentionMetadata") -> None:
         self._snapshot = {
@@ -163,55 +152,4 @@ class Fa3SparseDecodeAdapter(SparseDecodeAdapter):
         )
         meta.max_seq_len_k = int(meta.cache_seqlens_int32.max().item())
 
-        self._maybe_log_adapter_debug(
-            layer_id=layer_id,
-            meta=meta,
-            top_k_device_locs=top_k_device_locs,
-            valid_lengths=valid_lengths,
-            sparse_mask=sparse_mask_device,
-            effective_sparse_mask=effective_sparse_mask,
-            effective_lengths=effective_lengths,
-        )
-
         return meta
-
-    def _maybe_log_adapter_debug(
-        self,
-        *,
-        layer_id: int,
-        meta: "FlashAttentionMetadata",
-        top_k_device_locs: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        effective_sparse_mask: torch.Tensor,
-        effective_lengths: torch.Tensor,
-    ) -> None:
-        if (
-            not self._debug_enabled
-            or self._debug_log_count >= self._debug_max_logs
-            or top_k_device_locs.shape[0] == 0
-        ):
-            return
-
-        row = 0
-        valid_len = int(valid_lengths[row].item())
-        prefix_len = min(valid_len, 16)
-        logger.warning(
-            "SparseDecodeDebug FA3Adapter #%d: layer=%d bs=%d top_k=%d "
-            "row0(sparse=%s effective_sparse=%s valid_len=%d effective_len=%d "
-            "meta_cache_seqlen=%d meta_max_seq_len_k=%d page_table_prefix=%s)",
-            self._debug_log_count,
-            layer_id,
-            top_k_device_locs.shape[0],
-            top_k_device_locs.shape[1],
-            bool(sparse_mask[row].item()),
-            bool(effective_sparse_mask[row].item()),
-            valid_len,
-            int(effective_lengths[row].item()),
-            int(meta.cache_seqlens_int32[row].item()),
-            int(meta.max_seq_len_k),
-            meta.page_table[row, :prefix_len].detach().cpu().tolist()
-            if prefix_len > 0
-            else [],
-        )
-        self._debug_log_count += 1
