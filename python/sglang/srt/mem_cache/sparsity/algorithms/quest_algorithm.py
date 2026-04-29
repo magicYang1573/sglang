@@ -16,6 +16,7 @@ before returning.
 """
 
 import logging
+import os
 
 import torch
 
@@ -24,6 +25,13 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 class QuestAlgorithm(BaseSparseAlgorithmImpl):
@@ -48,6 +56,9 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.topk_pages_budget = None
         self._page_ids = None
         self._page_token_offsets = None
+        self._debug_enabled = _env_int("SGLANG_SPARSE_DECODE_DEBUG", 0) > 0
+        self._debug_max_logs = _env_int("SGLANG_SPARSE_DECODE_DEBUG_MAX_LOGS", 20)
+        self._debug_log_count = 0
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
@@ -350,7 +361,111 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
                 torch.full_like(compact_tokens, -1),
             )
 
+        self._maybe_log_retrieve_debug(
+            layer_id=layer_id,
+            seq_lens=seq_lens,
+            sparse_mask=sparse_mask,
+            num_pages=num_pages,
+            recent_start=recent_start,
+            recent_token_start=recent_token_start,
+            recent_token_count=recent_token_count,
+            history_token_budget=history_token_budget,
+            k_pages=k_pages,
+            selected_history_pages=selected_history_pages,
+            selected_recent_pages=selected_recent_pages,
+            out_tokens=out_tokens,
+            valid_lengths=valid_lengths,
+        )
+
         return out_tokens, valid_lengths
+
+    def _maybe_log_retrieve_debug(
+        self,
+        *,
+        layer_id: int,
+        seq_lens: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        num_pages: torch.Tensor,
+        recent_start: torch.Tensor,
+        recent_token_start: torch.Tensor,
+        recent_token_count: torch.Tensor,
+        history_token_budget: torch.Tensor,
+        k_pages: torch.Tensor,
+        selected_history_pages: torch.Tensor,
+        selected_recent_pages: torch.Tensor,
+        out_tokens: torch.Tensor,
+        valid_lengths: torch.Tensor,
+    ) -> None:
+        if (
+            not self._debug_enabled
+            or self._debug_log_count >= self._debug_max_logs
+            or out_tokens.shape[0] == 0
+        ):
+            return
+
+        row = 0
+        valid_len = int(valid_lengths[row].item())
+        seq_len = int(seq_lens[row].item())
+        recent_start_token = int(recent_token_start[row].item())
+        token_prefix_len = min(valid_len, 16)
+        token_suffix_len = min(valid_len, 16)
+        prefix = (
+            out_tokens[row, :token_prefix_len].detach().cpu().tolist()
+            if token_prefix_len > 0
+            else []
+        )
+        suffix = (
+            out_tokens[row, valid_len - token_suffix_len : valid_len]
+            .detach()
+            .cpu()
+            .tolist()
+            if token_suffix_len > 0
+            else []
+        )
+        valid_tokens = out_tokens[row, :valid_len]
+        recent_selected = int(
+            ((valid_tokens >= recent_start_token) & (valid_tokens < seq_len))
+            .sum()
+            .item()
+        )
+        expected_recent = int(recent_token_count[row].item())
+
+        logger.warning(
+            "SparseDecodeDebug Quest retrieve #%d: layer=%d bs=%d "
+            "quest_page_size=%d top_k=%d max_context_pages=%d topk_pages_budget=%d "
+            "row0(seq_len=%d sparse=%s num_pages=%d recent_start_page=%d "
+            "recent_start_token=%d expected_recent_tokens=%d selected_recent_tokens=%d "
+            "history_token_budget=%d k_pages=%d valid_len=%d "
+            "history_pages_prefix=%s recent_pages=%s token_prefix=%s token_suffix=%s)",
+            self._debug_log_count,
+            layer_id,
+            out_tokens.shape[0],
+            self.page_size,
+            int(self.config.top_k),
+            self.max_context_pages,
+            self.topk_pages_budget,
+            seq_len,
+            bool(sparse_mask[row].item()),
+            int(num_pages[row].item()),
+            int(recent_start[row].item()),
+            recent_start_token,
+            expected_recent,
+            recent_selected,
+            int(history_token_budget[row].item()),
+            int(k_pages[row].item()),
+            valid_len,
+            selected_history_pages[row, : min(selected_history_pages.shape[1], 8)]
+            .detach()
+            .cpu()
+            .tolist(),
+            selected_recent_pages[row, : min(selected_recent_pages.shape[1], 8)]
+            .detach()
+            .cpu()
+            .tolist(),
+            prefix,
+            suffix,
+        )
+        self._debug_log_count += 1
 
     def _retrieve_page_scores(
         self,

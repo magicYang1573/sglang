@@ -16,6 +16,7 @@ For backward compatibility the module keeps the ``SparseConfig`` and
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -32,6 +33,13 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 class RequestTrackers:
@@ -121,6 +129,9 @@ class SparseAlgorithmController:
         self.device = device
         self.start_layer = start_layer
         self.end_layer = end_layer
+        self._debug_enabled = _env_int("SGLANG_SPARSE_DECODE_DEBUG", 0) > 0
+        self._debug_max_logs = _env_int("SGLANG_SPARSE_DECODE_DEBUG_MAX_LOGS", 20)
+        self._debug_log_count = 0
 
         # Will be bound later by HiSparseCoordinator.__init__.
         self.io: Optional["HiSparseCoordinator"] = None
@@ -247,6 +258,15 @@ class SparseAlgorithmController:
             layer_id=layer.layer_id,
         )
 
+        self._maybe_log_decode_debug(
+            layer_id=layer.layer_id,
+            forward_batch=forward_batch,
+            sparse_mask=sparse_mask,
+            top_k_tokens=top_k_tokens,
+            valid_lengths=valid_lengths,
+            top_k_device_locs=top_k_device_locs,
+        )
+
         return self.adapter.adapt_for_attn_metadata(
             selected_indices=top_k_device_locs,
             valid_lengths=valid_lengths,
@@ -257,6 +277,54 @@ class SparseAlgorithmController:
             page_size=(self.config.page_size or 1),
             layer_id=layer.layer_id,
         )
+
+    def _maybe_log_decode_debug(
+        self,
+        *,
+        layer_id: int,
+        forward_batch: "ForwardBatch",
+        sparse_mask: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        top_k_device_locs: torch.Tensor,
+    ) -> None:
+        if (
+            not self._debug_enabled
+            or self._debug_log_count >= self._debug_max_logs
+            or top_k_tokens.shape[0] == 0
+        ):
+            return
+
+        row = 0
+        valid_len = int(valid_lengths[row].item())
+        prefix_len = min(valid_len, 16)
+        token_prefix = (
+            top_k_tokens[row, :prefix_len].detach().cpu().tolist()
+            if prefix_len > 0
+            else []
+        )
+        loc_prefix = (
+            top_k_device_locs[row, :prefix_len].detach().cpu().tolist()
+            if prefix_len > 0
+            else []
+        )
+        invalid_in_valid = int((top_k_device_locs[row, :valid_len] < 0).sum().item())
+        logger.warning(
+            "SparseDecodeDebug Controller #%d: layer=%d bs=%d "
+            "row0(req_pool=%d seq_len=%d sparse=%s valid_len=%d "
+            "invalid_device_locs_in_valid=%d token_prefix=%s device_loc_prefix=%s)",
+            self._debug_log_count,
+            layer_id,
+            top_k_tokens.shape[0],
+            int(forward_batch.req_pool_indices[row].item()),
+            int(forward_batch.seq_lens[row].item()),
+            bool(sparse_mask[row].item()),
+            valid_len,
+            invalid_in_valid,
+            token_prefix,
+            loc_prefix,
+        )
+        self._debug_log_count += 1
 
     def end_layer_decode(
         self,
