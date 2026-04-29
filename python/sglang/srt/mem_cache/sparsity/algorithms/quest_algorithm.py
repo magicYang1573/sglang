@@ -44,12 +44,30 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
         self.page_k_min = {}
         self.page_k_max = {}
         self.page_valid = {}
+        self.max_context_pages = None
+        self.topk_pages_budget = None
+        self._page_ids = None
+        self._page_token_offsets = None
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
     ):
         key_buf = self.token_to_kv_pool.get_key_buffer(start_layer)
         head_num, head_dim = key_buf.shape[1], key_buf.shape[2]
+        max_context_len = self.req_to_token_pool.max_context_len
+        self.max_context_pages = (max_context_len + self.page_size - 1) // self.page_size
+        max_history_pages = max(self.max_context_pages - self.num_recent_pages, 0)
+        self.topk_pages_budget = (
+            min(max(int(max_history_pages * self.sparsity_ratio), 1), max_history_pages)
+            if max_history_pages > 0
+            else 0
+        )
+        self._page_ids = torch.arange(
+            self.max_context_pages, dtype=torch.int64, device=self.device
+        )
+        self._page_token_offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=self.device
+        )
 
         for layer_id in range(start_layer, end_layer):
             self.page_k_min[layer_id] = torch.zeros(
@@ -170,101 +188,142 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
             )
         seq_lens = seq_lens_source.seq_lens.to(device)
 
+        req_to_token = self.req_to_token_pool.req_to_token
+        max_req_tokens = req_to_token.shape[1]
+        page_ids = self._page_ids.to(device=device)
+        page_offsets = self._page_token_offsets.to(device=device)
+        max_context_pages = page_ids.numel()
+
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
+        num_pages = num_pages.clamp(min=0, max=max_context_pages)
+        recent_count = torch.minimum(
+            num_pages, torch.full_like(num_pages, self.num_recent_pages)
+        )
+        recent_start = num_pages - recent_count
+
+        logical_pages = page_ids.view(1, -1).expand(bs, max_context_pages)
+        page_valid = logical_pages < num_pages.unsqueeze(1)
+        sparse_rows = sparse_mask.to(device=device, dtype=torch.bool).unsqueeze(1)
+
+        page_start_positions = (logical_pages * self.page_size).clamp(
+            0, max_req_tokens - 1
+        )
+        page_start_tokens = req_to_token[
+            req_pool_indices.to(req_to_token.device).view(-1, 1),
+            page_start_positions.to(req_to_token.device),
+        ].to(device)
+        phys_pages = page_start_tokens // self.page_size
+
+        scores = self._retrieve_page_scores(
+            layer_id,
+            phys_pages,
+            req_pool_indices,
+            queries,
+        )
+
+        history_mask = logical_pages < recent_start.unsqueeze(1)
+        eligible_history = sparse_rows & page_valid & history_mask
+        masked_scores = torch.where(
+            eligible_history, scores, torch.full_like(scores, float("-inf"))
+        )
+
+        history_pages = recent_start
+        k_pages = torch.floor(history_pages.to(torch.float32) * self.sparsity_ratio).to(
+            torch.int64
+        )
+        k_pages = torch.where(history_pages > 0, torch.clamp(k_pages, min=1), k_pages)
+        k_pages = torch.minimum(k_pages, history_pages)
+
+        if self.topk_pages_budget > 0:
+            k_select = self.topk_pages_budget
+            topk_scores, topk_pages = torch.topk(
+                masked_scores, k=k_select, dim=1, sorted=True
+            )
+            topk_rank = torch.arange(k_select, dtype=torch.int64, device=device).view(
+                1, -1
+            )
+            topk_valid = (topk_rank < k_pages.unsqueeze(1)) & torch.isfinite(
+                topk_scores
+            )
+            history_pages_for_sort = torch.where(
+                topk_valid,
+                topk_pages.to(torch.int64),
+                torch.full_like(topk_pages, max_context_pages, dtype=torch.int64),
+            )
+            selected_history_pages = torch.sort(history_pages_for_sort, dim=1)[0]
+            selected_history_valid = selected_history_pages < max_context_pages
+        else:
+            selected_history_pages = torch.empty(
+                (bs, 0), dtype=torch.int64, device=device
+            )
+            selected_history_valid = torch.empty(
+                (bs, 0), dtype=torch.bool, device=device
+            )
+
+        recent_slots = min(self.num_recent_pages, max_context_pages)
+        if recent_slots > 0:
+            recent_offsets = torch.arange(
+                recent_slots, dtype=torch.int64, device=device
+            ).view(1, -1)
+            selected_recent_pages = recent_start.unsqueeze(1) + recent_offsets
+            selected_recent_valid = (
+                (recent_offsets < recent_count.unsqueeze(1))
+                & (selected_recent_pages < num_pages.unsqueeze(1))
+                & sparse_rows
+            )
+        else:
+            selected_recent_pages = torch.empty(
+                (bs, 0), dtype=torch.int64, device=device
+            )
+            selected_recent_valid = torch.empty(
+                (bs, 0), dtype=torch.bool, device=device
+            )
+
+        selected_pages = torch.cat(
+            [selected_history_pages, selected_recent_pages], dim=1
+        )
+        selected_page_valid = torch.cat(
+            [selected_history_valid, selected_recent_valid], dim=1
+        )
+
+        token_positions = (
+            selected_pages.unsqueeze(2) * self.page_size
+            + page_offsets.view(1, 1, -1)
+        ).reshape(bs, -1)
+        token_valid = (
+            selected_page_valid.unsqueeze(2)
+            & (token_positions.view(bs, -1, self.page_size) < seq_lens.view(bs, 1, 1))
+        ).reshape(bs, -1)
+
+        total_token_slots = token_positions.shape[1]
+        token_order = torch.arange(total_token_slots, dtype=torch.int64, device=device)
+        sort_key = torch.where(
+            token_valid,
+            token_order.view(1, -1),
+            token_order.view(1, -1) + total_token_slots,
+        )
+        compact_indices = torch.argsort(sort_key, dim=1)
+        compact_width = min(top_k_budget, total_token_slots)
+        compact_tokens = token_positions.gather(
+            1, compact_indices[:, :compact_width]
+        ).to(torch.int32)
+
+        valid_lengths = torch.minimum(
+            token_valid.sum(dim=1),
+            torch.full((bs,), top_k_budget, dtype=torch.int64, device=device),
+        ).to(torch.int32)
         out_tokens = torch.full(
             (bs, top_k_budget), -1, dtype=torch.int32, device=device
         )
-        out_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
-
-        req_to_token = self.req_to_token_pool.req_to_token
-        max_req_tokens = req_to_token.shape[1]
-
-        for i in range(bs):
-            if not bool(sparse_mask[i]):
-                continue
-
-            seq_len = int(seq_lens[i].item())
-            if seq_len <= 0:
-                continue
-
-            num_pages = int((seq_len + self.page_size - 1) // self.page_size)
-            if num_pages <= 0:
-                continue
-
-            page_idx = torch.arange(num_pages, device=device)
-            page_start_token = req_to_token[
-                req_pool_indices[i],
-                (page_idx * self.page_size).clamp(0, max_req_tokens - 1),
-            ]
-            phys_pages = (page_start_token // self.page_size).unsqueeze(0)
-
-            scores = self._retrieve_page_scores(
-                layer_id,
-                phys_pages,
-                req_pool_indices[i : i + 1],
-                queries[i : i + 1],
-            )  # [1, num_pages]
-
-            recent_count = min(self.num_recent_pages, num_pages)
-            recent_start = num_pages - recent_count
-
-            masked_scores = scores.clone()
-            if recent_count > 0:
-                masked_scores[:, recent_start:] = float("-inf")
-
-            history_pages = recent_start
-            # Budget top-k pages: respect sparsity_ratio but cap at history.
-            k_pages = min(
-                max(int(history_pages * self.sparsity_ratio), 1), history_pages
+        if compact_width > 0:
+            out_range = torch.arange(compact_width, dtype=torch.int32, device=device)
+            out_tokens[:, :compact_width] = torch.where(
+                out_range.view(1, -1) < valid_lengths.view(-1, 1),
+                compact_tokens,
+                torch.full_like(compact_tokens, -1),
             )
 
-            if k_pages > 0:
-                topk_idx = torch.topk(masked_scores, k=k_pages, dim=1, sorted=False)[1]
-                topk_idx = topk_idx.squeeze(0)
-            else:
-                topk_idx = torch.empty(0, dtype=torch.int64, device=device)
-
-            recent_idx = torch.arange(
-                recent_start, num_pages, device=device, dtype=torch.int64
-            )
-            combined_pages = torch.cat([topk_idx.to(torch.int64), recent_idx], dim=0)
-            # Deduplicate in ascending order (recent window may overlap).
-            combined_pages = torch.unique(combined_pages)
-
-            # Expand page indices to token positions
-            if self.page_size == 1:
-                token_positions = combined_pages.to(torch.int32)
-            else:
-                page_starts = combined_pages * self.page_size
-                offsets = torch.arange(self.page_size, device=device, dtype=torch.int64)
-                token_positions = (
-                    page_starts.unsqueeze(1) + offsets.unsqueeze(0)
-                ).reshape(-1)
-                token_positions = token_positions[token_positions < seq_len]
-                token_positions = token_positions.to(torch.int32)
-
-            # Truncate to budget (keep the most recent tokens first, then older).
-            if token_positions.numel() > top_k_budget:
-                # Prioritize recent tokens: keep the last ``num_recent_pages``
-                # worth of tokens, then top scoring older ones.
-                recent_token_start = int(recent_start * self.page_size)
-                recent_mask = token_positions >= recent_token_start
-                recent_tokens = token_positions[recent_mask]
-                history_tokens = token_positions[~recent_mask]
-                if recent_tokens.numel() >= top_k_budget:
-                    token_positions = recent_tokens[:top_k_budget]
-                else:
-                    remainder = top_k_budget - recent_tokens.numel()
-                    token_positions = torch.cat(
-                        [history_tokens[:remainder], recent_tokens], dim=0
-                    )
-
-            length = int(token_positions.numel())
-            if length == 0:
-                continue
-            out_tokens[i, :length] = token_positions
-            out_lengths[i] = length
-
-        return out_tokens, out_lengths
+        return out_tokens, valid_lengths
 
     def _retrieve_page_scores(
         self,

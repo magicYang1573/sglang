@@ -265,6 +265,39 @@ class TestQuestRetrieveTopK(CustomTestCase):
         self.assertIn(16, valid_tokens.tolist())
         self.assertIn(17, valid_tokens.tolist())
 
+    def test_batched_variable_lengths_and_sparse_mask(self):
+        seq_lens = [18, 9, 0]
+        req_indices = torch.tensor([0, 1, 3], dtype=torch.int64, device=self.device)
+        for req_idx, seq_len in zip(req_indices.tolist(), seq_lens):
+            self.states.register(req_idx, seq_len)
+            if seq_len > 0:
+                self._run_construct(req_idx, seq_len)
+
+        queries = torch.randn(
+            len(seq_lens),
+            self.head_num * self.head_dim,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        fwd = SimpleNamespace(
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        )
+        sparse_mask = torch.tensor([True, False, True], dtype=torch.bool)
+        top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
+            queries=queries,
+            layer_id=0,
+            req_pool_indices=req_indices,
+            sparse_mask=sparse_mask,
+            forward_batch=fwd,
+        )
+
+        self.assertEqual(top_k_tokens.shape, (3, self.top_k_budget))
+        self.assertGreater(int(valid_lengths[0].item()), 0)
+        self.assertEqual(int(valid_lengths[1].item()), 0)
+        self.assertEqual(int(valid_lengths[2].item()), 0)
+        self.assertTrue(torch.all(top_k_tokens[1] == -1))
+        self.assertTrue(torch.all(top_k_tokens[2] == -1))
+
     def test_sparse_mask_false_returns_minus_one_row(self):
         seq_len = 16
         req_idx = 0
