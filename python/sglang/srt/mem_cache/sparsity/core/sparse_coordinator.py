@@ -238,6 +238,11 @@ class SparseAlgorithmController:
         # see the unchanged dense metadata.  The flag is populated once per
         # step by :meth:`HiSparseCoordinator.map_last_loc_to_buffer`.
         if getattr(self.io, "_all_dense_this_step", False):
+            self._maybe_log_all_dense_debug(
+                layer_id=layer.layer_id,
+                forward_batch=forward_batch,
+                attn_metadata=attn_metadata,
+            )
             return attn_metadata
 
         sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
@@ -323,6 +328,106 @@ class SparseAlgorithmController:
             invalid_in_valid,
             token_prefix,
             loc_prefix,
+        )
+        self._debug_log_count += 1
+
+    def _maybe_log_all_dense_debug(
+        self,
+        *,
+        layer_id: int,
+        forward_batch: "ForwardBatch",
+        attn_metadata: Any,
+    ) -> None:
+        if (
+            not self._debug_enabled
+            or self._debug_log_count >= self._debug_max_logs
+            or forward_batch.req_pool_indices.shape[0] == 0
+            or self.io is None
+        ):
+            return
+
+        row = 0
+        req_idx = int(forward_batch.req_pool_indices[row].item())
+        seq_len = int(forward_batch.seq_lens[row].item())
+        prefix_len = min(seq_len, 16)
+        suffix_len = min(seq_len, 16)
+
+        req_to_token = self.req_to_token_pool.req_to_token
+        logical_prefix = (
+            req_to_token[req_idx, :prefix_len].detach().cpu().tolist()
+            if prefix_len > 0
+            else []
+        )
+        logical_suffix = (
+            req_to_token[req_idx, seq_len - suffix_len : seq_len]
+            .detach()
+            .cpu()
+            .tolist()
+            if suffix_len > 0
+            else []
+        )
+        hot_prefix = (
+            self.io.req_to_device_buffer[req_idx, :prefix_len].detach().cpu().tolist()
+            if prefix_len > 0
+            else []
+        )
+        hot_suffix = (
+            self.io.req_to_device_buffer[req_idx, seq_len - suffix_len : seq_len]
+            .detach()
+            .cpu()
+            .tolist()
+            if suffix_len > 0 and seq_len <= self.io.device_buffer_size
+            else []
+        )
+
+        page_table = getattr(attn_metadata, "page_table", None)
+        page_table_prefix = (
+            page_table[row, :prefix_len].detach().cpu().tolist()
+            if page_table is not None and prefix_len > 0
+            else []
+        )
+        page_table_suffix = (
+            page_table[row, seq_len - suffix_len : seq_len].detach().cpu().tolist()
+            if page_table is not None and suffix_len > 0
+            else []
+        )
+        cache_seqlen = getattr(attn_metadata, "cache_seqlens_int32", None)
+        cache_seqlen_value = (
+            int(cache_seqlen[row].item()) if cache_seqlen is not None else -1
+        )
+
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        out_loc = int(out_cache_loc[row].item()) if out_cache_loc is not None else -1
+        mapped_out_loc = -1
+        if out_loc >= 0:
+            mapped_out_loc = int(
+                self.io.mem_pool_device.full_to_hisparse_device_index_mapping[
+                    out_loc
+                ].item()
+            )
+
+        logger.warning(
+            "SparseDecodeDebug AllDense #%d: layer=%d bs=%d "
+            "row0(req_pool=%d seq_len=%d prompt_len=%d cache_seqlen=%d "
+            "out_cache_loc=%d mapped_out_cache_loc=%d device_buffer_size=%d "
+            "logical_prefix=%s hot_prefix=%s page_table_prefix=%s "
+            "logical_suffix=%s hot_suffix=%s page_table_suffix=%s)",
+            self._debug_log_count,
+            layer_id,
+            forward_batch.req_pool_indices.shape[0],
+            req_idx,
+            seq_len,
+            self.states.prompt_lens_cpu.get(req_idx, -1),
+            cache_seqlen_value,
+            out_loc,
+            mapped_out_loc,
+            self.io.device_buffer_size,
+            logical_prefix,
+            hot_prefix,
+            page_table_prefix,
+            logical_suffix,
+            hot_suffix,
+            page_table_suffix,
         )
         self._debug_log_count += 1
 
