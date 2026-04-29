@@ -367,13 +367,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._size_full
 
     def available_size(self) -> int:
-        if self.sparse_decode_mode:
-            # In sparse_decode mode only the logical pool is consumed during
-            # prefill; the hot buffer is managed implicitly by
-            # HiSparseCoordinator (and is strictly smaller than the logical
-            # pool), so reporting the logical pool's availability is the
-            # correct bound.
-            return self.logical_attn_allocator.available_size()
         return min(
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),

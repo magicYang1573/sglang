@@ -123,7 +123,16 @@ def parse_hisparse_config(server_args) -> SparseConfig:
     Kept for backward compatibility with the DSA/HiSparse path
     (``enable_hisparse``).
     """
-    return _parse_sparse_config(getattr(server_args, "hisparse_config", None))
+    cfg = _parse_sparse_config(getattr(server_args, "hisparse_config", None))
+    algorithm = cfg.algorithm.lower() if cfg.algorithm is not None else None
+    if algorithm is not None and algorithm not in ("deepseek_nsa", "dsa_native", "nsa"):
+        if cfg.backend is None:
+            cfg.backend = "fa3"
+        if cfg.page_size is None:
+            cfg.page_size = 1
+        if cfg.min_sparse_prompt_len is None:
+            cfg.min_sparse_prompt_len = 4096
+    return cfg
 
 
 def parse_sparse_decode_config(server_args) -> SparseConfig:

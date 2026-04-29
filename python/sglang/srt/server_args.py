@@ -5682,14 +5682,16 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'. '
+            'For non-native sparse decode, add an algorithm field, e.g. '
+            '\'{"algorithm": "quest", "top_k": 2048, "device_buffer_size": 4096}\'.',
         )
 
         parser.add_argument(
             "--enable-sparse-decode",
             action="store_true",
             help="Enable the non-native sparse decode path (e.g. Qwen + Quest + FA3). "
-            "Mutually exclusive with --enable-hisparse.",
+            "Prefer --enable-hisparse with --hisparse-config for new usage.",
         )
 
         parser.add_argument(
@@ -5697,6 +5699,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.sparse_decode_config,
             help="JSON string configuring the non-native sparse decode path. "
+            "Deprecated alias; prefer --hisparse-config with --enable-hisparse. "
             'Example: \'{"algorithm": "quest", "top_k": 2048, '
             '"device_buffer_size": 4096, "min_sparse_prompt_len": 4096, '
             '"sparse_extra_config": {"sparsity_ratio": 0.5, "num_recent_pages": 8}}\'.',
@@ -6544,11 +6547,25 @@ class ServerArgs:
         # Non-native sparse decode: force the hybrid (fa3 prefill + sparse
         # fa3 decode) arrangement so ModelRunner's existing HybridAttnBackend
         # path auto-composes both halves.
-        if self.enable_sparse_decode:
+        if self.enable_sparse_decode or self.is_non_native_hisparse_enabled():
             if prefill_attention_backend_str is None:
                 prefill_attention_backend_str = "fa3"
             decode_attention_backend_str = "fa3_sparse_decode"
         return prefill_attention_backend_str, decode_attention_backend_str
+
+    def is_non_native_hisparse_enabled(self) -> bool:
+        if not self.enable_hisparse or not self.hisparse_config:
+            return False
+        try:
+            cfg = json.loads(self.hisparse_config)
+        except json.JSONDecodeError:
+            return False
+        algorithm = cfg.get("algorithm")
+        return algorithm is not None and algorithm.lower() not in (
+            "deepseek_nsa",
+            "dsa_native",
+            "nsa",
+        )
 
     def use_mla_backend(self):
         from sglang.srt.configs.model_config import AttentionArch
@@ -6677,34 +6694,63 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
-            from sglang.srt.configs.model_config import is_deepseek_nsa
+            non_native_hisparse = self.is_non_native_hisparse_enabled()
 
-            hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
-                "(e.g., DeepSeek V3.2, GLM-5). "
-            )
+            if not non_native_hisparse:
+                from sglang.srt.configs.model_config import is_deepseek_nsa
+
+                hf_config = self.get_model_config().hf_config
+                assert is_deepseek_nsa(hf_config), (
+                    "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
+                    "(e.g., DeepSeek V3.2, GLM-5). "
+                    "For non-native sparse decode, set "
+                    "--hisparse-config with an algorithm such as 'quest'."
+                )
 
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
-                    raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                    )
+            if not non_native_hisparse:
+                for attr, label in [
+                    ("nsa_prefill_backend", "prefill"),
+                    ("nsa_decode_backend", "decode"),
+                ]:
+                    backend = getattr(self, attr)
+                    if backend is not None and backend != "flashmla_sparse":
+                        raise ValueError(
+                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                            f"but got --nsa-{label}-backend={backend}. "
+                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        )
 
             if self.kv_cache_dtype != "bfloat16":
                 raise ValueError(
                     f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
                     f"Please use --kv-cache-dtype=bfloat16."
                 )
+            if non_native_hisparse:
+                if self.page_size != 1:
+                    raise ValueError(
+                        "Non-native HiSparse currently requires --page-size=1 "
+                        f"(got {self.page_size})."
+                    )
+                if self.attention_backend not in (None, "fa3"):
+                    raise ValueError(
+                        "Non-native HiSparse requires --attention-backend=fa3 (or unset)."
+                    )
+                if not self.disable_cuda_graph:
+                    logger.warning(
+                        "--enable-hisparse with non-native sparse algorithm: "
+                        "auto-disabling CUDA Graph until the path is fully "
+                        "graph-capture-compatible."
+                    )
+                    self.disable_cuda_graph = True
+                if not self.disable_piecewise_cuda_graph:
+                    logger.warning(
+                        "--enable-hisparse with non-native sparse algorithm: "
+                        "auto-disabling Piecewise CUDA Graph."
+                    )
+                    self.disable_piecewise_cuda_graph = True
 
         # Non-native sparse decode guards
         if self.enable_sparse_decode:

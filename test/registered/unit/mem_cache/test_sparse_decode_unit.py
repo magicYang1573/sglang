@@ -69,6 +69,20 @@ class TestSparseConfigFactory(CustomTestCase):
             {"sparsity_ratio": 0.3, "num_recent_pages": 2, "quest_page_size": 4},
         )
 
+    def test_parse_hisparse_config_quest_uses_sparse_decode_defaults(self):
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        raw = '{"algorithm": "quest", "top_k": 128, "device_buffer_size": 256}'
+        args = SimpleNamespace(hisparse_config=raw)
+        cfg = parse_hisparse_config(args)
+
+        self.assertEqual(cfg.algorithm, "quest")
+        self.assertEqual(cfg.backend, "fa3")
+        self.assertEqual(cfg.page_size, 1)
+        self.assertEqual(cfg.min_sparse_prompt_len, 4096)
+        self.assertEqual(cfg.top_k, 128)
+        self.assertEqual(cfg.device_buffer_size, 256)
+
     def test_device_buffer_size_must_exceed_top_k(self):
         from sglang.srt.mem_cache.sparsity import parse_sparse_decode_config
 
@@ -96,6 +110,9 @@ class _FakeKVPool:
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self._k_buffer[layer_id]
+
+    def register_mapping(self, mapping):
+        self.mapping = mapping
 
 
 class _FakeStates:
@@ -318,6 +335,28 @@ class TestQuestRetrieveTopK(CustomTestCase):
         )
         self.assertEqual(int(valid_lengths[0].item()), 0)
         self.assertTrue(torch.all(top_k_tokens[0] == -1))
+
+
+class TestHiSparseAllocatorSemantics(CustomTestCase):
+    def test_sparse_decode_available_size_matches_hisparse_external_contract(self):
+        from sglang.srt.mem_cache.hisparse_memory_pool import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+
+        allocator = HiSparseTokenToKVPoolAllocator(
+            size=8,
+            page_size=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            kvcache=_FakeKVPool([torch.empty(1)]),
+            need_sort=False,
+            host_to_device_ratio=2,
+            sparse_decode_mode=True,
+        )
+
+        self.assertEqual(allocator.logical_attn_allocator.available_size(), 16)
+        self.assertEqual(allocator.hisparse_attn_allocator.available_size(), 8)
+        self.assertEqual(allocator.available_size(), 8)
 
 
 # ---------------------------------------------------------------------------

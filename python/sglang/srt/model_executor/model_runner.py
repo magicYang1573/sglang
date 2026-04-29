@@ -692,11 +692,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
             if self.enable_hisparse:
-                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+                from sglang.srt.mem_cache.sparsity import (
+                    build_sparse_algorithm_controller,
+                    parse_hisparse_config,
+                )
 
                 hisparse_cfg = parse_hisparse_config(self.server_args)
-                algorithm_controller = None
-                mode = "dsa_native"
+                if self.server_args.is_non_native_hisparse_enabled():
+                    algorithm_controller = build_sparse_algorithm_controller(
+                        config=hisparse_cfg,
+                        device=torch.device(self.device),
+                        req_to_token_pool=self.req_to_token_pool,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                    mode = "sparse_decode"
+                else:
+                    algorithm_controller = None
+                    mode = "dsa_native"
             else:
                 from sglang.srt.mem_cache.sparsity import (
                     build_sparse_algorithm_controller,

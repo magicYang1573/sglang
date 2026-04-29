@@ -58,7 +58,10 @@ def _sparse_decode_mha_kv_multiplier(mr: "ModelRunner") -> int:
     one physical row per logical token; scale the per-token byte cost when
     sparse-decode will actually use that pool.
     """
-    if not getattr(mr.server_args, "enable_sparse_decode", False):
+    if not (
+        getattr(mr.server_args, "enable_sparse_decode", False)
+        or mr.server_args.is_non_native_hisparse_enabled()
+    ):
         return 1
     if mr.is_hybrid_swa or mr.mambaish_config is not None:
         return 1
@@ -66,9 +69,16 @@ def _sparse_decode_mha_kv_multiplier(mr: "ModelRunner") -> int:
         return 1
     if is_float4_e2m1fn_x2(mr.kv_cache_dtype):
         return 1
-    from sglang.srt.mem_cache.sparsity import parse_sparse_decode_config
+    from sglang.srt.mem_cache.sparsity import (
+        parse_hisparse_config,
+        parse_sparse_decode_config,
+    )
 
-    cfg = parse_sparse_decode_config(mr.server_args)
+    cfg = (
+        parse_hisparse_config(mr.server_args)
+        if mr.server_args.is_non_native_hisparse_enabled()
+        else parse_sparse_decode_config(mr.server_args)
+    )
     return int(cfg.host_to_device_ratio) + 1
 
 
