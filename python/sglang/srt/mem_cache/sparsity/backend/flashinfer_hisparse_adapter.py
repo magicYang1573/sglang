@@ -33,36 +33,19 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         layer_id: int,
         **kwargs,
     ) -> Any:
-        """Dense-fallback path expressed via the sparse main line.
+        """Dense-fallback path through the sparse adapter.
 
-        The HiSparse + FlashInfer design says that the FlashInfer wrapper only
-        ever sees ``token-level`` ``kv_indices``.  When every request in the
-        batch is short enough to skip retrieval, we still go through the same
-        adapter, but feed it the hot-buffer rows for the full sequence as if
-        they were the ``selected_indices`` chosen by Quest.  This avoids
-        triggering the "dense fallback" branch in :meth:`_build_kv_indices`,
-        which has an extra admission invariant that does not hold pre-admit.
+        Used only when every request in the batch is admitted but short
+        (``compute_all_dense_flag`` returned True).  The empty ``selected_indices``
+        + ``sparse_mask=False`` combination triggers ``_build_kv_indices``'s
+        dense branch which reads ``req_to_device_buffer`` rows directly.
         """
-        coord = getattr(forward_batch, "hisparse_coordinator", None)
-        if coord is None:
-            raise RuntimeError(
-                "FlashInfer HiSparse adapter requires forward_batch.hisparse_coordinator"
-            )
-
-        device = self.device
         bs = int(forward_batch.batch_size)
-        # Width = device_buffer_size so we can copy ``req_to_device_buffer``
-        # rows directly; ``valid_lengths`` masks unused trailing slots.
-        width = int(coord.device_buffer_size)
-        seq_lens_dev = forward_batch.seq_lens.to(device=device, dtype=torch.int64)
-        valid_lengths = seq_lens_dev.clamp(min=0, max=width).to(torch.int32)
-        selected_indices = coord.req_to_device_buffer[
-            forward_batch.req_pool_indices.to(coord.req_to_device_buffer.device),
-            :width,
-        ].to(device=device, dtype=torch.int32)
-        sparse_mask = torch.ones(bs, dtype=torch.bool, device=device)
+        empty_selected = torch.empty((bs, 0), dtype=torch.int32, device=self.device)
+        valid_lengths = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        sparse_mask = torch.zeros(bs, dtype=torch.bool, device=self.device)
         return self.adapt_for_attn_metadata(
-            selected_indices=selected_indices,
+            selected_indices=empty_selected,
             valid_lengths=valid_lengths,
             sparse_mask=sparse_mask,
             current_metadata=current_metadata,
@@ -113,7 +96,6 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             forward_batch=forward_batch,
             kv_indptr=kv_indptr,
             layer_id=layer_id,
-            req_to_token=req_to_token,
         )
 
         kv_last_page_len.fill_(1)
@@ -146,7 +128,6 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         forward_batch: "ForwardBatch",
         kv_indptr: torch.Tensor,
         layer_id: int,
-        req_to_token: Any = None,
     ) -> torch.Tensor:
         coord = getattr(forward_batch, "hisparse_coordinator", None)
         if coord is None:
@@ -158,11 +139,7 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         bs = int(forward_batch.batch_size)
         top_k = selected_indices.shape[1]
         dense_width = coord.device_buffer_size
-        # Logical-row fallback may need to address ``seq_len`` rows for not-yet
-        # admitted requests, which can exceed both ``top_k`` and
-        # ``device_buffer_size``.  Size ``max_width`` accordingly.
-        max_seq_len_in_batch = int(forward_batch.seq_lens.max().item()) if bs > 0 else 0
-        max_width = max(top_k, dense_width, max_seq_len_in_batch)
+        max_width = max(top_k, dense_width)
 
         cols = torch.arange(max_width, device=device).view(1, -1)
         sparse_mask = sparse_mask.to(device=device, dtype=torch.bool)
@@ -209,19 +186,21 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         # newest token is handled separately via the same mapping rule used by
         # HiSparseMHATokenToKVPool.set_kv_buffer().
         history_lengths = (dense_lengths - 1).clamp(min=0)
-        not_admitted_dense_mask = (~sparse_mask) & (dense_caps < history_lengths)
-        # Soft-fallback: rows that have not yet been admitted into the hot
-        # buffer use the original logical KV rows as ``kv_indices`` (which is
-        # well-defined for FlashInfer page_size=1).  We log once per layer so
-        # the operator notices, but do not raise.
-        if torch.any(not_admitted_dense_mask):
-            rows = not_admitted_dense_mask.nonzero(as_tuple=False).flatten()
+        not_admitted_dense = (~sparse_mask) & (dense_caps < history_lengths)
+        if torch.any(not_admitted_dense):
+            # Reaching here means the upstream gating in
+            # ``HiSparseCoordinator.can_run_hisparse`` /
+            # ``SparseAlgorithmController.compute_all_dense_flag`` did not
+            # bypass the HiSparse path even though admission was not complete.
+            # Bail out loudly so callers can fix the gating instead of
+            # producing silently-wrong KV indices.
+            rows = not_admitted_dense.nonzero(as_tuple=False).flatten()
             max_report = min(int(rows.numel()), 8)
             rows_report = rows[:max_report]
-            logger.warning(
-                "FlashInfer HiSparse dense row not yet admitted; falling back "
-                "to logical req_to_token rows for layer_id=%d. examples=%s",
-                layer_id,
+            logger.error(
+                "FlashInfer HiSparse dense fallback row is not admitted into "
+                "HiSparse device buffer. Dense fallback requires full sequence "
+                "KV in req_to_device_buffer. examples=%s",
                 [
                     {
                         "row": int(r.item()),
@@ -234,21 +213,15 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
                         "req_device_buffer_size": int(
                             dense_caps[r].detach().cpu().item()
                         ),
+                        "top_k": dense_budget,
                     }
                     for r in rows_report
                 ],
             )
-        # Use full seq_len for not-admitted rows so they look like normal
-        # FlashInfer dense decode; for admitted dense rows we keep the
-        # ``device_buffer_size``-clamped length (existing semantics).
-        full_lengths = forward_batch.seq_lens.to(
-            device=device, dtype=torch.int64
-        ).clamp(min=0)
-        dense_lengths_effective = torch.where(
-            not_admitted_dense_mask, full_lengths, dense_lengths
-        )
-
-        lengths = torch.where(sparse_mask, sparse_lengths, dense_lengths_effective)
+            raise RuntimeError(
+                "FlashInfer HiSparse dense fallback row is not admitted."
+            )
+        lengths = torch.where(sparse_mask, sparse_lengths, dense_lengths)
         lengths = lengths.clamp(min=1)
 
         kv_indptr[0] = 0
@@ -288,24 +261,6 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             newest_locs.view(-1, 1).expand_as(dense_locs),
             dense_locs,
         )
-
-        # Soft-fallback for not-admitted dense rows: use logical KV rows from
-        # ``req_to_token_pool.req_to_token``.  FlashInfer paged decode reads
-        # them as token-row indices because page_size=1.
-        if torch.any(not_admitted_dense_mask):
-            r2t = req_to_token
-            if r2t is None:
-                r2t = forward_batch.req_to_token_pool.req_to_token
-            logical_cols = cols.clamp(max=r2t.shape[1] - 1).expand(bs, max_width)
-            logical_locs = r2t[
-                forward_batch.req_pool_indices.to(r2t.device).view(-1, 1),
-                logical_cols.to(r2t.device),
-            ].to(device=device, dtype=torch.int32)
-            dense_locs = torch.where(
-                not_admitted_dense_mask.view(-1, 1),
-                logical_locs,
-                dense_locs,
-            )
 
         row_locs = torch.where(sparse_mask.view(-1, 1), sparse_locs, dense_locs)
         valid = cols < lengths.view(-1, 1)

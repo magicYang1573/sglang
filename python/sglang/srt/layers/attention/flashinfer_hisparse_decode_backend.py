@@ -91,6 +91,20 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
             self._hisparse_sparse_active = False
             return super().init_forward_metadata(forward_batch)
 
+        # Only enable HiSparse sparse decode when *every* request in this
+        # batch has finished admission into the hot buffer.  Decode steps
+        # that include not-yet-admitted requests fall back to dense FlashInfer
+        # against the logical KV pool, which is always safe because
+        # ``HiSparseMHATokenToKVPool`` reuses the same physical tensor.
+        admitted_cpu = controller.states.admitted_cpu
+        req_pool_idx_cpu = forward_batch.req_pool_indices.detach().cpu().tolist()
+        all_admitted = all(
+            admitted_cpu.get(int(i), False) for i in req_pool_idx_cpu
+        )
+        if not all_admitted:
+            self._hisparse_sparse_active = False
+            return super().init_forward_metadata(forward_batch)
+
         self._hisparse_sparse_active = True
         self.forward_metadata = FlashInferHiSparseDecodeMetadata(
             decode_wrappers=self.decode_wrappers,
