@@ -92,16 +92,32 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
             return super().init_forward_metadata(forward_batch)
 
         # Only enable HiSparse sparse decode when *every* request in this
-        # batch has finished admission into the hot buffer.  Decode steps
-        # that include not-yet-admitted requests fall back to dense FlashInfer
-        # against the logical KV pool, which is always safe because
-        # ``HiSparseMHATokenToKVPool`` reuses the same physical tensor.
+        # batch has finished admission AND its hot-buffer capacity covers
+        # ``seq_len`` (i.e. dense / sparse paths inside the adapter both have
+        # well-defined ``req_to_device_buffer`` rows).  Otherwise we fall back
+        # to dense FlashInfer against the logical KV pool, which is always
+        # safe because ``HiSparseMHATokenToKVPool`` reuses the same physical
+        # tensor.
         admitted_cpu = controller.states.admitted_cpu
         req_pool_idx_cpu = forward_batch.req_pool_indices.detach().cpu().tolist()
-        all_admitted = all(
-            admitted_cpu.get(int(i), False) for i in req_pool_idx_cpu
+        seq_lens_cpu_list = (
+            forward_batch.seq_lens_cpu.tolist()
+            if forward_batch.seq_lens_cpu is not None
+            else forward_batch.seq_lens.detach().cpu().tolist()
         )
-        if not all_admitted:
+        req_caps = coord.req_device_buffer_size
+        ok_for_sparse = True
+        for req_idx, seq_len in zip(req_pool_idx_cpu, seq_lens_cpu_list):
+            if not admitted_cpu.get(int(req_idx), False):
+                ok_for_sparse = False
+                break
+            # Conservative gate: hot buffer must already cover seq_len-1
+            # tokens of history.  Lazy growth typically catches up within a
+            # decode step; until then, fall back to dense FlashInfer.
+            if int(seq_len) - 1 > int(req_caps[int(req_idx)]):
+                ok_for_sparse = False
+                break
+        if not ok_for_sparse:
             self._hisparse_sparse_active = False
             return super().init_forward_metadata(forward_batch)
 
