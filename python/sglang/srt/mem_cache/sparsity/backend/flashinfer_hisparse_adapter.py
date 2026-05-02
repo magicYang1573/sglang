@@ -266,10 +266,39 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             .detach()
             .cpu()
             .tolist(),
+            "selected_locs_tail": selected_indices[:report_rows, -prefix:]
+            .detach()
+            .cpu()
+            .tolist(),
         }
         if top_k_tokens is not None:
             data["top_k_tokens_head"] = (
                 top_k_tokens[:report_rows, :prefix].detach().cpu().tolist()
             )
+            data["top_k_tokens_tail"] = (
+                top_k_tokens[:report_rows, -prefix:].detach().cpu().tolist()
+            )
+        row_segments = []
+        indptr_cpu = kv_indptr[: report_rows + 1].detach().cpu().tolist()
+        kv_indices_cpu = kv_indices.detach().cpu()
+        for row in range(report_rows):
+            start, end = indptr_cpu[row], indptr_cpu[row + 1]
+            segment = kv_indices_cpu[start:end]
+            row_segments.append(
+                {
+                    "row": row,
+                    "len": end - start,
+                    "head": segment[: min(prefix, segment.numel())].tolist(),
+                    "tail": segment[-min(prefix, segment.numel()) :].tolist(),
+                }
+            )
+        data["kv_indices_by_row"] = row_segments
+
+        k_buf, v_buf = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
+        data["k_buffer_shape"] = list(k_buf.shape)
+        data["v_buffer_shape"] = list(v_buf.shape)
+        data["k_buffer_stride"] = list(k_buf.stride())
+        data["v_buffer_stride"] = list(v_buf.stride())
+        data["kv_pool_page_size"] = int(getattr(forward_batch.token_to_kv_pool, "page_size", -1))
         logger.warning("FlashInfer HiSparse debug indices: %s", data)
         current_metadata._debug_logged = True

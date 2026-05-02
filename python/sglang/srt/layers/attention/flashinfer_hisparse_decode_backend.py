@@ -9,6 +9,8 @@ locations into FlashInfer's paged KV indices.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import os
 from typing import Any, Callable, List
 
 import torch
@@ -20,6 +22,8 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -106,9 +110,27 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
                 )
 
         decode_wrapper = self.forward_metadata.decode_wrappers[0]
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if (
+            os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") == "1"
+            and layer.layer_id == 0
+            and not getattr(self.forward_metadata, "_debug_backend_logged", False)
+        ):
+            logger.warning(
+                "FlashInfer HiSparse backend debug: q_shape=%s q_dtype=%s "
+                "k_shape=%s v_shape=%s k_stride=%s v_stride=%s page_size=%s",
+                list(q.shape),
+                str(q.dtype),
+                list(kv_buffer[0].shape),
+                list(kv_buffer[1].shape),
+                list(kv_buffer[0].stride()),
+                list(kv_buffer[1].stride()),
+                getattr(forward_batch.token_to_kv_pool, "page_size", None),
+            )
+            self.forward_metadata._debug_backend_logged = True
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            kv_buffer,
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             k_scale=layer.k_scale_float,
