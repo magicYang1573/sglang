@@ -5,13 +5,17 @@ Sweep OpenAI-style / native SGLang serving throughput over multiple max-concurre
 Uses the same request path as `python -m sglang.bench_serving`:
   - Fixed-length random prompts (--dataset-name random, --random-range-ratio 0)
   - Default: 32k input tokens, 4k decode tokens
+  - Default: each concurrency step runs ``num_prompts == max_concurrency`` for that step
 
 Example (server on localhost:30000, OpenAI completions API):
 
   python benchmark/long_context_concurrency_sweep.py \\
     --backend sglang-oai --host 127.0.0.1 --port 30000 \\
     --input-len 32768 --output-len 4096 \\
-    --num-prompts 16 --concurrencies 1,2,4,8,16,32
+    --concurrencies 1,2,4,8,16,32
+
+  # Each step uses num_prompts = that step's max_concurrency (e.g. 8 requests @ max_concurrency=8).
+  # To use the same count for every step: --num-prompts 32
 
 Native /generate endpoint:
 
@@ -85,8 +89,10 @@ def main() -> None:
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=32,
-        help="Requests per concurrency step (raise to stabilize throughput).",
+        default=None,
+        metavar="N",
+        help="If set, run N requests for every concurrency step. "
+        "Default: each step runs num_prompts equal to that step's max_concurrency.",
     )
     parser.add_argument(
         "--concurrencies",
@@ -146,6 +152,7 @@ def main() -> None:
             out_path = tmp.name
 
         try:
+            num_prompts = args.num_prompts if args.num_prompts is not None else mc
             cmd: List[str] = [
                 sys.executable,
                 "-m",
@@ -161,7 +168,7 @@ def main() -> None:
                 "--random-range-ratio",
                 "0",
                 "--num-prompts",
-                str(args.num_prompts),
+                str(num_prompts),
                 "--max-concurrency",
                 str(mc),
                 "--seed",
@@ -189,7 +196,7 @@ def main() -> None:
             cmd.extend(["--ready-check-timeout-sec", str(ready_timeout)])
 
             print("\n" + "=" * 72)
-            print(f"Running: max_concurrency={mc}")
+            print(f"Running: max_concurrency={mc}, num_prompts={num_prompts}")
             print(" ".join(cmd))
             print("=" * 72 + "\n", flush=True)
 
@@ -201,6 +208,7 @@ def main() -> None:
                 raise RuntimeError(f"No JSON output written for concurrency={mc}")
             rec = json.loads(line)
             rec["_sweep_max_concurrency"] = mc
+            rec["_sweep_num_prompts"] = num_prompts
             rows.append(rec)
 
         finally:
@@ -208,12 +216,16 @@ def main() -> None:
 
     # Summary table
     print("\n" + "=" * 80)
+    np_desc = (
+        f"num_prompts={args.num_prompts} (fixed)"
+        if args.num_prompts is not None
+        else "num_prompts = concurrency per step"
+    )
     print(
-        f"Summary  (input={args.input_len} tok, output={args.output_len} tok, "
-        f"num_prompts={args.num_prompts})"
+        f"Summary  (input={args.input_len} tok, output={args.output_len} tok, {np_desc})"
     )
     print("=" * 80)
-    hdr = f"{'max_conc':>8}  {'out_tok/s':>12}  {'req/s':>10}  {'in_tok/s':>12}  {'total_tok/s':>12}"
+    hdr = f"{'n_req':>5}  {'max_conc':>8}  {'out_tok/s':>12}  {'req/s':>10}  {'in_tok/s':>12}  {'total_tok/s':>12}"
     print(hdr)
     print("-" * len(hdr))
 
@@ -221,11 +233,12 @@ def main() -> None:
     best_mc = None
     for rec in rows:
         mc = rec.get("_sweep_max_concurrency")
+        npr = int(rec.get("_sweep_num_prompts", 0))
         ot = float(rec.get("output_throughput") or 0)
         rt = float(rec.get("request_throughput") or 0)
         it = float(rec.get("input_throughput") or 0)
         tt = float(rec.get("total_throughput") or 0)
-        print(f"{mc:8d}  {ot:12.2f}  {rt:10.2f}  {it:12.2f}  {tt:12.2f}")
+        print(f"{npr:5d}  {mc:8d}  {ot:12.2f}  {rt:10.2f}  {it:12.2f}  {tt:12.2f}")
         if ot > best_out:
             best_out = ot
             best_mc = mc
