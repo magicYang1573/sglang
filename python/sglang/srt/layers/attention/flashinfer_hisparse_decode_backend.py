@@ -47,6 +47,11 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
     """
 
     def __init__(self, *args, **kwargs):
+        # FlashInferAttnBackend does not keep ``model_runner``; this backend needs
+        # it for HiSparse coordinator / graph buffers.
+        if not args:
+            raise TypeError("FlashInferHiSparseDecodeBackend requires model_runner")
+        self.model_runner = args[0]
         super().__init__(*args, skip_prefill=True, **kwargs)
         if self.num_wrappers != 1:
             raise ValueError(
