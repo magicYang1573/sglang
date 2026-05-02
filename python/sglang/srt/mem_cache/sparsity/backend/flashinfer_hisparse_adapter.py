@@ -178,7 +178,11 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         dense_caps = coord.req_device_buffer_size[
             forward_batch.req_pool_indices.detach().cpu()
         ].to(device=device, dtype=torch.int64)
-        not_admitted_dense = (~sparse_mask) & (dense_caps < dense_lengths)
+        # Dense rows need all history tokens in the hot buffer; the current
+        # newest token is handled separately via the same mapping rule used by
+        # HiSparseMHATokenToKVPool.set_kv_buffer().
+        history_lengths = (dense_lengths - 1).clamp(min=0)
+        not_admitted_dense = (~sparse_mask) & (dense_caps < history_lengths)
         if torch.any(not_admitted_dense):
             rows = not_admitted_dense.nonzero(as_tuple=False).flatten()
             max_report = min(int(rows.numel()), 8)
@@ -226,11 +230,19 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             forward_batch.req_pool_indices.to(coord.req_to_device_buffer.device).view(-1, 1),
             dense_cols.to(coord.req_to_device_buffer.device),
         ].to(device=device, dtype=torch.int32)
-        newest_locs = coord.mem_pool_device.full_to_hisparse_device_index_mapping[
+        newest_mapping = coord.mem_pool_device.full_to_hisparse_device_index_mapping[
             forward_batch.out_cache_loc.to(
                 coord.mem_pool_device.full_to_hisparse_device_index_mapping.device
             )
-        ].to(device=device, dtype=torch.int32)
+        ].to(device=device)
+        newest_locs = torch.where(
+            newest_mapping > 0,
+            newest_mapping,
+            forward_batch.out_cache_loc.to(device=device),
+        )
+        newest_locs = torch.where(
+            newest_mapping < 0, torch.zeros_like(newest_locs), newest_locs
+        ).to(torch.int32)
         newest_col = forward_batch.seq_lens.to(device=device, dtype=torch.int64).view(
             -1, 1
         ) - 1
