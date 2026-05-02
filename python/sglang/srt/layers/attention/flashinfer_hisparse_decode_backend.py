@@ -62,7 +62,8 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
         if not forward_batch.forward_mode.is_decode_or_idle():
             return super().init_forward_metadata(forward_batch)
 
-        coord = getattr(forward_batch, "hisparse_coordinator", None)
+        coord = getattr(self, "model_runner", None)
+        coord = getattr(coord, "hisparse_coordinator", None)
         controller = getattr(coord, "algorithm_controller", None) if coord else None
         if controller is None or getattr(coord, "_all_dense_this_step", False):
             self._hisparse_sparse_active = False
