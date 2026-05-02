@@ -175,6 +175,38 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             raise RuntimeError(
                 "FlashInfer HiSparse dense fallback row exceeds top_k."
             )
+        dense_caps = coord.req_device_buffer_size[
+            forward_batch.req_pool_indices.detach().cpu()
+        ].to(device=device, dtype=torch.int64)
+        not_admitted_dense = (~sparse_mask) & (dense_caps < dense_lengths)
+        if torch.any(not_admitted_dense):
+            rows = not_admitted_dense.nonzero(as_tuple=False).flatten()
+            max_report = min(int(rows.numel()), 8)
+            rows_report = rows[:max_report]
+            logger.error(
+                "FlashInfer HiSparse dense fallback row is not admitted into "
+                "HiSparse device buffer. Dense fallback requires full sequence "
+                "KV in req_to_device_buffer. examples=%s",
+                [
+                    {
+                        "row": int(r.item()),
+                        "req_pool_idx": int(
+                            forward_batch.req_pool_indices[r].detach().cpu().item()
+                        ),
+                        "seq_len": int(
+                            forward_batch.seq_lens[r].detach().cpu().item()
+                        ),
+                        "req_device_buffer_size": int(
+                            dense_caps[r].detach().cpu().item()
+                        ),
+                        "top_k": dense_budget,
+                    }
+                    for r in rows_report
+                ],
+            )
+            raise RuntimeError(
+                "FlashInfer HiSparse dense fallback row is not admitted."
+            )
         lengths = torch.where(sparse_mask, sparse_lengths, dense_lengths)
         lengths = lengths.clamp(min=1)
 
