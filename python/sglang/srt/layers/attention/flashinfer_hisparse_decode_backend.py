@@ -86,6 +86,13 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
         if controller is None:
             return super().forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
 
+        controller.begin_layer_decode(
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            attn_metadata=self.forward_metadata,
+        )
+
         cache_loc = (
             forward_batch.out_cache_loc
             if not layer.is_cross_attention
@@ -97,13 +104,6 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
-
-        controller.begin_layer_decode(
-            q=q,
-            layer=layer,
-            forward_batch=forward_batch,
-            attn_metadata=self.forward_metadata,
-        )
 
         decode_wrapper = self.forward_metadata.decode_wrappers[0]
         o = decode_wrapper.forward(
