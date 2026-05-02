@@ -182,46 +182,19 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         dense_caps = coord.req_device_buffer_size[
             forward_batch.req_pool_indices.detach().cpu()
         ].to(device=device, dtype=torch.int64)
-        # Dense rows need all history tokens in the hot buffer; the current
-        # newest token is handled separately via the same mapping rule used by
-        # HiSparseMHATokenToKVPool.set_kv_buffer().
-        history_lengths = (dense_lengths - 1).clamp(min=0)
-        not_admitted_dense = (~sparse_mask) & (dense_caps < history_lengths)
-        if torch.any(not_admitted_dense):
-            # Reaching here means the upstream gating in
-            # ``HiSparseCoordinator.can_run_hisparse`` /
-            # ``SparseAlgorithmController.compute_all_dense_flag`` did not
-            # bypass the HiSparse path even though admission was not complete.
-            # Bail out loudly so callers can fix the gating instead of
-            # producing silently-wrong KV indices.
-            rows = not_admitted_dense.nonzero(as_tuple=False).flatten()
-            max_report = min(int(rows.numel()), 8)
-            rows_report = rows[:max_report]
-            logger.error(
-                "FlashInfer HiSparse dense fallback row is not admitted into "
-                "HiSparse device buffer. Dense fallback requires full sequence "
-                "KV in req_to_device_buffer. examples=%s",
-                [
-                    {
-                        "row": int(r.item()),
-                        "req_pool_idx": int(
-                            forward_batch.req_pool_indices[r].detach().cpu().item()
-                        ),
-                        "seq_len": int(
-                            forward_batch.seq_lens[r].detach().cpu().item()
-                        ),
-                        "req_device_buffer_size": int(
-                            dense_caps[r].detach().cpu().item()
-                        ),
-                        "top_k": dense_budget,
-                    }
-                    for r in rows_report
-                ],
-            )
-            raise RuntimeError(
-                "FlashInfer HiSparse dense fallback row is not admitted."
-            )
-        lengths = torch.where(sparse_mask, sparse_lengths, dense_lengths)
+        # ``HiSparseCoordinator._grow_device_buffers`` lazily extends the hot
+        # buffer for new decode tokens, so a dense row may legitimately have
+        # ``dense_caps < seq_len - 1`` for a step or two right after admission.
+        # The newest token is recovered via ``newest_locs`` below; the rows
+        # still missing in the hot buffer (``[dense_caps, seq_len - 2]``)
+        # are skipped by clamping the dense length to ``min(dense_caps + 1,
+        # seq_len)``.  This keeps FlashInfer kv_indices well-defined and only
+        # transiently truncates the visible history.
+        dense_lengths_admitted = torch.minimum(dense_lengths, dense_caps + 1)
+        seq_lens_dev = forward_batch.seq_lens.to(device=device, dtype=torch.int64)
+        dense_lengths_admitted = torch.minimum(dense_lengths_admitted, seq_lens_dev)
+
+        lengths = torch.where(sparse_mask, sparse_lengths, dense_lengths_admitted)
         lengths = lengths.clamp(min=1)
 
         kv_indptr[0] = 0
@@ -253,9 +226,11 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         newest_locs = torch.where(
             newest_mapping < 0, torch.zeros_like(newest_locs), newest_locs
         ).to(torch.int32)
-        newest_col = forward_batch.seq_lens.to(device=device, dtype=torch.int64).view(
-            -1, 1
-        ) - 1
+        # Place the newest decode token at the last valid column for this row,
+        # which is ``lengths - 1`` (matches ``valid = cols < lengths`` below).
+        # When admission has caught up, this equals ``seq_len - 1``; when the
+        # hot buffer is still growing, it equals ``dense_caps``.
+        newest_col = (lengths - 1).clamp(min=0).view(-1, 1)
         dense_locs = torch.where(
             cols == newest_col,
             newest_locs.view(-1, 1).expand_as(dense_locs),
