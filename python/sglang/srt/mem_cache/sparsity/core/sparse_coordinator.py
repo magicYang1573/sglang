@@ -16,6 +16,7 @@ For backward compatibility the module keeps the ``SparseConfig`` and
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -271,6 +272,14 @@ class SparseAlgorithmController:
             top_k_result=top_k_tokens,
             layer_id=layer.layer_id,
         )
+        self._maybe_debug_topk(
+            layer_id=layer.layer_id,
+            forward_batch=forward_batch,
+            sparse_mask=sparse_mask,
+            top_k_tokens=top_k_tokens,
+            valid_lengths=valid_lengths,
+            top_k_device_locs=top_k_device_locs,
+        )
 
         return self.adapter.adapt_for_attn_metadata(
             selected_indices=top_k_device_locs,
@@ -283,6 +292,45 @@ class SparseAlgorithmController:
             layer_id=layer.layer_id,
             top_k_tokens=top_k_tokens,
         )
+
+    def _maybe_debug_topk(
+        self,
+        layer_id: int,
+        forward_batch: "ForwardBatch",
+        sparse_mask: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        top_k_device_locs: torch.Tensor,
+    ) -> None:
+        if os.environ.get("SGLANG_HISPARSE_TOPK_DEBUG", "0") != "1":
+            return
+        max_layers = int(os.environ.get("SGLANG_HISPARSE_TOPK_DEBUG_LAYERS", "4"))
+        if layer_id >= max_layers:
+            return
+        logged_layers = getattr(self, "_debug_topk_logged_layers", set())
+        if layer_id in logged_layers:
+            return
+
+        rows = min(int(forward_batch.batch_size), 4)
+        width = min(16, top_k_tokens.shape[1])
+        logger.warning(
+            "HiSparse topk debug: backend=%s layer_id=%d batch_size=%d "
+            "seq_lens=%s req_pool_indices=%s sparse_mask=%s valid_lengths=%s "
+            "topk_head=%s topk_tail=%s locs_head=%s locs_tail=%s",
+            self.config.backend,
+            layer_id,
+            int(forward_batch.batch_size),
+            forward_batch.seq_lens[:rows].detach().cpu().tolist(),
+            forward_batch.req_pool_indices[:rows].detach().cpu().tolist(),
+            sparse_mask[:rows].detach().cpu().tolist(),
+            valid_lengths[:rows].detach().cpu().tolist(),
+            top_k_tokens[:rows, :width].detach().cpu().tolist(),
+            top_k_tokens[:rows, -width:].detach().cpu().tolist(),
+            top_k_device_locs[:rows, :width].detach().cpu().tolist(),
+            top_k_device_locs[:rows, -width:].detach().cpu().tolist(),
+        )
+        logged_layers.add(layer_id)
+        self._debug_topk_logged_layers = logged_layers
 
     def _translate_dense_metadata_for_hisparse(
         self,
