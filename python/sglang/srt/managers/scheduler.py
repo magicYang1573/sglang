@@ -1455,7 +1455,11 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if disable_overlap_for_batch and not processed_pending_result_before_schedule:
+            if (
+                disable_overlap_for_batch
+                and not processed_pending_result_before_schedule
+                and self.result_queue
+            ):
                 pop_and_process()
 
             # Launch the current batch
@@ -1468,7 +1472,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and self.result_queue:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
