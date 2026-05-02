@@ -141,6 +141,68 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
+        self._maybe_compare_flashinfer_with_torch_ref(
+            q=q,
+            o=o,
+            kv_buffer=kv_buffer,
+            layer=layer,
+        )
 
         controller.end_layer_decode(o=o, layer=layer, forward_batch=forward_batch)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _maybe_compare_flashinfer_with_torch_ref(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        kv_buffer,
+        layer: RadixAttention,
+    ) -> None:
+        if os.environ.get("SGLANG_HISPARSE_FLASHINFER_COMPARE", "0") != "1":
+            return
+        if layer.layer_id != 0 or getattr(self.forward_metadata, "_debug_compare_done", False):
+            return
+        kv_indices = getattr(self.forward_metadata, "kv_indices", None)
+        kv_indptr = getattr(self.forward_metadata, "kv_indptr_active", None)
+        if kv_indices is None or kv_indptr is None:
+            return
+
+        row = 0
+        start = int(kv_indptr[row].detach().cpu().item())
+        end = int(kv_indptr[row + 1].detach().cpu().item())
+        idx = kv_indices[start:end].to(torch.long)
+        if idx.numel() == 0:
+            return
+
+        q_heads = layer.tp_q_head_num
+        kv_heads = layer.tp_k_head_num
+        group = q_heads // kv_heads
+        q_row = q.contiguous().view(-1, q_heads, layer.head_dim)[row].to(torch.float32)
+        k_row = kv_buffer[0][idx, 0].to(torch.float32)
+        v_row = kv_buffer[1][idx, 0].to(torch.float32)
+
+        if group > 1:
+            k_row = k_row.repeat_interleave(group, dim=1)
+            v_row = v_row.repeat_interleave(group, dim=1)
+
+        scores = torch.einsum("hd,thd->ht", q_row, k_row) * layer.scaling
+        if layer.logit_cap is not None and layer.logit_cap > 0:
+            scores = layer.logit_cap * torch.tanh(scores / layer.logit_cap)
+        probs = torch.softmax(scores, dim=-1)
+        ref = torch.einsum("ht,thd->hd", probs, v_row)
+        flash = o.view(-1, q_heads, layer.v_head_dim)[row].to(torch.float32)
+        diff = (flash - ref).abs()
+        logger.warning(
+            "FlashInfer HiSparse torch-ref compare: row=%d len=%d "
+            "max_abs_diff=%s mean_abs_diff=%s flash_norm=%s ref_norm=%s "
+            "idx_head=%s idx_tail=%s",
+            row,
+            int(idx.numel()),
+            float(diff.max().detach().cpu().item()),
+            float(diff.mean().detach().cpu().item()),
+            float(flash.norm().detach().cpu().item()),
+            float(ref.norm().detach().cpu().item()),
+            idx[:16].detach().cpu().tolist(),
+            idx[-16:].detach().cpu().tolist(),
+        )
+        self.forward_metadata._debug_compare_done = True
