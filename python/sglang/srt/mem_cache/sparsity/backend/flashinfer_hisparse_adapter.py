@@ -11,7 +11,6 @@ buffer.
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -81,17 +80,6 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             forward_batch=forward_batch,
             kv_indptr=kv_indptr,
             layer_id=layer_id,
-        )
-        self._maybe_debug_log_indices(
-            selected_indices=selected_indices,
-            valid_lengths=valid_lengths,
-            sparse_mask=sparse_mask,
-            current_metadata=current_metadata,
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            top_k_tokens=kwargs.get("top_k_tokens"),
         )
 
         kv_last_page_len.fill_(1)
@@ -265,97 +253,3 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             )
             raise RuntimeError("FlashInfer HiSparse produced negative kv_indices.")
         return kv_indices
-
-    def _maybe_debug_log_indices(
-        self,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: Any,
-        forward_batch: "ForwardBatch",
-        layer_id: int,
-        kv_indptr: torch.Tensor,
-        kv_indices: torch.Tensor,
-        top_k_tokens: torch.Tensor | None,
-    ) -> None:
-        if os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") != "1":
-            return
-        max_layers = int(os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG_LAYERS", "4"))
-        if layer_id >= max_layers:
-            return
-        logged_layers = getattr(current_metadata, "_debug_logged_layers", set())
-        if layer_id in logged_layers:
-            return
-
-        report_rows = min(int(forward_batch.batch_size), 4)
-        prefix = 16
-        data = {
-            "layer_id": int(layer_id),
-            "batch_size": int(forward_batch.batch_size),
-            "seq_lens": forward_batch.seq_lens[:report_rows].detach().cpu().tolist(),
-            "req_pool_indices": forward_batch.req_pool_indices[:report_rows]
-            .detach()
-            .cpu()
-            .tolist(),
-            "sparse_mask": sparse_mask[:report_rows].detach().cpu().tolist(),
-            "valid_lengths": valid_lengths[:report_rows].detach().cpu().tolist(),
-            "kv_indptr": kv_indptr[: report_rows + 1].detach().cpu().tolist(),
-            "kv_indices_head": kv_indices[: min(prefix, kv_indices.numel())]
-            .detach()
-            .cpu()
-            .tolist(),
-            "kv_indices_min": int(kv_indices.min().detach().cpu().item())
-            if kv_indices.numel() > 0
-            else None,
-            "kv_indices_max": int(kv_indices.max().detach().cpu().item())
-            if kv_indices.numel() > 0
-            else None,
-            "selected_locs_head": selected_indices[:report_rows, :prefix]
-            .detach()
-            .cpu()
-            .tolist(),
-            "selected_locs_tail": selected_indices[:report_rows, -prefix:]
-            .detach()
-            .cpu()
-            .tolist(),
-        }
-        if top_k_tokens is not None:
-            data["top_k_tokens_head"] = (
-                top_k_tokens[:report_rows, :prefix].detach().cpu().tolist()
-            )
-            data["top_k_tokens_tail"] = (
-                top_k_tokens[:report_rows, -prefix:].detach().cpu().tolist()
-            )
-        row_segments = []
-        indptr_cpu = kv_indptr[: report_rows + 1].detach().cpu().tolist()
-        kv_indices_cpu = kv_indices.detach().cpu()
-        for row in range(report_rows):
-            start, end = indptr_cpu[row], indptr_cpu[row + 1]
-            segment = kv_indices_cpu[start:end]
-            row_segments.append(
-                {
-                    "row": row,
-                    "len": end - start,
-                    "head": segment[: min(prefix, segment.numel())].tolist(),
-                    "tail": segment[-min(prefix, segment.numel()) :].tolist(),
-                }
-            )
-        data["kv_indices_by_row"] = row_segments
-
-        k_buf, v_buf = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
-        page_size = int(getattr(forward_batch.token_to_kv_pool, "page_size", -1))
-        data["raw_k_buffer_shape"] = list(k_buf.shape)
-        data["raw_v_buffer_shape"] = list(v_buf.shape)
-        data["raw_k_buffer_stride"] = list(k_buf.stride())
-        data["raw_v_buffer_stride"] = list(v_buf.stride())
-        if page_size > 0:
-            data["flashinfer_k_buffer_shape"] = list(
-                k_buf.view(k_buf.shape[0] // page_size, page_size, k_buf.shape[1], k_buf.shape[2]).shape
-            )
-            data["flashinfer_v_buffer_shape"] = list(
-                v_buf.view(v_buf.shape[0] // page_size, page_size, v_buf.shape[1], v_buf.shape[2]).shape
-            )
-        data["kv_pool_page_size"] = page_size
-        logger.warning("FlashInfer HiSparse debug indices: %s", data)
-        logged_layers.add(layer_id)
-        current_metadata._debug_logged_layers = logged_layers

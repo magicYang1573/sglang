@@ -9,8 +9,6 @@ locations into FlashInfer's paged KV indices.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import logging
-import os
 from typing import Any, Callable, List
 
 import torch
@@ -22,8 +20,6 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -124,29 +120,6 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
             raw_k.view(-1, page_size, layer.tp_k_head_num, layer.head_dim),
             raw_v.view(-1, page_size, layer.tp_v_head_num, layer.v_head_dim),
         )
-        if (
-            os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") == "1"
-            and layer.layer_id
-            < int(os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG_LAYERS", "4"))
-        ):
-            logged_backend_layers = getattr(
-                self.forward_metadata, "_debug_backend_logged_layers", set()
-            )
-            if layer.layer_id not in logged_backend_layers:
-                logger.warning(
-                    "FlashInfer HiSparse backend debug: layer_id=%s q_shape=%s q_dtype=%s "
-                    "k_shape=%s v_shape=%s k_stride=%s v_stride=%s page_size=%s",
-                    layer.layer_id,
-                    list(q.shape),
-                    str(q.dtype),
-                    list(kv_buffer[0].shape),
-                    list(kv_buffer[1].shape),
-                    list(kv_buffer[0].stride()),
-                    list(kv_buffer[1].stride()),
-                    page_size,
-                )
-                logged_backend_layers.add(layer.layer_id)
-                self.forward_metadata._debug_backend_logged_layers = logged_backend_layers
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             kv_buffer,
@@ -155,74 +128,6 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
             k_scale=layer.k_scale_float,
             v_scale=layer.v_scale_float,
         )
-        self._maybe_compare_flashinfer_with_torch_ref(
-            q=q,
-            o=o,
-            kv_buffer=kv_buffer,
-            layer=layer,
-        )
 
         controller.end_layer_decode(o=o, layer=layer, forward_batch=forward_batch)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
-
-    def _maybe_compare_flashinfer_with_torch_ref(
-        self,
-        q: torch.Tensor,
-        o: torch.Tensor,
-        kv_buffer,
-        layer: RadixAttention,
-    ) -> None:
-        if os.environ.get("SGLANG_HISPARSE_FLASHINFER_COMPARE", "0") != "1":
-            return
-        max_layers = int(os.environ.get("SGLANG_HISPARSE_FLASHINFER_COMPARE_LAYERS", "4"))
-        if layer.layer_id >= max_layers:
-            return
-        compared_layers = getattr(self.forward_metadata, "_debug_compare_layers", set())
-        if layer.layer_id in compared_layers:
-            return
-        kv_indices = getattr(self.forward_metadata, "kv_indices", None)
-        kv_indptr = getattr(self.forward_metadata, "kv_indptr_active", None)
-        if kv_indices is None or kv_indptr is None:
-            return
-
-        row = 0
-        start = int(kv_indptr[row].detach().cpu().item())
-        end = int(kv_indptr[row + 1].detach().cpu().item())
-        idx = kv_indices[start:end].to(torch.long)
-        if idx.numel() == 0:
-            return
-
-        q_heads = layer.tp_q_head_num
-        kv_heads = layer.tp_k_head_num
-        group = q_heads // kv_heads
-        q_row = q.contiguous().view(-1, q_heads, layer.head_dim)[row].to(torch.float32)
-        k_row = kv_buffer[0][idx, 0].to(torch.float32)
-        v_row = kv_buffer[1][idx, 0].to(torch.float32)
-
-        if group > 1:
-            k_row = k_row.repeat_interleave(group, dim=1)
-            v_row = v_row.repeat_interleave(group, dim=1)
-
-        scores = torch.einsum("hd,thd->ht", q_row, k_row) * layer.scaling
-        if layer.logit_cap is not None and layer.logit_cap > 0:
-            scores = layer.logit_cap * torch.tanh(scores / layer.logit_cap)
-        probs = torch.softmax(scores, dim=-1)
-        ref = torch.einsum("ht,thd->hd", probs, v_row)
-        flash = o.view(-1, q_heads, layer.v_head_dim)[row].to(torch.float32)
-        diff = (flash - ref).abs()
-        logger.warning(
-            "FlashInfer HiSparse torch-ref compare: layer_id=%d row=%d len=%d "
-            "max_abs_diff=%s mean_abs_diff=%s flash_norm=%s ref_norm=%s "
-            "idx_head=%s idx_tail=%s",
-            layer.layer_id,
-            row,
-            int(idx.numel()),
-            float(diff.max().detach().cpu().item()),
-            float(diff.mean().detach().cpu().item()),
-            float(flash.norm().detach().cpu().item()),
-            float(ref.norm().detach().cpu().item()),
-            idx[:16].detach().cpu().tolist(),
-            idx[-16:].detach().cpu().tolist(),
-        )
-        compared_layers.add(layer.layer_id)
-        self.forward_metadata._debug_compare_layers = compared_layers
