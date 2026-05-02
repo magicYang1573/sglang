@@ -5,7 +5,6 @@
 # construction time.
 
 import logging
-import os
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Type
 
 import torch
@@ -174,7 +173,6 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
-        self._host_backed_up_len = [0] * max_num_reqs
 
         # Sparse-decode controller (non-DSA path).  Bound here so the
         # algorithm's representation pool can be initialized against the
@@ -286,7 +284,6 @@ class HiSparseCoordinator:
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
-        self._host_backed_up_len[req.req_pool_idx] = req.kv_allocated_len
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def _preload_to_device_buffer(self, req: Req) -> None:
@@ -369,7 +366,6 @@ class HiSparseCoordinator:
             self.alloc_device_buffer(req)
             req.hisparse_staging = False
             self._skip_first_backup[req.req_pool_idx] = True
-            self._host_backed_up_len[req.req_pool_idx] = req.kv_allocated_len
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
@@ -510,23 +506,9 @@ class HiSparseCoordinator:
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
-            actual_token_pos = int(seq_lens_cpu[i]) - 2
-            if actual_token_pos < 0:
-                continue
-
-            host_loc = int(self.req_to_host_pool[req_idx, actual_token_pos].item())
-            if host_loc >= 0:
-                self._host_backed_up_len[req_idx] = max(
-                    self._host_backed_up_len[req_idx], actual_token_pos + 1
-                )
-                if self._skip_first_backup[req_idx]:
-                    self._skip_first_backup[req_idx] = False
-                continue
-
             if self._skip_first_backup[req_idx]:
                 self._skip_first_backup[req_idx] = False
-                if actual_token_pos < self._host_backed_up_len[req_idx]:
-                    continue
+                continue
             backup_indices.append(i)
 
         if not backup_indices:
@@ -555,14 +537,6 @@ class HiSparseCoordinator:
             )
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
-        for req_idx, token_pos in zip(
-            backup_req_indices.detach().cpu().tolist(),
-            actual_token_pos.detach().cpu().tolist(),
-        ):
-            req_idx = int(req_idx)
-            self._host_backed_up_len[req_idx] = max(
-                self._host_backed_up_len[req_idx], int(token_pos) + 1
-            )
 
         if self._has_pending_backup:
             self._backup_done_event.wait(device_module.current_stream())
@@ -714,7 +688,6 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
-        self._host_backed_up_len[req.req_pool_idx] = 0
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -758,7 +731,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
-        self._host_backed_up_len[req.req_pool_idx] = 0
 
     def swap_in_selected_pages(
         self,
@@ -781,13 +753,6 @@ class HiSparseCoordinator:
             raise ValueError(
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
-
-        self._debug_check_top_k_tokens_for_swap_in(
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            top_k_result=top_k_result,
-            layer_id=layer_id,
-        )
 
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
@@ -837,171 +802,6 @@ class HiSparseCoordinator:
             )
         return top_k_indices
 
-    def _debug_check_top_k_tokens_for_swap_in(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        top_k_result: torch.Tensor,
-        layer_id: int,
-    ) -> None:
-        """Fail early with actionable context before the swap-in kernel.
-
-        The CUDA kernel can legally read the newest token from the reserved
-        device slot, and it can read older tokens from host only if
-        req_to_host_pool[req, token] has been populated.  If Quest returns an
-        older token that has no host backup, the kernel would dereference host
-        loc -1 and crash with an illegal memory access.  Keep this as a debug
-        check while validating the FlashInfer sparse-decode path.
-        """
-        token_pos = top_k_result.to(torch.int64)
-        seq_lens_i64 = seq_lens.to(torch.int64).view(-1, 1)
-        valid_range = (token_pos >= 0) & (token_pos < seq_lens_i64)
-        newest_token = seq_lens_i64 - 1
-        is_newest = valid_range & (token_pos == newest_token)
-
-        safe_token_pos = token_pos.clamp(min=0, max=self.req_to_host_pool.shape[1] - 1)
-        host_locs = self.req_to_host_pool[
-            req_pool_indices.to(self.req_to_host_pool.device).view(-1, 1),
-            safe_token_pos.to(self.req_to_host_pool.device),
-        ].to(top_k_result.device)
-        has_host_backup = valid_range & (host_locs >= 0)
-        bad = valid_range & (~is_newest) & (~has_host_backup)
-        if torch.any(bad):
-            prev_token = seq_lens_i64 - 2
-            repairable = bad & (token_pos == prev_token)
-            if torch.any(repairable):
-                repair_rows = torch.unique(repairable.nonzero(as_tuple=True)[0])
-                self._backup_previous_tokens_now(
-                    req_pool_indices=req_pool_indices,
-                    seq_lens=seq_lens,
-                    rows=repair_rows,
-                )
-                host_locs = self.req_to_host_pool[
-                    req_pool_indices.to(self.req_to_host_pool.device).view(-1, 1),
-                    safe_token_pos.to(self.req_to_host_pool.device),
-                ].to(top_k_result.device)
-                has_host_backup = valid_range & (host_locs >= 0)
-                bad = valid_range & (~is_newest) & (~has_host_backup)
-
-        if not torch.any(bad):
-            return
-
-        bad_rows, bad_cols = bad.nonzero(as_tuple=True)
-        max_report = min(int(bad_rows.numel()), 16)
-        rows = bad_rows[:max_report]
-        cols = bad_cols[:max_report]
-        reqs = req_pool_indices[rows]
-        bad_tokens = token_pos[rows, cols]
-        bad_host_locs = host_locs[rows, cols]
-        row_seq_lens = seq_lens_i64.view(-1)[rows]
-        newest = newest_token.view(-1)[rows]
-        logger.error(
-            "HiSparse swap-in found top-k tokens without host backup. "
-            "layer_id=%d, kernel will be skipped by raising. examples=%s, "
-            "state=%s",
-            layer_id,
-            [
-                {
-                    "row": int(rows[i].item()),
-                    "topk_col": int(cols[i].item()),
-                    "req_pool_idx": int(reqs[i].item()),
-                    "token_pos": int(bad_tokens[i].item()),
-                    "seq_len": int(row_seq_lens[i].item()),
-                    "newest_token": int(newest[i].item()),
-                    "host_loc": int(bad_host_locs[i].item()),
-                }
-                for i in range(max_report)
-            ],
-            self._debug_dump_req_state(req_pool_indices[rows[:1]]),
-        )
-        raise RuntimeError(
-            "HiSparse swap-in received top-k token(s) without host backup. "
-            "See preceding log for token positions and request ids."
-        )
-
-    def _backup_previous_tokens_now(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        rows: torch.Tensor,
-    ) -> None:
-        if rows.numel() == 0:
-            return
-        rows = rows.to(device=req_pool_indices.device, dtype=torch.int64)
-        backup_req_indices = req_pool_indices[rows]
-        actual_token_pos = seq_lens[rows].to(torch.int64) - 2
-        device_locs = self.req_to_device_buffer[
-            backup_req_indices,
-            actual_token_pos.clamp(max=self.device_buffer_size),
-        ]
-
-        already_backed = self.req_to_host_pool[
-            backup_req_indices.to(self.req_to_host_pool.device),
-            actual_token_pos.to(self.req_to_host_pool.device),
-        ] >= 0
-        if bool(torch.all(already_backed).item()):
-            return
-
-        backup_req_indices = backup_req_indices[~already_backed]
-        actual_token_pos = actual_token_pos[~already_backed]
-        device_locs = device_locs[~already_backed]
-        host_locs = self.mem_pool_host.alloc(len(device_locs))
-        if host_locs is None:
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {len(device_locs)} repair backup tokens"
-            )
-        host_locs = host_locs.to(device=self.device)
-        self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
-        self.mem_pool_host.backup_from_device_all_layer(
-            self.mem_pool_device,
-            host_locs,
-            device_locs,
-            io_backend="kernel",
-        )
-        for req_idx, token_pos in zip(
-            backup_req_indices.detach().cpu().tolist(),
-            actual_token_pos.detach().cpu().tolist(),
-        ):
-            req_idx = int(req_idx)
-            self._host_backed_up_len[req_idx] = max(
-                self._host_backed_up_len[req_idx], int(token_pos) + 1
-            )
-
-    def _debug_dump_req_state(self, req_pool_indices: torch.Tensor):
-        if req_pool_indices.numel() == 0:
-            return {}
-        req_idx = int(req_pool_indices[0].item())
-        host_head = (
-            self.req_to_host_pool[req_idx, : min(32, self.req_to_host_pool.shape[1])]
-            .detach()
-            .cpu()
-            .tolist()
-        )
-        dev_cap = int(self.req_device_buffer_size[req_idx])
-        dev_head = (
-            self.req_to_device_buffer[req_idx, : min(32, self.req_to_device_buffer.shape[1])]
-            .detach()
-            .cpu()
-            .tolist()
-        )
-        token_head = (
-            self.req_device_buffer_tokens[0, req_idx, : min(32, self.req_device_buffer_tokens.shape[2])]
-            .detach()
-            .cpu()
-            .tolist()
-        )
-        prompt_len = None
-        if self.algorithm_controller is not None:
-            prompt_len = self.algorithm_controller.states.prompt_lens_cpu.get(req_idx)
-        return {
-            "req_pool_idx": req_idx,
-            "prompt_len_cpu": prompt_len,
-            "req_device_buffer_size": dev_cap,
-            "req_to_host_pool_head": host_head,
-            "req_to_device_buffer_head": dev_head,
-            "req_device_buffer_tokens_layer0_head": token_head,
-        }
-
     def admit_request_from_gpu(self, req: Req) -> None:
         """Single-instance counterpart of :meth:`admit_request_into_staging`.
 
@@ -1036,12 +836,6 @@ class HiSparseCoordinator:
             req.req_pool_idx, :kv_len
         ].to(device=self.device, dtype=torch.int64)
 
-        # The request's req_pool_idx can be assigned/reused across chunked
-        # prefill.  Register at admission time as well, so sparse-mask decisions
-        # during decode use the final live req_pool_idx instead of falling back
-        # to prompt_len=0.
-        self.algorithm_controller.on_request_begin(req)
-
         # 1. Algorithm representation construction.  At this point the
         # request's KV still lives in the logical rows of the
         # HiSparseMHATokenToKVPool and is GPU-visible via get_key_buffer.
@@ -1063,20 +857,6 @@ class HiSparseCoordinator:
             )
         host_indices = host_indices.to(device=self.device)
         self.req_to_host_pool[req.req_pool_idx, :kv_len] = host_indices
-
-        if os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") == "1":
-            logger.warning(
-                "HiSparse admit_request_from_gpu: req_pool_idx=%s kv_len=%d "
-                "origin_len=%d host_head=%s logical_head=%s",
-                req.req_pool_idx,
-                kv_len,
-                len(req.origin_input_ids),
-                host_indices[: min(16, host_indices.numel())].detach().cpu().tolist(),
-                logical_indices[: min(16, logical_indices.numel())]
-                .detach()
-                .cpu()
-                .tolist(),
-            )
 
         self.mem_pool_host.backup_from_device_all_layer(
             self.mem_pool_device,
@@ -1112,6 +892,5 @@ class HiSparseCoordinator:
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
-        self._host_backed_up_len[req.req_pool_idx] = kv_len
         self.algorithm_controller.on_prefill_finished(req)
         logger.debug("HiSparse: admitted request %s from GPU (len=%d)", req.rid, kv_len)

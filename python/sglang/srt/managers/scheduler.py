@@ -1433,21 +1433,6 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # Non-native HiSparse sparse_decode updates request admission and
-            # release state in process_batch_result().  Process pending results
-            # before constructing the next batch; otherwise get_next_batch_to_run
-            # can build a decode batch containing a request that is about to be
-            # admitted or freed.
-            processed_pending_result_before_schedule = False
-            if (
-                self.hisparse_coordinator is not None
-                and self.hisparse_coordinator.mode == "sparse_decode"
-                and self.last_batch
-                and self.result_queue
-            ):
-                pop_and_process()
-                processed_pending_result_before_schedule = True
-
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1455,11 +1440,7 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
-            if (
-                disable_overlap_for_batch
-                and not processed_pending_result_before_schedule
-                and self.result_queue
-            ):
+            if disable_overlap_for_batch:
                 pop_and_process()
 
             # Launch the current batch
@@ -1472,7 +1453,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch and self.result_queue:
+                if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1519,23 +1500,7 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        # Non-native HiSparse sparse_decode admits a request to host/hot-buffer
-        # in process_batch_result() after prefill.  If overlap launches the
-        # next decode batch before processing the previous prefill result, the
-        # newly merged request can enter decode without host backup.
-        need_hisparse_sparse_decode_sync = (
-            batch
-            and self.hisparse_coordinator is not None
-            and self.hisparse_coordinator.mode == "sparse_decode"
-            and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
-        )
-
-        return (
-            disable_overlap_for_batch
-            or need_grammar_sync
-            or need_hisparse_sparse_decode_sync
-        )
+        return disable_overlap_for_batch or need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
