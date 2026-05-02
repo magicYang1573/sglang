@@ -5,6 +5,7 @@
 # construction time.
 
 import logging
+import os
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Type
 
 import torch
@@ -852,7 +853,8 @@ class HiSparseCoordinator:
         newest = newest_token.view(-1)[rows]
         logger.error(
             "HiSparse swap-in found top-k tokens without host backup. "
-            "layer_id=%d, kernel will be skipped by raising. examples=%s",
+            "layer_id=%d, kernel will be skipped by raising. examples=%s, "
+            "state=%s",
             layer_id,
             [
                 {
@@ -866,11 +868,47 @@ class HiSparseCoordinator:
                 }
                 for i in range(max_report)
             ],
+            self._debug_dump_req_state(req_pool_indices[rows[:1]]),
         )
         raise RuntimeError(
             "HiSparse swap-in received top-k token(s) without host backup. "
             "See preceding log for token positions and request ids."
         )
+
+    def _debug_dump_req_state(self, req_pool_indices: torch.Tensor):
+        if req_pool_indices.numel() == 0:
+            return {}
+        req_idx = int(req_pool_indices[0].item())
+        host_head = (
+            self.req_to_host_pool[req_idx, : min(32, self.req_to_host_pool.shape[1])]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        dev_cap = int(self.req_device_buffer_size[req_idx])
+        dev_head = (
+            self.req_to_device_buffer[req_idx, : min(32, self.req_to_device_buffer.shape[1])]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        token_head = (
+            self.req_device_buffer_tokens[0, req_idx, : min(32, self.req_device_buffer_tokens.shape[2])]
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        prompt_len = None
+        if self.algorithm_controller is not None:
+            prompt_len = self.algorithm_controller.states.prompt_lens_cpu.get(req_idx)
+        return {
+            "req_pool_idx": req_idx,
+            "prompt_len_cpu": prompt_len,
+            "req_device_buffer_size": dev_cap,
+            "req_to_host_pool_head": host_head,
+            "req_to_device_buffer_head": dev_head,
+            "req_device_buffer_tokens_layer0_head": token_head,
+        }
 
     def admit_request_from_gpu(self, req: Req) -> None:
         """Single-instance counterpart of :meth:`admit_request_into_staging`.
@@ -933,6 +971,20 @@ class HiSparseCoordinator:
             )
         host_indices = host_indices.to(device=self.device)
         self.req_to_host_pool[req.req_pool_idx, :kv_len] = host_indices
+
+        if os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") == "1":
+            logger.warning(
+                "HiSparse admit_request_from_gpu: req_pool_idx=%s kv_len=%d "
+                "origin_len=%d host_head=%s logical_head=%s",
+                req.req_pool_idx,
+                kv_len,
+                len(req.origin_input_ids),
+                host_indices[: min(16, host_indices.numel())].detach().cpu().tolist(),
+                logical_indices[: min(16, logical_indices.numel())]
+                .detach()
+                .cpu()
+                .tolist(),
+            )
 
         self.mem_pool_host.backup_from_device_all_layer(
             self.mem_pool_device,
