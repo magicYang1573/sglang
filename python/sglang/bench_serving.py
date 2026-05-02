@@ -283,6 +283,7 @@ async def async_request_openai_completions(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
+                    stream_error_msg: Optional[str] = None
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
                         if not chunk_bytes:
@@ -295,10 +296,28 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
+                            # SGLang streaming error chunk (no usable choices), see
+                            # serving_base.create_streaming_error_response.
+                            if "error" in data:
+                                err = data["error"]
+                                if isinstance(err, dict):
+                                    stream_error_msg = err.get(
+                                        "message", json.dumps(err)
+                                    )
+                                else:
+                                    stream_error_msg = str(err)
+                                break
+
+                            choices = data.get("choices") or []
+                            if not choices:
+                                # Usage-only or extension chunks (empty choices).
+                                continue
+
+                            text_delta = choices[0].get("text") or ""
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            if text_delta:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -307,19 +326,19 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(text_delta)
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += text_delta
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
 
                     output.generated_text = generated_text
-                    output.success = True
+                    output.success = stream_error_msg is None
+                    if stream_error_msg:
+                        output.error = stream_error_msg
                     output.latency = latency
                     output.output_len = output_len
                 else:
