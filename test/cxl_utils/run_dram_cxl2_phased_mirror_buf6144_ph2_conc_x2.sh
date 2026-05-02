@@ -18,6 +18,8 @@
 #   REQ_PER_CONC_MULT (default 2) — num-requests = max_concurrency × this, all phases
 #   P134_CONC (default 64) — concurrency for phase 1, 3, and 4
 #   HISPARSE_DEVICE_BUFFER_SIZE (default 6144)
+#   SERVER_STARTUP_WAIT (1800) — max seconds to wait for /health
+#   SERVER_POST_HEALTH_SLEEP_SEC (300) — sleep after /health OK (CUDA graph capture / warmup); set 0 to skip
 #   SERVER_TEARDOWN_WAIT_SEC (90), SERVER_POST_KILL_SLEEP_SEC (8) — port/process cleanup between cases
 #   Plus same server/client env as parent (MODEL_CLIENT, PORT, CXL_*, etc.)
 #
@@ -50,7 +52,8 @@ SEED="${SEED:-42}"
 PAUSE_BETWEEN_ROUNDS="${PAUSE_BETWEEN_ROUNDS:-3.0}"
 
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
-SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-600}"
+SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-1800}"
+SERVER_POST_HEALTH_SLEEP_SEC="${SERVER_POST_HEALTH_SLEEP_SEC:-300}"
 SKIP_SERVER="${SKIP_SERVER:-0}"
 # Between cases: tear down full launch_server tree + wait until HTTP port is free (avoids rpc_port leaks).
 SERVER_TEARDOWN_WAIT_SEC="${SERVER_TEARDOWN_WAIT_SEC:-90}"
@@ -144,6 +147,10 @@ wait_for_server() {
     fi
   done
   echo "  Server ready (waited ${waited}s)"
+  if [[ "${SERVER_POST_HEALTH_SLEEP_SEC:-0}" -gt 0 ]]; then
+    echo "  Sleeping ${SERVER_POST_HEALTH_SLEEP_SEC}s after /health (CUDA graph / server warmup)..."
+    sleep "${SERVER_POST_HEALTH_SLEEP_SEC}"
+  fi
 }
 
 # Recursive kill when setsid is unavailable (children-first).
@@ -328,6 +335,7 @@ run_e2e_fast() {
   echo "HISPARSE_DEVICE_BUFFER_SIZE=${HISPARSE_DEVICE_BUFFER_SIZE}"
   echo "REQ_PER_CONC_MULT=${REQ_PER_CONC_MULT} P134_CONC=${P134_CONC} NREQ_P134=${NREQ_P134}"
   echo "P1-P3 order: interleaved dram then cxl2 per (ctx[, conc[, olen]]); P4 per ctx: cxl1 then cxl2"
+  echo "SERVER_STARTUP_WAIT=${SERVER_STARTUP_WAIT:-1800} SERVER_POST_HEALTH_SLEEP_SEC=${SERVER_POST_HEALTH_SLEEP_SEC:-300}"
   echo "SERVER_TEARDOWN_WAIT_SEC=${SERVER_TEARDOWN_WAIT_SEC:-90} SERVER_POST_KILL_SLEEP_SEC=${SERVER_POST_KILL_SLEEP_SEC:-8}"
   echo "MODEL_PATH=${MODEL_PATH} MODEL_CLIENT=${MODEL_CLIENT}"
   echo "TP=${TP} DP_SIZE=${DP_SIZE} PORT=${PORT}"
