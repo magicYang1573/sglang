@@ -82,10 +82,12 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
         if not forward_batch.forward_mode.is_decode_or_idle():
             return super().init_forward_metadata(forward_batch)
 
-        coord = getattr(self, "model_runner", None)
-        coord = getattr(coord, "hisparse_coordinator", None)
-        controller = getattr(coord, "algorithm_controller", None) if coord else None
-        if controller is None or getattr(coord, "_all_dense_this_step", False):
+        # ``self.model_runner`` is set in :meth:`__init__`.  Use direct access
+        # so a misconfigured coordinator surfaces immediately instead of
+        # silently falling through to dense FlashInfer.
+        coord = self.model_runner.hisparse_coordinator
+        controller = coord.algorithm_controller if coord is not None else None
+        if controller is None:
             self._hisparse_sparse_active = False
             return super().init_forward_metadata(forward_batch)
 

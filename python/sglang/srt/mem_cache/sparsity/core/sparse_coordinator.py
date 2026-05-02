@@ -60,18 +60,28 @@ class RequestTrackers:
         # (see ``SparseAlgorithmController.compute_all_dense_flag``).  Kept in
         # sync by :meth:`register` / :meth:`clear`.
         self.prompt_lens_cpu: dict = {}
+        # ``True`` once :meth:`HiSparseCoordinator.admit_request_from_gpu`
+        # (or staging-path equivalent) has populated the request's hot buffer.
+        # The decode hot path uses this to avoid the dense fallback branch
+        # before admission has run.
+        self.admitted_cpu: dict = {}
 
     def register(self, idx: int, prompt_len: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = prompt_len
         self.last_constructed_page[idx] = 0
         self.prompt_lens_cpu[int(idx)] = int(prompt_len)
+        self.admitted_cpu[int(idx)] = False
+
+    def mark_admitted(self, idx: int) -> None:
+        self.admitted_cpu[int(idx)] = True
 
     def clear(self, idx: int) -> None:
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
         self.last_constructed_page[idx] = 0
         self.prompt_lens_cpu.pop(int(idx), None)
+        self.admitted_cpu.pop(int(idx), None)
 
 
 @dataclass
@@ -163,7 +173,11 @@ class SparseAlgorithmController:
         :meth:`HiSparseCoordinator.admit_request_from_gpu`); extra bookkeeping
         by subclasses (e.g. caching min/max in GPU) can happen here.
         """
-        return
+        if req.req_pool_idx is None:
+            return
+        # Mark admission complete so the decode hot path can rely on
+        # ``req_device_buffer_size > 0`` for this request.
+        self.states.mark_admitted(req.req_pool_idx)
 
     def on_request_end(self, req: "Req") -> None:
         if req.req_pool_idx is None:
@@ -191,6 +205,7 @@ class SparseAlgorithmController:
             # No threshold configured → every request goes through sparse.
             return False
         prompt_lens_cpu = self.states.prompt_lens_cpu
+        admitted_cpu = self.states.admitted_cpu
         seq_lens_list = (
             seq_lens_cpu.tolist()
             if seq_lens_cpu is not None
@@ -203,6 +218,12 @@ class SparseAlgorithmController:
             if seq_len is not None:
                 if int(seq_len) > int(self.config.top_k):
                     return False
+            # If admission has not populated the hot buffer for this request
+            # yet, the dense fallback path cannot satisfy
+            # ``req_device_buffer_size >= history_lengths``.  Stay on the
+            # sparse main line, which can tolerate empty selections.
+            if not admitted_cpu.get(int(req_idx), False):
+                return False
         return True
 
     def begin_layer_decode(
