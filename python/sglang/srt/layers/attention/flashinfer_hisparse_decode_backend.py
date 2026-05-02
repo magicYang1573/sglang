@@ -9,7 +9,7 @@ locations into FlashInfer's paged KV indices.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, List
+from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
@@ -20,6 +20,9 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 @dataclass
@@ -46,13 +49,11 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
     HiSparse hot-buffer locations can be used directly as ``kv_indices``.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, model_runner: "ModelRunner", **kwargs):
         # FlashInferAttnBackend does not keep ``model_runner``; this backend needs
-        # it for HiSparse coordinator / graph buffers.
-        if not args:
-            raise TypeError("FlashInferHiSparseDecodeBackend requires model_runner")
-        self.model_runner = args[0]
-        super().__init__(*args, skip_prefill=True, **kwargs)
+        # it for HiSparse coordinator / graph buffers (decode path + CUDA graph buffers).
+        self.model_runner = model_runner
+        super().__init__(model_runner, skip_prefill=True, **kwargs)
         if self.num_wrappers != 1:
             raise ValueError(
                 "flashinfer_hisparse_decode currently supports only one decode "
