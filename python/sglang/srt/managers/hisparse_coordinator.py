@@ -174,6 +174,7 @@ class HiSparseCoordinator:
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
+        self._host_backed_up_len = [0] * max_num_reqs
 
         # Sparse-decode controller (non-DSA path).  Bound here so the
         # algorithm's representation pool can be initialized against the
@@ -285,6 +286,7 @@ class HiSparseCoordinator:
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
+        self._host_backed_up_len[req.req_pool_idx] = req.kv_allocated_len
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def _preload_to_device_buffer(self, req: Req) -> None:
@@ -367,6 +369,7 @@ class HiSparseCoordinator:
             self.alloc_device_buffer(req)
             req.hisparse_staging = False
             self._skip_first_backup[req.req_pool_idx] = True
+            self._host_backed_up_len[req.req_pool_idx] = req.kv_allocated_len
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
@@ -508,8 +511,10 @@ class HiSparseCoordinator:
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
             if self._skip_first_backup[req_idx]:
+                actual_token_pos = int(seq_lens_cpu[i]) - 2
                 self._skip_first_backup[req_idx] = False
-                continue
+                if actual_token_pos < self._host_backed_up_len[req_idx]:
+                    continue
             backup_indices.append(i)
 
         if not backup_indices:
@@ -538,6 +543,14 @@ class HiSparseCoordinator:
             )
         host_locs = host_locs.to(device=self.device)
         self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
+        for req_idx, token_pos in zip(
+            backup_req_indices.detach().cpu().tolist(),
+            actual_token_pos.detach().cpu().tolist(),
+        ):
+            req_idx = int(req_idx)
+            self._host_backed_up_len[req_idx] = max(
+                self._host_backed_up_len[req_idx], int(token_pos) + 1
+            )
 
         if self._has_pending_backup:
             self._backup_done_event.wait(device_module.current_stream())
@@ -689,6 +702,7 @@ class HiSparseCoordinator:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
+        self._host_backed_up_len[req.req_pool_idx] = 0
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -732,6 +746,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._host_backed_up_len[req.req_pool_idx] = 0
 
     def swap_in_selected_pages(
         self,
@@ -1020,5 +1035,6 @@ class HiSparseCoordinator:
 
         req.hisparse_staging = False
         self._skip_first_backup[req.req_pool_idx] = True
+        self._host_backed_up_len[req.req_pool_idx] = kv_len
         self.algorithm_controller.on_prefill_finished(req)
         logger.debug("HiSparse: admitted request %s from GPU (len=%d)", req.rid, kv_len)
