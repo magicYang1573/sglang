@@ -192,12 +192,10 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             forward_batch.req_pool_indices.to(coord.req_to_device_buffer.device).view(-1, 1),
             dense_cols.to(coord.req_to_device_buffer.device),
         ].to(device=device, dtype=torch.int32)
-        newest_locs = coord.req_device_buffer_token_locs[
-            layer_id,
-            forward_batch.req_pool_indices.to(
-                coord.req_device_buffer_token_locs.device
-            ),
-            coord.device_buffer_size,
+        newest_locs = coord.mem_pool_device.full_to_hisparse_device_index_mapping[
+            forward_batch.out_cache_loc.to(
+                coord.mem_pool_device.full_to_hisparse_device_index_mapping.device
+            )
         ].to(device=device, dtype=torch.int32)
         newest_col = forward_batch.seq_lens.to(device=device, dtype=torch.int64).view(
             -1, 1
@@ -210,7 +208,17 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
 
         row_locs = torch.where(sparse_mask.view(-1, 1), sparse_locs, dense_locs)
         valid = cols < lengths.view(-1, 1)
-        return row_locs[valid].contiguous()
+        kv_indices = row_locs[valid].contiguous()
+        if torch.any(kv_indices < 0):
+            bad = (kv_indices < 0).nonzero(as_tuple=False).flatten()
+            logger.error(
+                "FlashInfer HiSparse produced negative kv_indices. "
+                "head=%s, bad_offsets=%s",
+                kv_indices[: min(16, kv_indices.numel())].detach().cpu().tolist(),
+                bad[:16].detach().cpu().tolist(),
+            )
+            raise RuntimeError("FlashInfer HiSparse produced negative kv_indices.")
+        return kv_indices
 
     def _maybe_debug_log_indices(
         self,
