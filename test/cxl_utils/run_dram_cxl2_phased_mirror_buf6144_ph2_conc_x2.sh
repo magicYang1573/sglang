@@ -18,6 +18,7 @@
 #   REQ_PER_CONC_MULT (default 2) — num-requests = max_concurrency × this, all phases
 #   P134_CONC (default 64) — concurrency for phase 1, 3, and 4
 #   HISPARSE_DEVICE_BUFFER_SIZE (default 6144)
+#   SERVER_TEARDOWN_WAIT_SEC (90), SERVER_POST_KILL_SLEEP_SEC (8) — port/process cleanup between cases
 #   Plus same server/client env as parent (MODEL_CLIENT, PORT, CXL_*, etc.)
 #
 # =============================================================================
@@ -51,6 +52,9 @@ PAUSE_BETWEEN_ROUNDS="${PAUSE_BETWEEN_ROUNDS:-3.0}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 SERVER_STARTUP_WAIT="${SERVER_STARTUP_WAIT:-600}"
 SKIP_SERVER="${SKIP_SERVER:-0}"
+# Between cases: tear down full launch_server tree + wait until HTTP port is free (avoids rpc_port leaks).
+SERVER_TEARDOWN_WAIT_SEC="${SERVER_TEARDOWN_WAIT_SEC:-90}"
+SERVER_POST_KILL_SLEEP_SEC="${SERVER_POST_KILL_SLEEP_SEC:-8}"
 
 SGLANG_ENV_SCRIPT="${SGLANG_ENV_SCRIPT:-${HOME}/env.sh}"
 PYTHON_BIN="${PYTHON_BIN:-/data2/ljr/a/downloads/miniconda3/envs/sgl/bin/python}"
@@ -142,14 +146,80 @@ wait_for_server() {
   echo "  Server ready (waited ${waited}s)"
 }
 
+# Recursive kill when setsid is unavailable (children-first).
+kill_tree_term() {
+  local pid=$1
+  local c
+  for c in $(pgrep -P "${pid}" 2>/dev/null || true); do
+    kill_tree_term "${c}"
+  done
+  kill -TERM "${pid}" 2>/dev/null || true
+}
+
+kill_tree_kill() {
+  local pid=$1
+  local c
+  for c in $(pgrep -P "${pid}" 2>/dev/null || true); do
+    kill_tree_kill "${c}"
+  done
+  kill -KILL "${pid}" 2>/dev/null || true
+}
+
+# Wait until nothing answers on HTTP PORT (launch_server fully gone).
+wait_http_port_down() {
+  local url="http://127.0.0.1:${PORT}/health"
+  local max_wait="${1:-${SERVER_TEARDOWN_WAIT_SEC:-90}}"
+  local waited=0
+  while curl -sSf --connect-timeout 1 "${url}" >/dev/null 2>&1; do
+    sleep 1
+    waited=$((waited + 1))
+    if [[ $((waited % 15)) -eq 0 ]]; then
+      echo "  ... still waiting for ${PORT} to go down (${waited}s)"
+    fi
+    if [[ "${waited}" -ge "${max_wait}" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
 kill_server() {
-  if [[ -n "${SERVER_PID:-}" ]]; then
-    echo "  Stopping server (PID=${SERVER_PID})..."
-    kill "${SERVER_PID}" 2>/dev/null || true
-    wait "${SERVER_PID}" 2>/dev/null || true
-    unset SERVER_PID
-    sleep 5
+  if [[ -z "${SERVER_PID:-}" ]]; then
+    return 0
   fi
+  local pid="${SERVER_PID}"
+  echo "  Stopping server (PID=${pid}, PORT=${PORT})..."
+  if command -v setsid >/dev/null 2>&1; then
+    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+  else
+    kill_tree_term "${pid}"
+  fi
+
+  local max_wait="${SERVER_TEARDOWN_WAIT_SEC:-90}"
+  if ! wait_http_port_down "${max_wait}"; then
+    echo "  WARN: HTTP still up after ${max_wait}s — sending SIGKILL to process group / tree"
+    if command -v setsid >/dev/null 2>&1; then
+      kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+    else
+      kill_tree_kill "${pid}"
+    fi
+    wait_http_port_down "${max_wait}" || echo "  WARN: ${PORT} may still be bound; next start may fail"
+  fi
+
+  wait "${pid}" 2>/dev/null || true
+  unset SERVER_PID
+  sleep "${SERVER_POST_KILL_SLEEP_SEC:-8}"
+}
+
+# If a stray server still holds PORT, wait before starting the next case (avoids rpc_port collision).
+ensure_http_down_before_launch() {
+  [[ "${SKIP_SERVER}" == "1" ]] && return 0
+  local url="http://127.0.0.1:${PORT}/health"
+  if ! curl -sSf --connect-timeout 1 "${url}" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "  PORT ${PORT} still has a listener — waiting up to ${SERVER_TEARDOWN_WAIT_SEC:-90}s before launch..."
+  wait_http_port_down "${SERVER_TEARDOWN_WAIT_SEC:-90}"
 }
 
 if [[ "${SKIP_SERVER}" != "1" ]]; then
@@ -189,21 +259,40 @@ start_server_for_scheme() {
 
   echo "  Launching server: scheme=${scheme} (log -> ${log_file##*/})"
   echo "  HiSparse config: ${cfg}"
+  ensure_http_down_before_launch || return 1
+  # setsid → new session + process group so kill_server can signal the whole launch_server tree.
   # shellcheck disable=SC2086
-  SGLANG_ENABLE_JIT_DEEPGEMM=0 "${PYTHON_BIN}" -m sglang.launch_server \
-    --model "${MODEL_PATH}" \
-    --tp "${TP}" \
-    --dp-size "${DP_SIZE}" \
-    --enable-dp-attention \
-    --trust-remote-code \
-    --dtype bfloat16 \
-    --enable-hisparse \
-    --allow-auto-truncate \
-    --hisparse-config "${cfg}" \
-    --mem-fraction-static "${MEM_FRACTION_STATIC}" \
-    --max-total-tokens "${MAX_TOTAL_TOKENS}" \
-    --port "${PORT}" \
-    >"${log_file}" 2>&1 &
+  if command -v setsid >/dev/null 2>&1; then
+    setsid env SGLANG_ENABLE_JIT_DEEPGEMM=0 "${PYTHON_BIN}" -m sglang.launch_server \
+      --model "${MODEL_PATH}" \
+      --tp "${TP}" \
+      --dp-size "${DP_SIZE}" \
+      --enable-dp-attention \
+      --trust-remote-code \
+      --dtype bfloat16 \
+      --enable-hisparse \
+      --allow-auto-truncate \
+      --hisparse-config "${cfg}" \
+      --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+      --max-total-tokens "${MAX_TOTAL_TOKENS}" \
+      --port "${PORT}" \
+      >"${log_file}" 2>&1 &
+  else
+    env SGLANG_ENABLE_JIT_DEEPGEMM=0 "${PYTHON_BIN}" -m sglang.launch_server \
+      --model "${MODEL_PATH}" \
+      --tp "${TP}" \
+      --dp-size "${DP_SIZE}" \
+      --enable-dp-attention \
+      --trust-remote-code \
+      --dtype bfloat16 \
+      --enable-hisparse \
+      --allow-auto-truncate \
+      --hisparse-config "${cfg}" \
+      --mem-fraction-static "${MEM_FRACTION_STATIC}" \
+      --max-total-tokens "${MAX_TOTAL_TOKENS}" \
+      --port "${PORT}" \
+      >"${log_file}" 2>&1 &
+  fi
   SERVER_PID=$!
 }
 
@@ -239,6 +328,7 @@ run_e2e_fast() {
   echo "HISPARSE_DEVICE_BUFFER_SIZE=${HISPARSE_DEVICE_BUFFER_SIZE}"
   echo "REQ_PER_CONC_MULT=${REQ_PER_CONC_MULT} P134_CONC=${P134_CONC} NREQ_P134=${NREQ_P134}"
   echo "P1-P3 order: interleaved dram then cxl2 per (ctx[, conc[, olen]]); P4 per ctx: cxl1 then cxl2"
+  echo "SERVER_TEARDOWN_WAIT_SEC=${SERVER_TEARDOWN_WAIT_SEC:-90} SERVER_POST_KILL_SLEEP_SEC=${SERVER_POST_KILL_SLEEP_SEC:-8}"
   echo "MODEL_PATH=${MODEL_PATH} MODEL_CLIENT=${MODEL_CLIENT}"
   echo "TP=${TP} DP_SIZE=${DP_SIZE} PORT=${PORT}"
   echo "CXL_DEV_PATH=${CXL_DEV_PATH} CXL_DEV_PATH_2=${CXL_DEV_PATH_2}"
@@ -290,7 +380,10 @@ for tin in "${CTX_ALL[@]}"; do
       echo "  SKIP_SERVER=1 — client only"
     else
       kill_server 2>/dev/null || true
-      start_server_for_scheme "${SCHEME}" "${srv_log}"
+      if ! start_server_for_scheme "${SCHEME}" "${srv_log}"; then
+        echo "  ERROR: could not free PORT=${PORT} — skipping case"
+        continue
+      fi
       if ! wait_for_server; then
         echo "  ERROR: server failed to start — skipping"
         kill_server
@@ -342,7 +435,10 @@ for tin in "${CTX_ALL[@]}"; do
         echo "  SKIP_SERVER=1 — client only"
       else
         kill_server 2>/dev/null || true
-        start_server_for_scheme "${SCHEME}" "${srv_log}"
+        if ! start_server_for_scheme "${SCHEME}" "${srv_log}"; then
+          echo "  ERROR: could not free PORT=${PORT} — skipping case"
+          continue
+        fi
         if ! wait_for_server; then
           echo "  ERROR: server failed to start — skipping"
           kill_server
@@ -395,7 +491,10 @@ for tin in "${CTX_ALL[@]}"; do
         echo "  SKIP_SERVER=1 — client only"
       else
         kill_server 2>/dev/null || true
-        start_server_for_scheme "${SCHEME}" "${srv_log}"
+        if ! start_server_for_scheme "${SCHEME}" "${srv_log}"; then
+          echo "  ERROR: could not free PORT=${PORT} — skipping case"
+          continue
+        fi
         if ! wait_for_server; then
           echo "  ERROR: server failed to start — skipping"
           kill_server
@@ -450,7 +549,10 @@ for tin in "${CTX_ALL[@]}"; do
       echo "  SKIP_SERVER=1 — client only"
     else
       kill_server 2>/dev/null || true
-      start_server_for_scheme "${SCHEME}" "${srv_log}"
+      if ! start_server_for_scheme "${SCHEME}" "${srv_log}"; then
+        echo "  ERROR: could not free PORT=${PORT} — skipping case"
+        continue
+      fi
       if ! wait_for_server; then
         echo "  ERROR: server failed to start — skipping"
         kill_server
