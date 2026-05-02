@@ -145,8 +145,9 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         dense_lengths = forward_batch.seq_lens.to(device=device, dtype=torch.int64).clamp(
             min=0, max=dense_width
         )
+        dense_budget = int(coord.top_k)
         too_long_dense = (~sparse_mask) & (
-            forward_batch.seq_lens.to(device=device, dtype=torch.int64) > dense_width
+            forward_batch.seq_lens.to(device=device, dtype=torch.int64) > dense_budget
         )
         if torch.any(too_long_dense):
             rows = too_long_dense.nonzero(as_tuple=False).flatten()
@@ -165,13 +166,14 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
                         "seq_len": int(
                             forward_batch.seq_lens[r].detach().cpu().item()
                         ),
+                        "top_k": dense_budget,
                         "device_buffer_size": int(dense_width),
                     }
                     for r in rows_report
                 ],
             )
             raise RuntimeError(
-                "FlashInfer HiSparse dense fallback row exceeds device_buffer_size."
+                "FlashInfer HiSparse dense fallback row exceeds top_k."
             )
         lengths = torch.where(sparse_mask, sparse_lengths, dense_lengths)
         lengths = lengths.clamp(min=1)
