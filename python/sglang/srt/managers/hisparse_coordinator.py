@@ -510,8 +510,20 @@ class HiSparseCoordinator:
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
+            actual_token_pos = int(seq_lens_cpu[i]) - 2
+            if actual_token_pos < 0:
+                continue
+
+            host_loc = int(self.req_to_host_pool[req_idx, actual_token_pos].item())
+            if host_loc >= 0:
+                self._host_backed_up_len[req_idx] = max(
+                    self._host_backed_up_len[req_idx], actual_token_pos + 1
+                )
+                if self._skip_first_backup[req_idx]:
+                    self._skip_first_backup[req_idx] = False
+                continue
+
             if self._skip_first_backup[req_idx]:
-                actual_token_pos = int(seq_lens_cpu[i]) - 2
                 self._skip_first_backup[req_idx] = False
                 if actual_token_pos < self._host_backed_up_len[req_idx]:
                     continue
