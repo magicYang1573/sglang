@@ -1509,8 +1509,6 @@ class Scheduler(
             and self.hisparse_coordinator is not None
             and self.hisparse_coordinator.mode == "sparse_decode"
             and batch.forward_mode.is_decode()
-            and self.last_batch is not None
-            and self.last_batch.forward_mode.is_extend()
             and len(self.result_queue) > 0
         )
 
