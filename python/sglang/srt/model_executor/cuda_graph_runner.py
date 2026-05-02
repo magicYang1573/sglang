@@ -739,7 +739,6 @@ class CudaGraphRunner:
             if self.model_runner.spec_algorithm.is_ngram()
             else True
         )
-
         return (
             is_bs_supported
             and is_encoder_lens_supported
@@ -1234,7 +1233,6 @@ class CudaGraphRunner:
             graph_key = self.bs
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
-        self._after_hisparse_sparse_decode_replay(forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
@@ -1265,13 +1263,6 @@ class CudaGraphRunner:
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
-
-    def _after_hisparse_sparse_decode_replay(self, forward_batch: ForwardBatch) -> None:
-        coord = getattr(self.model_runner, "hisparse_coordinator", None)
-        controller = getattr(coord, "algorithm_controller", None) if coord else None
-        if controller is None:
-            return
-        controller.after_decode_step(forward_batch)
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

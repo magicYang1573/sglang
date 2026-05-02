@@ -73,6 +73,15 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         kv_indptr = current_metadata.kv_indptr[: bs + 1]
         kv_last_page_len = current_metadata.kv_last_page_len[:bs]
 
+        if getattr(current_metadata, "use_cuda_graph", False):
+            top_k = selected_indices.shape[1]
+            kv_indices = current_metadata.kv_indices[: bs * top_k]
+            kv_indices.copy_(
+                torch.clamp(selected_indices[:bs], min=0).to(torch.int32).reshape(-1)
+            )
+            current_metadata.kv_indptr_active = kv_indptr
+            return current_metadata
+
         kv_indices = self._build_kv_indices(
             selected_indices=selected_indices,
             valid_lengths=valid_lengths,

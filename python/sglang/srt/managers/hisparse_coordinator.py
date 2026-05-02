@@ -198,6 +198,42 @@ class HiSparseCoordinator:
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
+    def can_run_cuda_graph(self, forward_batch) -> bool:
+        if self.algorithm_controller is None:
+            return True
+        if self.mode != "sparse_decode":
+            return True
+        if not forward_batch.forward_mode.is_decode():
+            return False
+        if forward_batch.spec_info is not None:
+            return False
+        backend = (self.algorithm_controller.config.backend or "").lower()
+        if backend not in ("flashinfer", "flashinfer_hisparse_decode"):
+            return False
+
+        min_len = self.algorithm_controller.config.min_sparse_prompt_len
+        prompt_lens_cpu = self.algorithm_controller.states.prompt_lens_cpu
+        req_pool_indices = forward_batch.req_pool_indices.detach().cpu().tolist()
+        seq_lens_cpu = (
+            forward_batch.seq_lens_cpu.tolist()
+            if forward_batch.seq_lens_cpu is not None
+            else forward_batch.seq_lens.detach().cpu().tolist()
+        )
+        for req_idx, seq_len in zip(req_pool_indices, seq_lens_cpu):
+            prompt_len = prompt_lens_cpu.get(int(req_idx), 0)
+            is_sparse = (
+                min_len is None
+                or prompt_len >= min_len
+                or int(seq_len) > int(self.algorithm_controller.config.top_k)
+            )
+            if not is_sparse:
+                return False
+        return True
+
+    def after_cuda_graph_replay(self, forward_batch) -> None:
+        if self.algorithm_controller is not None:
+            self.algorithm_controller.after_decode_step(forward_batch)
+
     def get_token_stats(self) -> HiSparseTokenStats:
         device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         device_capacity = device_allocator.size

@@ -3007,6 +3007,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             mode_check()
             and self.graph_runner
             and self.graph_runner.can_run(forward_batch)
+            and (
+                self.hisparse_coordinator is None
+                or self.hisparse_coordinator.can_run_cuda_graph(forward_batch)
+            )
         )
 
         if (
@@ -3021,6 +3025,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.after_cuda_graph_replay(forward_batch)
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
         # For MLP sync

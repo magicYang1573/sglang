@@ -6778,7 +6778,7 @@ class ServerArgs:
                         "Non-native HiSparse requires --attention-backend=fa3, "
                         "--attention-backend=flashinfer, or unset."
                     )
-                if not self.disable_cuda_graph:
+                if hisparse_backend != "flashinfer" and not self.disable_cuda_graph:
                     logger.warning(
                         "--enable-hisparse with non-native sparse algorithm: "
                         "auto-disabling CUDA Graph until the path is fully "
@@ -6856,12 +6856,12 @@ class ServerArgs:
                     f"{sparse_decode_backend!r} got incompatible "
                     f"--attention-backend={self.attention_backend!r}."
                 )
-            # CUDA Graph has Python for-loops in QuestAlgorithm.retrieve_topk,
-            # first release disables CUDA Graph for safety.
-            if not self.disable_cuda_graph:
+            # The FlashInfer HiSparse path has a fixed-buffer CUDA Graph path.
+            # Other non-native sparse backends still stay eager by default.
+            if sparse_decode_backend != "flashinfer" and not self.disable_cuda_graph:
                 logger.warning(
                     "--enable-sparse-decode: auto-disabling CUDA Graph because "
-                    "QuestAlgorithm currently contains Python for-loops."
+                    "the selected sparse decode backend is not graph-compatible yet."
                 )
                 self.disable_cuda_graph = True
             # Piecewise CUDA Graph captures attention kernels with their
