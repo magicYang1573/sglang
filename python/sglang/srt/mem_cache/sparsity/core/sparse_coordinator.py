@@ -191,10 +191,18 @@ class SparseAlgorithmController:
             # No threshold configured → every request goes through sparse.
             return False
         prompt_lens_cpu = self.states.prompt_lens_cpu
-        for req_idx in req_pool_indices_cpu:
+        seq_lens_list = (
+            seq_lens_cpu.tolist()
+            if seq_lens_cpu is not None
+            else [None] * len(req_pool_indices_cpu)
+        )
+        for req_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_list):
             prompt_len = prompt_lens_cpu.get(int(req_idx), 0)
             if prompt_len >= min_len:
                 return False
+            if seq_len is not None:
+                if int(seq_len) > int(self.config.top_k):
+                    return False
         return True
 
     def begin_layer_decode(
@@ -242,6 +250,11 @@ class SparseAlgorithmController:
             return attn_metadata
 
         sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
+        # Dense fallback is only intended while the full sequence is within the
+        # sparse token budget. Once seq_len exceeds top_k, Quest decides which
+        # token-level indices to attend and HiSparse swap-in brings missing KV
+        # into the device hot buffer.
+        sparse_mask = sparse_mask | (forward_batch.seq_lens > self.config.top_k)
 
         top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
             queries=q,
