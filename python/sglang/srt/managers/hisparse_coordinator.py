@@ -906,6 +906,12 @@ class HiSparseCoordinator:
             req.req_pool_idx, :kv_len
         ].to(device=self.device, dtype=torch.int64)
 
+        # The request's req_pool_idx can be assigned/reused across chunked
+        # prefill.  Register at admission time as well, so sparse-mask decisions
+        # during decode use the final live req_pool_idx instead of falling back
+        # to prompt_len=0.
+        self.algorithm_controller.on_request_begin(req)
+
         # 1. Algorithm representation construction.  At this point the
         # request's KV still lives in the logical rows of the
         # HiSparseMHATokenToKVPool and is GPU-visible via get_key_buffer.
