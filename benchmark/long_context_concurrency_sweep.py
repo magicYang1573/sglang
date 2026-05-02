@@ -16,6 +16,16 @@ Example (server on localhost:30000, OpenAI completions API):
 Native /generate endpoint:
 
   python benchmark/long_context_concurrency_sweep.py --backend sglang ...
+
+Local ShareGPT JSON (avoid HF download for dataset-name random):
+
+  python benchmark/long_context_concurrency_sweep.py ... \\
+    --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json
+
+No dataset file needed (synthetic token ids; use when you want zero downloads):
+
+  python benchmark/long_context_concurrency_sweep.py ... \\
+    --dataset-name random-ids
 """
 
 from __future__ import annotations
@@ -84,6 +94,21 @@ def main() -> None:
         default="1,2,4,8,16,32",
         help="Comma-separated max-concurrency values for --max-concurrency.",
     )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default="random",
+        help="bench_serving --dataset-name (e.g. random, random-ids, sharegpt). "
+        "Use random-ids to skip ShareGPT JSON entirely.",
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Local file path passed to bench_serving --dataset-path (ShareGPT JSON "
+        "for random/sharegpt, or your JSONL for custom/openai). "
+        "When valid, HF download is skipped.",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument(
         "--warmup-requests",
@@ -128,7 +153,7 @@ def main() -> None:
                 "--backend",
                 args.backend,
                 "--dataset-name",
-                "random",
+                args.dataset_name,
                 "--random-input-len",
                 str(args.input_len),
                 "--random-output-len",
@@ -156,6 +181,8 @@ def main() -> None:
                 cmd.extend(["--model", args.model])
             if args.tokenizer:
                 cmd.extend(["--tokenizer", args.tokenizer])
+            if args.dataset_path:
+                cmd.extend(["--dataset-path", args.dataset_path])
 
             # Only block on server readiness for the first concurrency.
             ready_timeout = args.ready_check_timeout_sec if i == 0 else 0
