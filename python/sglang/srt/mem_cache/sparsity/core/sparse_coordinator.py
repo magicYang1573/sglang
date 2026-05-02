@@ -268,6 +268,7 @@ class SparseAlgorithmController:
             req_to_token=self.req_to_token_pool.req_to_token,
             page_size=(self.config.page_size or 1),
             layer_id=layer.layer_id,
+            top_k_tokens=top_k_tokens,
         )
 
     def _translate_dense_metadata_for_hisparse(
