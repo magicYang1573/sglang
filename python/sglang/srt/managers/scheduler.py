@@ -1500,7 +1500,25 @@ class Scheduler(
             and len(self.result_queue) > 0
         )
 
-        return disable_overlap_for_batch or need_grammar_sync
+        # Non-native HiSparse sparse_decode admits a request to host/hot-buffer
+        # in process_batch_result() after prefill.  If overlap launches the
+        # next decode batch before processing the previous prefill result, the
+        # newly merged request can enter decode without host backup.
+        need_hisparse_sparse_decode_sync = (
+            batch
+            and self.hisparse_coordinator is not None
+            and self.hisparse_coordinator.mode == "sparse_decode"
+            and batch.forward_mode.is_decode()
+            and self.last_batch is not None
+            and self.last_batch.forward_mode.is_extend()
+            and len(self.result_queue) > 0
+        )
+
+        return (
+            disable_overlap_for_batch
+            or need_grammar_sync
+            or need_hisparse_sparse_decode_sync
+        )
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
