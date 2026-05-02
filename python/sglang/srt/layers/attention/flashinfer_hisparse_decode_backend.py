@@ -118,21 +118,27 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
         )
         if (
             os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") == "1"
-            and layer.layer_id == 0
-            and not getattr(self.forward_metadata, "_debug_backend_logged", False)
+            and layer.layer_id
+            < int(os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG_LAYERS", "4"))
         ):
-            logger.warning(
-                "FlashInfer HiSparse backend debug: q_shape=%s q_dtype=%s "
-                "k_shape=%s v_shape=%s k_stride=%s v_stride=%s page_size=%s",
-                list(q.shape),
-                str(q.dtype),
-                list(kv_buffer[0].shape),
-                list(kv_buffer[1].shape),
-                list(kv_buffer[0].stride()),
-                list(kv_buffer[1].stride()),
-                page_size,
+            logged_backend_layers = getattr(
+                self.forward_metadata, "_debug_backend_logged_layers", set()
             )
-            self.forward_metadata._debug_backend_logged = True
+            if layer.layer_id not in logged_backend_layers:
+                logger.warning(
+                    "FlashInfer HiSparse backend debug: layer_id=%s q_shape=%s q_dtype=%s "
+                    "k_shape=%s v_shape=%s k_stride=%s v_stride=%s page_size=%s",
+                    layer.layer_id,
+                    list(q.shape),
+                    str(q.dtype),
+                    list(kv_buffer[0].shape),
+                    list(kv_buffer[1].shape),
+                    list(kv_buffer[0].stride()),
+                    list(kv_buffer[1].stride()),
+                    page_size,
+                )
+                logged_backend_layers.add(layer.layer_id)
+                self.forward_metadata._debug_backend_logged_layers = logged_backend_layers
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
             kv_buffer,
@@ -160,7 +166,11 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
     ) -> None:
         if os.environ.get("SGLANG_HISPARSE_FLASHINFER_COMPARE", "0") != "1":
             return
-        if layer.layer_id != 0 or getattr(self.forward_metadata, "_debug_compare_done", False):
+        max_layers = int(os.environ.get("SGLANG_HISPARSE_FLASHINFER_COMPARE_LAYERS", "4"))
+        if layer.layer_id >= max_layers:
+            return
+        compared_layers = getattr(self.forward_metadata, "_debug_compare_layers", set())
+        if layer.layer_id in compared_layers:
             return
         kv_indices = getattr(self.forward_metadata, "kv_indices", None)
         kv_indptr = getattr(self.forward_metadata, "kv_indptr_active", None)
@@ -193,9 +203,10 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
         flash = o.view(-1, q_heads, layer.v_head_dim)[row].to(torch.float32)
         diff = (flash - ref).abs()
         logger.warning(
-            "FlashInfer HiSparse torch-ref compare: row=%d len=%d "
+            "FlashInfer HiSparse torch-ref compare: layer_id=%d row=%d len=%d "
             "max_abs_diff=%s mean_abs_diff=%s flash_norm=%s ref_norm=%s "
             "idx_head=%s idx_tail=%s",
+            layer.layer_id,
             row,
             int(idx.numel()),
             float(diff.max().detach().cpu().item()),
@@ -205,4 +216,5 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
             idx[:16].detach().cpu().tolist(),
             idx[-16:].detach().cpu().tolist(),
         )
-        self.forward_metadata._debug_compare_done = True
+        compared_layers.add(layer.layer_id)
+        self.forward_metadata._debug_compare_layers = compared_layers

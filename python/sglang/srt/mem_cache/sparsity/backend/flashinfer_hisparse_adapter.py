@@ -236,7 +236,11 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
     ) -> None:
         if os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") != "1":
             return
-        if getattr(current_metadata, "_debug_logged", False) and layer_id != 0:
+        max_layers = int(os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG_LAYERS", "4"))
+        if layer_id >= max_layers:
+            return
+        logged_layers = getattr(current_metadata, "_debug_logged_layers", set())
+        if layer_id in logged_layers:
             return
 
         report_rows = min(int(forward_batch.batch_size), 4)
@@ -309,4 +313,5 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             )
         data["kv_pool_page_size"] = page_size
         logger.warning("FlashInfer HiSparse debug indices: %s", data)
-        current_metadata._debug_logged = True
+        logged_layers.add(layer_id)
+        current_metadata._debug_logged_layers = logged_layers
