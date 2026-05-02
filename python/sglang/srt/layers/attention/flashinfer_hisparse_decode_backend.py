@@ -129,5 +129,8 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
             v_scale=layer.v_scale_float,
         )
 
-        controller.end_layer_decode(o=o, layer=layer, forward_batch=forward_batch)
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if not get_is_capture_mode():
+            controller.end_layer_decode(o=o, layer=layer, forward_batch=forward_batch)
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)

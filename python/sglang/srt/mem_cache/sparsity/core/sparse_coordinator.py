@@ -335,6 +335,27 @@ class SparseAlgorithmController:
             forward_batch=forward_batch,
         )
 
+    def after_decode_step(self, forward_batch: "ForwardBatch") -> None:
+        """Step-level representation update used after CUDA Graph replay.
+
+        During CUDA Graph capture/replay, per-layer Python hooks are not
+        replayed.  The graph path therefore skips :meth:`end_layer_decode` and
+        invokes this method once after graph replay to keep algorithm
+        representations in sync for the next decode step.
+        """
+        if self.io is None:
+            return
+        if getattr(self.io, "_all_dense_this_step", False):
+            return
+        for layer_id in range(self.start_layer, self.end_layer):
+            self.algorithm.update_representations(
+                layer_id=layer_id,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                k_buffer=self._k_buffer_for_update(layer_id),
+                forward_batch=forward_batch,
+            )
+
     def construct_prefill_representations(
         self,
         req: "Req",

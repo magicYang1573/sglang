@@ -83,5 +83,8 @@ class Fa3SparseDecodeBackend(FlashAttentionBackend):
             # object before the next begin_layer_decode call.
             self.forward_metadata = original_metadata
 
-        controller.end_layer_decode(o=out, layer=layer, forward_batch=forward_batch)
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        if not get_is_capture_mode():
+            controller.end_layer_decode(o=out, layer=layer, forward_batch=forward_batch)
         return out
