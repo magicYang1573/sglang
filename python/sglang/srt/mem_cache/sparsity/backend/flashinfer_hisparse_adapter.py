@@ -80,6 +80,7 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             sparse_mask=sparse_mask,
             forward_batch=forward_batch,
             kv_indptr=kv_indptr,
+            layer_id=layer_id,
         )
         self._maybe_debug_log_indices(
             selected_indices=selected_indices,
@@ -122,6 +123,7 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         sparse_mask: torch.Tensor,
         forward_batch: "ForwardBatch",
         kv_indptr: torch.Tensor,
+        layer_id: int,
     ) -> torch.Tensor:
         coord = getattr(forward_batch, "hisparse_coordinator", None)
         if coord is None:
@@ -190,6 +192,21 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
             forward_batch.req_pool_indices.to(coord.req_to_device_buffer.device).view(-1, 1),
             dense_cols.to(coord.req_to_device_buffer.device),
         ].to(device=device, dtype=torch.int32)
+        newest_locs = coord.req_device_buffer_token_locs[
+            layer_id,
+            forward_batch.req_pool_indices.to(
+                coord.req_device_buffer_token_locs.device
+            ),
+            coord.device_buffer_size,
+        ].to(device=device, dtype=torch.int32)
+        newest_col = forward_batch.seq_lens.to(device=device, dtype=torch.int64).view(
+            -1, 1
+        ) - 1
+        dense_locs = torch.where(
+            cols == newest_col,
+            newest_locs.view(-1, 1).expand_as(dense_locs),
+            dense_locs,
+        )
 
         row_locs = torch.where(sparse_mask.view(-1, 1), sparse_locs, dense_locs)
         valid = cols < lengths.view(-1, 1)
