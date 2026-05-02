@@ -754,6 +754,13 @@ class HiSparseCoordinator:
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
 
+        self._debug_check_top_k_tokens_for_swap_in(
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            top_k_result=top_k_result,
+            layer_id=layer_id,
+        )
+
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
@@ -801,6 +808,69 @@ class HiSparseCoordinator:
                 num_real_reqs=self.num_real_reqs,
             )
         return top_k_indices
+
+    def _debug_check_top_k_tokens_for_swap_in(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Fail early with actionable context before the swap-in kernel.
+
+        The CUDA kernel can legally read the newest token from the reserved
+        device slot, and it can read older tokens from host only if
+        req_to_host_pool[req, token] has been populated.  If Quest returns an
+        older token that has no host backup, the kernel would dereference host
+        loc -1 and crash with an illegal memory access.  Keep this as a debug
+        check while validating the FlashInfer sparse-decode path.
+        """
+        token_pos = top_k_result.to(torch.int64)
+        seq_lens_i64 = seq_lens.to(torch.int64).view(-1, 1)
+        valid_range = (token_pos >= 0) & (token_pos < seq_lens_i64)
+        newest_token = seq_lens_i64 - 1
+        is_newest = valid_range & (token_pos == newest_token)
+
+        safe_token_pos = token_pos.clamp(min=0, max=self.req_to_host_pool.shape[1] - 1)
+        host_locs = self.req_to_host_pool[
+            req_pool_indices.to(self.req_to_host_pool.device).view(-1, 1),
+            safe_token_pos.to(self.req_to_host_pool.device),
+        ].to(top_k_result.device)
+        has_host_backup = valid_range & (host_locs >= 0)
+        bad = valid_range & (~is_newest) & (~has_host_backup)
+        if not torch.any(bad):
+            return
+
+        bad_rows, bad_cols = bad.nonzero(as_tuple=True)
+        max_report = min(int(bad_rows.numel()), 16)
+        rows = bad_rows[:max_report]
+        cols = bad_cols[:max_report]
+        reqs = req_pool_indices[rows]
+        bad_tokens = token_pos[rows, cols]
+        bad_host_locs = host_locs[rows, cols]
+        row_seq_lens = seq_lens_i64.view(-1)[rows]
+        newest = newest_token.view(-1)[rows]
+        logger.error(
+            "HiSparse swap-in found top-k tokens without host backup. "
+            "layer_id=%d, kernel will be skipped by raising. examples=%s",
+            layer_id,
+            [
+                {
+                    "row": int(rows[i].item()),
+                    "topk_col": int(cols[i].item()),
+                    "req_pool_idx": int(reqs[i].item()),
+                    "token_pos": int(bad_tokens[i].item()),
+                    "seq_len": int(row_seq_lens[i].item()),
+                    "newest_token": int(newest[i].item()),
+                    "host_loc": int(bad_host_locs[i].item()),
+                }
+                for i in range(max_report)
+            ],
+        )
+        raise RuntimeError(
+            "HiSparse swap-in received top-k token(s) without host backup. "
+            "See preceding log for token positions and request ids."
+        )
 
     def admit_request_from_gpu(self, req: Req) -> None:
         """Single-instance counterpart of :meth:`admit_request_into_staging`.
