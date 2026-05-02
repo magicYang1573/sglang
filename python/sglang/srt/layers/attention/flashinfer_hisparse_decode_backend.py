@@ -110,7 +110,12 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
                 )
 
         decode_wrapper = self.forward_metadata.decode_wrappers[0]
-        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        raw_k, raw_v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        page_size = forward_batch.token_to_kv_pool.page_size
+        kv_buffer = (
+            raw_k.view(-1, page_size, layer.tp_k_head_num, layer.head_dim),
+            raw_v.view(-1, page_size, layer.tp_v_head_num, layer.v_head_dim),
+        )
         if (
             os.environ.get("SGLANG_HISPARSE_FLASHINFER_DEBUG", "0") == "1"
             and layer.layer_id == 0
@@ -125,7 +130,7 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
                 list(kv_buffer[1].shape),
                 list(kv_buffer[0].stride()),
                 list(kv_buffer[1].stride()),
-                getattr(forward_batch.token_to_kv_pool, "page_size", None),
+                page_size,
             )
             self.forward_metadata._debug_backend_logged = True
         o = decode_wrapper.forward(

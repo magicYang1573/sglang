@@ -295,10 +295,18 @@ class FlashInferHiSparseAdapter(SparseDecodeAdapter):
         data["kv_indices_by_row"] = row_segments
 
         k_buf, v_buf = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
-        data["k_buffer_shape"] = list(k_buf.shape)
-        data["v_buffer_shape"] = list(v_buf.shape)
-        data["k_buffer_stride"] = list(k_buf.stride())
-        data["v_buffer_stride"] = list(v_buf.stride())
-        data["kv_pool_page_size"] = int(getattr(forward_batch.token_to_kv_pool, "page_size", -1))
+        page_size = int(getattr(forward_batch.token_to_kv_pool, "page_size", -1))
+        data["raw_k_buffer_shape"] = list(k_buf.shape)
+        data["raw_v_buffer_shape"] = list(v_buf.shape)
+        data["raw_k_buffer_stride"] = list(k_buf.stride())
+        data["raw_v_buffer_stride"] = list(v_buf.stride())
+        if page_size > 0:
+            data["flashinfer_k_buffer_shape"] = list(
+                k_buf.view(k_buf.shape[0] // page_size, page_size, k_buf.shape[1], k_buf.shape[2]).shape
+            )
+            data["flashinfer_v_buffer_shape"] = list(
+                v_buf.view(v_buf.shape[0] // page_size, page_size, v_buf.shape[1], v_buf.shape[2]).shape
+            )
+        data["kv_pool_page_size"] = page_size
         logger.warning("FlashInfer HiSparse debug indices: %s", data)
         current_metadata._debug_logged = True
