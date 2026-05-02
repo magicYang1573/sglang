@@ -138,6 +138,7 @@ ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "flashinfer_hisparse_decode",
     "flashmla",
     "trtllm_mla",
     "trtllm_mha",
@@ -6544,13 +6545,31 @@ class ServerArgs:
             if self.decode_attention_backend
             else self.attention_backend
         )
-        # Non-native sparse decode: force the hybrid (fa3 prefill + sparse
-        # fa3 decode) arrangement so ModelRunner's existing HybridAttnBackend
-        # path auto-composes both halves.
+        # Non-native sparse decode: force a hybrid arrangement so ModelRunner's
+        # existing HybridAttnBackend path auto-composes dense prefill with the
+        # selected sparse decode backend.
         if self.enable_sparse_decode or self.is_non_native_hisparse_enabled():
+            sparse_backend = "fa3"
+            raw_sparse_config = (
+                self.sparse_decode_config
+                if self.enable_sparse_decode
+                else self.hisparse_config
+            )
+            if raw_sparse_config:
+                try:
+                    sparse_backend = json.loads(raw_sparse_config).get(
+                        "backend", sparse_backend
+                    )
+                except json.JSONDecodeError:
+                    sparse_backend = "fa3"
+            sparse_backend = (sparse_backend or "fa3").lower()
             if prefill_attention_backend_str is None:
                 prefill_attention_backend_str = "fa3"
-            decode_attention_backend_str = "fa3_sparse_decode"
+            decode_attention_backend_str = (
+                "flashinfer_hisparse_decode"
+                if sparse_backend == "flashinfer"
+                else "fa3_sparse_decode"
+            )
         return prefill_attention_backend_str, decode_attention_backend_str
 
     def is_non_native_hisparse_enabled(self) -> bool:
@@ -6787,9 +6806,30 @@ class ServerArgs:
                         "text-only models; architecture %s is experimental.",
                         arch_list,
                     )
-            if self.attention_backend not in (None, "fa3"):
+            sparse_decode_backend = "fa3"
+            if self.sparse_decode_config:
+                try:
+                    sparse_decode_backend = json.loads(self.sparse_decode_config).get(
+                        "backend", sparse_decode_backend
+                    )
+                except json.JSONDecodeError:
+                    sparse_decode_backend = "fa3"
+            sparse_decode_backend = (sparse_decode_backend or "fa3").lower()
+            if sparse_decode_backend not in ("fa3", "flashinfer"):
                 raise ValueError(
-                    "--enable-sparse-decode requires --attention-backend=fa3 (or unset)."
+                    "--enable-sparse-decode supports backend='fa3' or "
+                    f"backend='flashinfer' (got {sparse_decode_backend!r})."
+                )
+            allowed_attention_backends = (
+                (None, "fa3")
+                if sparse_decode_backend == "fa3"
+                else (None, "fa3", "flashinfer")
+            )
+            if self.attention_backend not in allowed_attention_backends:
+                raise ValueError(
+                    "--enable-sparse-decode with backend="
+                    f"{sparse_decode_backend!r} got incompatible "
+                    f"--attention-backend={self.attention_backend!r}."
                 )
             # CUDA Graph has Python for-loops in QuestAlgorithm.retrieve_topk,
             # first release disables CUDA Graph for safety.

@@ -234,12 +234,23 @@ class SparseAlgorithmController:
         # decode writes.  Therefore FA3 must see translated physical rows, not
         # the original logical ``req_to_token`` rows.
         if getattr(self.io, "_all_dense_this_step", False):
+            dense_adapter = getattr(self.adapter, "adapt_dense_for_attn_metadata", None)
+            if dense_adapter is not None:
+                return dense_adapter(
+                    current_metadata=attn_metadata,
+                    forward_batch=forward_batch,
+                    layer_id=layer.layer_id,
+                    req_to_token=self.req_to_token_pool.req_to_token,
+                )
             attn_metadata = self._translate_dense_metadata_for_hisparse(
                 attn_metadata, forward_batch
             )
             return attn_metadata
 
         sparse_mask = self._compute_sparse_mask(forward_batch.req_pool_indices)
+        sparse_mask = sparse_mask | (
+            forward_batch.seq_lens > self.io.device_buffer_size
+        )
 
         top_k_tokens, valid_lengths = self.algorithm.retrieve_topk(
             queries=q,

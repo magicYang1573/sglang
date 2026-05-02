@@ -71,6 +71,13 @@ def _create_backend_adaptor(
 
         return Fa3SparseDecodeAdapter(device)
 
+    if backend_key in ("flashinfer", "flashinfer_hisparse_decode"):
+        from sglang.srt.mem_cache.sparsity.backend.flashinfer_hisparse_adapter import (
+            FlashInferHiSparseAdapter,
+        )
+
+        return FlashInferHiSparseAdapter(device)
+
     if backend_key == "fa":
         return FlashAttentionAdaptor(device)
 
