@@ -6549,7 +6549,7 @@ class ServerArgs:
         # existing HybridAttnBackend path auto-composes dense prefill with the
         # selected sparse decode backend.
         if self.enable_sparse_decode or self.is_non_native_hisparse_enabled():
-            sparse_backend = "fa3"
+            sparse_backend = None
             raw_sparse_config = (
                 self.sparse_decode_config
                 if self.enable_sparse_decode
@@ -6557,12 +6557,14 @@ class ServerArgs:
             )
             if raw_sparse_config:
                 try:
-                    sparse_backend = json.loads(raw_sparse_config).get(
-                        "backend", sparse_backend
-                    )
+                    sparse_backend = json.loads(raw_sparse_config).get("backend")
                 except json.JSONDecodeError:
-                    sparse_backend = "fa3"
+                    sparse_backend = None
+            if sparse_backend is None:
+                sparse_backend = decode_attention_backend_str or "fa3"
             sparse_backend = (sparse_backend or "fa3").lower()
+            if sparse_backend == "flashinfer_hisparse_decode":
+                sparse_backend = "flashinfer"
             if prefill_attention_backend_str is None:
                 prefill_attention_backend_str = "fa3"
             decode_attention_backend_str = (
@@ -6753,9 +6755,28 @@ class ServerArgs:
                         "Non-native HiSparse currently requires --page-size=1 "
                         f"(got {self.page_size})."
                     )
-                if self.attention_backend not in (None, "fa3"):
+                hisparse_backend = None
+                if self.hisparse_config:
+                    try:
+                        hisparse_backend = json.loads(self.hisparse_config).get(
+                            "backend"
+                        )
+                    except json.JSONDecodeError:
+                        hisparse_backend = None
+                if hisparse_backend is None:
+                    hisparse_backend = self.attention_backend or "fa3"
+                hisparse_backend = (hisparse_backend or "fa3").lower()
+                if hisparse_backend == "flashinfer_hisparse_decode":
+                    hisparse_backend = "flashinfer"
+                if hisparse_backend not in ("fa3", "flashinfer"):
                     raise ValueError(
-                        "Non-native HiSparse requires --attention-backend=fa3 (or unset)."
+                        "Non-native HiSparse supports attention backend 'fa3' "
+                        f"or 'flashinfer' (got {hisparse_backend!r})."
+                    )
+                if self.attention_backend not in (None, "fa3", "flashinfer"):
+                    raise ValueError(
+                        "Non-native HiSparse requires --attention-backend=fa3, "
+                        "--attention-backend=flashinfer, or unset."
                     )
                 if not self.disable_cuda_graph:
                     logger.warning(
@@ -6806,15 +6827,19 @@ class ServerArgs:
                         "text-only models; architecture %s is experimental.",
                         arch_list,
                     )
-            sparse_decode_backend = "fa3"
+            sparse_decode_backend = None
             if self.sparse_decode_config:
                 try:
                     sparse_decode_backend = json.loads(self.sparse_decode_config).get(
-                        "backend", sparse_decode_backend
+                        "backend"
                     )
                 except json.JSONDecodeError:
-                    sparse_decode_backend = "fa3"
+                    sparse_decode_backend = None
+            if sparse_decode_backend is None:
+                sparse_decode_backend = self.attention_backend or "fa3"
             sparse_decode_backend = (sparse_decode_backend or "fa3").lower()
+            if sparse_decode_backend == "flashinfer_hisparse_decode":
+                sparse_decode_backend = "flashinfer"
             if sparse_decode_backend not in ("fa3", "flashinfer"):
                 raise ValueError(
                     "--enable-sparse-decode supports backend='fa3' or "

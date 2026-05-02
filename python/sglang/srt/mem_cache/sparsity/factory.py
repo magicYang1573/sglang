@@ -134,7 +134,7 @@ def parse_hisparse_config(server_args) -> SparseConfig:
     algorithm = cfg.algorithm.lower() if cfg.algorithm is not None else None
     if algorithm is not None and algorithm not in ("deepseek_nsa", "dsa_native", "nsa"):
         if cfg.backend is None:
-            cfg.backend = "fa3"
+            cfg.backend = getattr(server_args, "attention_backend", None) or "fa3"
         if cfg.page_size is None:
             cfg.page_size = 1
         if cfg.min_sparse_prompt_len is None:
@@ -151,7 +151,7 @@ def parse_sparse_decode_config(server_args) -> SparseConfig:
     if cfg.algorithm is None:
         cfg.algorithm = "quest"
     if cfg.backend is None:
-        cfg.backend = "fa3"
+        cfg.backend = getattr(server_args, "attention_backend", None) or "fa3"
     if cfg.page_size is None:
         cfg.page_size = 1
     if cfg.min_sparse_prompt_len is None:

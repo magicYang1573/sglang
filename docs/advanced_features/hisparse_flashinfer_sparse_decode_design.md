@@ -159,19 +159,17 @@ def create_flashinfer_hisparse_decode_backend(runner):
 
 ### 4.3 ServerArgs backend 选择
 
-建议 `--enable-sparse-decode` 支持：
+backend 选择走 SGLang 外层 attention backend 参数，而不是写进
+`--hisparse-config` / `--sparse-decode-config`。也就是说，Quest/HiSparse
+配置只描述算法与 hot buffer 大小；decode backend 由下面的启动参数决定：
 
-```json
-{
-  "algorithm": "quest",
-  "backend": "flashinfer",
-  "top_k": 2048,
-  "device_buffer_size": 4096,
-  "quest_page_size": 16
-}
+```bash
+--attention-backend flashinfer
 ```
 
-当 `backend == "flashinfer"` 时：
+当外层 attention backend 为 `flashinfer`，且启用非原生 HiSparse
+（例如 `--enable-hisparse --hisparse-config '{"algorithm":"quest", ...}'`）
+时：
 
 ```text
 prefill_attention_backend = "fa3" 或 "flashinfer"
@@ -185,7 +183,10 @@ prefill = "fa3"
 decode  = "flashinfer_hisparse_decode"
 ```
 
-原因是当前 sparse decode 的 prefill 语义已经在 FA3 路径中跑通，先只替换 decode backend，改动面更小。
+如果外层 attention backend 未设置或为 `fa3`，decode 仍走现有
+`fa3_sparse_decode`。首版不要求用户在 sparse config 里配置 backend。
+
+原因是 backend 是运行时 kernel 选择，应该与 `--attention-backend` 的语义一致；sparse config 只保留算法参数，如 `top_k`、`device_buffer_size`、`quest_page_size`。
 
 ---
 
@@ -399,8 +400,8 @@ wrapper.forward 读取这个 buffer
 - 新增 `FlashInferHiSparseDecodeBackend`。
 - 新增 `FlashInferHiSparseAdapter`。
 - 注册 `flashinfer_hisparse_decode`。
-- factory 支持 `backend="flashinfer"`。
-- server args 在 sparse decode + flashinfer 时选择新 decode backend。
+- factory 在 sparse config 未写 backend 时从外层 `--attention-backend` 推断 adapter。
+- server args 在非原生 HiSparse / sparse decode + `--attention-backend flashinfer` 时选择新 decode backend。
 
 验证：
 
