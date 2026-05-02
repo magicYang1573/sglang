@@ -62,6 +62,13 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
         if not forward_batch.forward_mode.is_decode_or_idle():
             return super().init_forward_metadata(forward_batch)
 
+        coord = getattr(forward_batch, "hisparse_coordinator", None)
+        controller = getattr(coord, "algorithm_controller", None) if coord else None
+        if controller is None or getattr(coord, "_all_dense_this_step", False):
+            self._hisparse_sparse_active = False
+            return super().init_forward_metadata(forward_batch)
+
+        self._hisparse_sparse_active = True
         self.forward_metadata = FlashInferHiSparseDecodeMetadata(
             decode_wrappers=self.decode_wrappers,
             kv_indptr=self.kv_indptr[0],
@@ -87,7 +94,7 @@ class FlashInferHiSparseDecodeBackend(FlashInferAttnBackend):
     ):
         coord = getattr(forward_batch, "hisparse_coordinator", None)
         controller = getattr(coord, "algorithm_controller", None) if coord else None
-        if controller is None:
+        if controller is None or not getattr(self, "_hisparse_sparse_active", False):
             return super().forward_decode(q, k, v, layer, forward_batch, save_kv_cache)
 
         controller.begin_layer_decode(
