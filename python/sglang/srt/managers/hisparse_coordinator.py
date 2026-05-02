@@ -866,6 +866,23 @@ class HiSparseCoordinator:
         ].to(top_k_result.device)
         has_host_backup = valid_range & (host_locs >= 0)
         bad = valid_range & (~is_newest) & (~has_host_backup)
+        if torch.any(bad):
+            prev_token = seq_lens_i64 - 2
+            repairable = bad & (token_pos == prev_token)
+            if torch.any(repairable):
+                repair_rows = torch.unique(repairable.nonzero(as_tuple=True)[0])
+                self._backup_previous_tokens_now(
+                    req_pool_indices=req_pool_indices,
+                    seq_lens=seq_lens,
+                    rows=repair_rows,
+                )
+                host_locs = self.req_to_host_pool[
+                    req_pool_indices.to(self.req_to_host_pool.device).view(-1, 1),
+                    safe_token_pos.to(self.req_to_host_pool.device),
+                ].to(top_k_result.device)
+                has_host_backup = valid_range & (host_locs >= 0)
+                bad = valid_range & (~is_newest) & (~has_host_backup)
+
         if not torch.any(bad):
             return
 
@@ -901,6 +918,54 @@ class HiSparseCoordinator:
             "HiSparse swap-in received top-k token(s) without host backup. "
             "See preceding log for token positions and request ids."
         )
+
+    def _backup_previous_tokens_now(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> None:
+        if rows.numel() == 0:
+            return
+        rows = rows.to(device=req_pool_indices.device, dtype=torch.int64)
+        backup_req_indices = req_pool_indices[rows]
+        actual_token_pos = seq_lens[rows].to(torch.int64) - 2
+        device_locs = self.req_to_device_buffer[
+            backup_req_indices,
+            actual_token_pos.clamp(max=self.device_buffer_size),
+        ]
+
+        already_backed = self.req_to_host_pool[
+            backup_req_indices.to(self.req_to_host_pool.device),
+            actual_token_pos.to(self.req_to_host_pool.device),
+        ] >= 0
+        if bool(torch.all(already_backed).item()):
+            return
+
+        backup_req_indices = backup_req_indices[~already_backed]
+        actual_token_pos = actual_token_pos[~already_backed]
+        device_locs = device_locs[~already_backed]
+        host_locs = self.mem_pool_host.alloc(len(device_locs))
+        if host_locs is None:
+            raise RuntimeError(
+                f"HiSparse host mem pool alloc failed for {len(device_locs)} repair backup tokens"
+            )
+        host_locs = host_locs.to(device=self.device)
+        self.req_to_host_pool[backup_req_indices, actual_token_pos] = host_locs
+        self.mem_pool_host.backup_from_device_all_layer(
+            self.mem_pool_device,
+            host_locs,
+            device_locs,
+            io_backend="kernel",
+        )
+        for req_idx, token_pos in zip(
+            backup_req_indices.detach().cpu().tolist(),
+            actual_token_pos.detach().cpu().tolist(),
+        ):
+            req_idx = int(req_idx)
+            self._host_backed_up_len[req_idx] = max(
+                self._host_backed_up_len[req_idx], int(token_pos) + 1
+            )
 
     def _debug_dump_req_state(self, req_pool_indices: torch.Tensor):
         if req_pool_indices.numel() == 0:
