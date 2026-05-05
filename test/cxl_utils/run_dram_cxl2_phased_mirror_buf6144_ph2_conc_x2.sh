@@ -15,6 +15,8 @@
 #   bash test/cxl_utils/run_dram_cxl2_phased_mirror_buf6144_ph2_conc_x2.sh
 #
 # Optional env:
+#   MAX_RUNNING_REQUESTS — if set, passed to launch_server as --max-running-requests
+#     (global cap; with --enable-dp-attention the effective per-DP cap is divided by dp_size).
 #   REQ_PER_CONC_MULT (default 2) — num-requests = max_concurrency × this, all phases
 #   P134_CONC (default 64) — concurrency for phase 1, 3, and 4
 #   HISPARSE_DEVICE_BUFFER_SIZE (default 6144)
@@ -33,6 +35,8 @@ DP_SIZE="${DP_SIZE:-8}"
 PORT="${PORT:-30000}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-200000}"
+# Optional: set e.g. export MAX_RUNNING_REQUESTS=256 to pass --max-running-requests to launch_server.
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 
 CXL_DEV_PATH="${CXL_DEV_PATH:-/dev/dax0.0}"
 CXL_DEV_PATH_2="${CXL_DEV_PATH_2:-/dev/dax1.0}"
@@ -96,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --cxl-dev-2) CXL_DEV_PATH_2="$2"; shift 2 ;;
     --cxl-map-bytes) CXL_MAP_BYTES="$2"; shift 2 ;;
     --cxl-map-bytes-per-device) CXL_MAP_BYTES_PER_DEVICE="$2"; shift 2 ;;
+    --max-running-requests) MAX_RUNNING_REQUESTS="$2"; shift 2 ;;
     --env-script) SGLANG_ENV_SCRIPT="$2"; shift 2 ;;
     --python) PYTHON_BIN="$2"; shift 2 ;;
     -h|--help)
@@ -250,6 +255,10 @@ out_fix_tag() {
 start_server_for_scheme() {
   local scheme="$1"
   local log_file="$2"
+  local max_run_args=()
+  if [[ -n "${MAX_RUNNING_REQUESTS}" ]]; then
+    max_run_args=(--max-running-requests "${MAX_RUNNING_REQUESTS}")
+  fi
   local cfg=""
   case "${scheme}" in
     dram) cfg="${HISPARSE_DRAM}" ;;
@@ -276,6 +285,7 @@ start_server_for_scheme() {
       --hisparse-config "${cfg}" \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" \
       --max-total-tokens "${MAX_TOTAL_TOKENS}" \
+      "${max_run_args[@]}" \
       --port "${PORT}" \
       >"${log_file}" 2>&1 &
   else
@@ -291,6 +301,7 @@ start_server_for_scheme() {
       --hisparse-config "${cfg}" \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" \
       --max-total-tokens "${MAX_TOTAL_TOKENS}" \
+      "${max_run_args[@]}" \
       --port "${PORT}" \
       >"${log_file}" 2>&1 &
   fi
@@ -332,7 +343,7 @@ run_e2e_fast() {
   echo "SERVER_STARTUP_WAIT=${SERVER_STARTUP_WAIT:-1800}"
   echo "SERVER_TEARDOWN_WAIT_SEC=${SERVER_TEARDOWN_WAIT_SEC:-90} SERVER_POST_KILL_SLEEP_SEC=${SERVER_POST_KILL_SLEEP_SEC:-8}"
   echo "MODEL_PATH=${MODEL_PATH} MODEL_CLIENT=${MODEL_CLIENT}"
-  echo "TP=${TP} DP_SIZE=${DP_SIZE} PORT=${PORT}"
+  echo "TP=${TP} DP_SIZE=${DP_SIZE} PORT=${PORT} MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-}"
   echo "CXL_DEV_PATH=${CXL_DEV_PATH} CXL_DEV_PATH_2=${CXL_DEV_PATH_2}"
   echo "CXL_MAP_BYTES=${CXL_MAP_BYTES} CXL_MAP_BYTES_PER_DEVICE=${CXL_MAP_BYTES_PER_DEVICE}"
   echo "TOTAL_CASES=${TOTAL_CASES} (dram+cxl2 mirror p1-3=${CASES_P123} each; p4=${CASES_P4})"
