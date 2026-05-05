@@ -19,15 +19,15 @@ Request rate: 0.0 req/s  |  Max concurrency: 96
   Round 1: Warmup
 ============================================================
   Requests:       8/8 succeeded
-  Duration:       277.9 s
+  Duration:       278.2 s
   Input tokens:   1048576
   Output tokens:  8192
 
-  TTFT    mean=231818.7ms  p50=232310.3ms  p99=232313.9ms
-  TBT     mean=44.9ms  p50=44.0ms  p99=47.4ms
-  TPOT    mean=44.9ms  p50=44.5ms  p99=47.8ms
-  E2E     mean=277770.0ms  p50=277804.2ms  p99=277845.8ms
-  Throughput: 29.5 tok/s  0.03 req/s
+  TTFT    mean=231429.2ms  p50=232142.3ms  p99=232144.8ms
+  TBT     mean=45.6ms  p50=44.4ms  p99=48.1ms
+  TPOT    mean=45.6ms  p50=45.0ms  p99=48.3ms
+  E2E     mean=278060.8ms  p50=278155.6ms  p99=278165.8ms
+  Throughput: 29.4 tok/s  0.03 req/s
 
 Pausing 3.0s between rounds...
 
@@ -38,23 +38,23 @@ Pausing 3.0s between rounds...
 ============================================================
   Round 2: Warm Measurement
 ============================================================
-  Requests:       23/192 succeeded
-  Duration:       85.6 s
-  Input tokens:   3014656
-  Output tokens:  23546
+  Requests:       192/192 succeeded
+  Duration:       179.1 s
+  Input tokens:   25165824
+  Output tokens:  196452
 
-  TTFT    mean=7660.4ms  p50=7664.3ms  p99=7700.6ms
-  TBT     mean=74.9ms  p50=74.9ms  p99=86.6ms
-  TPOT    mean=74.9ms  p50=74.9ms  p99=75.7ms
-  E2E     mean=84303.4ms  p50=84307.6ms  p99=85083.5ms
-  Throughput: 275.0 tok/s  0.27 req/s
+  TTFT    mean=4605.2ms  p50=4870.9ms  p99=8109.5ms
+  TBT     mean=82.7ms  p50=79.4ms  p99=177.8ms
+  TPOT    mean=82.7ms  p50=82.8ms  p99=86.3ms
+  E2E     mean=89118.9ms  p50=88860.7ms  p99=94986.9ms
+  Throughput: 1097.0 tok/s  1.07 req/s
 
 ============================================================
   COMPARISON: Round 2 vs Round 1
 ============================================================
   Note: Round 1 is unique-only warmup, Round 2 is full repeated-load measurement; throughput is not directly comparable.
-  TTFT speedup:      30.26x  (231818.7 -> 7660.4 ms)
-  TBT speedup:       0.60x  (44.9 -> 74.9 ms)
-  E2E speedup:       3.29x  (277770.0 -> 84303.4 ms)
+  TTFT speedup:      50.25x  (231429.2 -> 4605.2 ms)
+  TBT speedup:       0.55x  (45.6 -> 82.7 ms)
+  E2E speedup:       3.12x  (278060.8 -> 89118.9 ms)
 
 Results saved to exp-new/dc_0502/p2_55_dram_ctx128k_conc96_r2fix1k_n192.json
