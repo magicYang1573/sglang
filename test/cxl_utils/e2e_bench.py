@@ -396,7 +396,11 @@ async def run_round(
         )
 
     timeout = aiohttp.ClientTimeout(total=3600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = aiohttp.TCPConnector(
+        limit=0 if max_concurrency <= 0 else max_concurrency,
+        limit_per_host=0 if max_concurrency <= 0 else max_concurrency,
+    )
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         tasks = []
         t0 = time.perf_counter()
         for i, (prompt, prompt_len, output_len) in enumerate(prompts):
