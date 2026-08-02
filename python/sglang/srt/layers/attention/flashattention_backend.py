@@ -50,7 +50,11 @@ from sglang.kernels.ops.attention.flash_attention import (
 
 
 def _should_disable_scheduler_metadata_precompute(server_args) -> bool:
-    return bool(server_args.enable_prefill_cp or server_args.enable_dp_attention)
+    return bool(
+        server_args.enable_prefill_cp
+        or server_args.enable_dp_attention
+        or getattr(server_args, "enable_kv_cache_sparsity", False)
+    )
 
 
 @dataclass

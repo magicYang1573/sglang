@@ -31,7 +31,7 @@ class StreamingLLMPolicy(SparsityPolicy):
         evidence=SelectionEvidence.POSITION,
         scope=DecisionScope.STEP,
         requires_request_state=False,
-        supports_cuda_graph=False,
+        supports_cuda_graph=True,
     )
 
     def __init__(self, config: KVSparsityConfig, device: torch.device):
@@ -63,10 +63,37 @@ class StreamingLLMPolicy(SparsityPolicy):
             raise ValueError("seq_lens must have shape [batch]")
 
         page_size = self.config.page_size
+        capacity = self.sink_pages + self.recent_pages
+        if seq_lens.is_cuda and torch.version.hip is None and capacity <= 8192:
+            from sglang.srt.mem_cache.sparsity.kernels.streaming_llm_select import (
+                streaming_llm_select,
+            )
+
+            (
+                logical_indices,
+                valid_lengths,
+                visible_kv_lens,
+                sparse_mask,
+            ) = streaming_llm_select(
+                seq_lens,
+                page_size=page_size,
+                min_sparse_tokens=self.config.min_sparse_tokens,
+                sink_pages=self.sink_pages,
+                recent_pages=self.recent_pages,
+            )
+            return SelectionResult(
+                granularity=Granularity.PAGE,
+                logical_indices=logical_indices,
+                valid_lengths=valid_lengths,
+                visible_kv_lens=visible_kv_lens,
+                sparse_mask=sparse_mask,
+                layer_id=None,
+                max_visible_kv_len=self._max_visible_kv_len(capacity, page_size),
+            )
+
         num_pages = torch.div(
             seq_lens + page_size - 1, page_size, rounding_mode="floor"
         )
-        capacity = self.sink_pages + self.recent_pages
         sparse_mask = (seq_lens >= self.config.min_sparse_tokens) & (
             num_pages > capacity
         )
@@ -111,8 +138,11 @@ class StreamingLLMPolicy(SparsityPolicy):
             # Dense rows are either below the activation threshold or no
             # longer than the retained page budget. This is therefore a safe
             # scheduler upper bound without synchronizing seq_lens to host.
-            max_visible_kv_len=max(
-                capacity * page_size,
-                max(self.config.min_sparse_tokens - 1, 1),
-            ),
+            max_visible_kv_len=self._max_visible_kv_len(capacity, page_size),
+        )
+
+    def _max_visible_kv_len(self, capacity: int, page_size: int) -> int:
+        return max(
+            capacity * page_size,
+            max(self.config.min_sparse_tokens - 1, 1),
         )

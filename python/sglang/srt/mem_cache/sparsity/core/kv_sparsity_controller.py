@@ -157,7 +157,10 @@ class KVSparsityController:
             forward_batch=forward_batch,
             metadata=metadata,
         )
-        if metadata is not self._metadata:
+        # The FA3 CUDA-graph path reuses one metadata object across capture and
+        # replay.  Layer identity, rather than Python object identity, is the
+        # reliable per-forward boundary in both eager and graph execution.
+        if layer.layer_id == self.start_layer or metadata is not self._metadata:
             self._begin_forward(metadata, forward_batch, context)
 
         context = self._make_context(

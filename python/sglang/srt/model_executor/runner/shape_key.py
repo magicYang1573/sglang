@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Hashable, Optional
 
 
 @dataclass(frozen=True)
@@ -30,8 +30,10 @@ class ShapeKey:
     variant_label: optional execution variant (for example, "lora",
         "nolora", or "chunked_prefix"), or None for runners that don't
         record per-variant graphs.
+    runtime_variant: optional stable key selected by a runtime extension.
     """
 
     size: int
     stream_idx: Optional[int] = None
     variant_label: Optional[str] = None
+    runtime_variant: Optional[Hashable] = None

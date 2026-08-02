@@ -40,10 +40,10 @@ def validate_kv_cache_sparsity(server_args: ServerArgs) -> None:
         raise ValueError("KV sparsity currently requires the NHD KV-cache layout")
 
     config = parse_kv_sparsity_config(server_args)
-    if config.policy != "streaming_llm":
-        raise ValueError(
-            "PR 1 supports only policy='streaming_llm'; Quest is provided by PR 2"
-        )
+    if config.policy not in {"streaming_llm", "quest"}:
+        raise ValueError("KV sparsity supports policy='streaming_llm' or 'quest'")
+    if config.policy == "quest" and config.page_size < 2:
+        raise ValueError("Quest KV sparsity requires --page-size >= 2")
     if config.backend != "fa3":
         raise ValueError("The initial KV sparsity runtime supports backend='fa3'")
 
@@ -103,13 +103,25 @@ def validate_kv_cache_sparsity(server_args: ServerArgs) -> None:
         raise ValueError("KV sparsity does not yet support cross-layer KV sharing")
 
     locked = getattr(server_args, "_cuda_graph_config_locked", set())
-    for phase, phase_config in (
-        (Phase.DECODE, server_args.cuda_graph_config.decode),
-        (Phase.PREFILL, server_args.cuda_graph_config.prefill),
-    ):
-        if (phase, "backend") in locked and phase_config.backend != Backend.DISABLED:
+    prefill_config = server_args.cuda_graph_config.prefill
+    if (
+        Phase.PREFILL,
+        "backend",
+    ) in locked and prefill_config.backend != Backend.DISABLED:
+        raise ValueError("KV sparsity requires prefill CUDA Graph to be disabled")
+    prefill_config.backend = Backend.DISABLED
+
+    decode_config = server_args.cuda_graph_config.decode
+    if (Phase.DECODE, "backend") in locked:
+        if decode_config.backend not in (Backend.BREAKABLE, Backend.DISABLED):
             raise ValueError(
-                f"KV sparsity PR 1 requires {phase} CUDA graph to be disabled"
+                f"{config.policy} KV sparsity supports only Breakable CUDA Graph "
+                "or eager decode"
             )
-        phase_config.backend = Backend.DISABLED
-    logger.info("Enabled HBM-resident StreamingLLM visibility with FA3 in eager mode")
+    else:
+        decode_config.backend = Backend.BREAKABLE
+    logger.info(
+        "Enabled HBM-resident %s visibility with FA3 and decode backend=%s",
+        config.policy,
+        decode_config.backend,
+    )

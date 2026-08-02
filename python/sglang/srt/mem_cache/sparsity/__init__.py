@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.sparsity.factory import (
     register_sparse_coordinator,
 )
 from sglang.srt.mem_cache.sparsity.policies import (
+    QuestPolicy,
     SparsityPolicy,
     StreamingLLMPolicy,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "SelectionResult",
     "SparsityPolicy",
     "StreamingLLMPolicy",
+    "QuestPolicy",
     "create_kv_sparsity_controller",
     "parse_kv_sparsity_config",
     "create_sparse_coordinator",

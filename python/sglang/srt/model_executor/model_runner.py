@@ -388,6 +388,7 @@ class ModelRunner:
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
         self.kv_sparsity_controller = None
+        self.cuda_graph_runtime_extension = None
 
         # Load model weights and configure
         self.initialize()
@@ -826,10 +827,19 @@ class ModelRunner:
         self.kv_sparsity_controller = create_kv_sparsity_controller(
             device=torch.device(self.device),
             req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             server_args=self.server_args,
         )
+        if self.kv_sparsity_controller.policy.capabilities.supports_cuda_graph:
+            from sglang.srt.mem_cache.sparsity.cuda_graph_support import (
+                create_cuda_graph_runtime_provider,
+            )
+
+            self.cuda_graph_runtime_extension = create_cuda_graph_runtime_provider(
+                self.kv_sparsity_controller
+            )
 
     def post_capture_resize_kv_pool(self):
         resize = compute_post_capture_kv_resize(self)

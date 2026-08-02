@@ -23,12 +23,14 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
+from sglang.srt.mem_cache.sparsity.policies.quest import QuestPolicy
 from sglang.srt.mem_cache.sparsity.policies.streaming_llm import StreamingLLMPolicy
 
 logger = logging.getLogger(__name__)
 
 _KV_SPARSITY_POLICIES = {
     "streaming_llm": StreamingLLMPolicy,
+    "quest": QuestPolicy,
 }
 _KV_SPARSITY_BACKEND_ALIASES = {
     "flashattention": "fa3",
@@ -196,6 +198,7 @@ def create_kv_sparsity_controller(
     *,
     device: torch.device,
     req_to_token_pool,
+    token_to_kv_pool,
     start_layer: int,
     end_layer: int,
     server_args,
@@ -210,7 +213,20 @@ def create_kv_sparsity_controller(
     if config.backend != "fa3":
         raise ValueError("The initial KV sparsity runtime supports only FA3")
 
-    policy = policy_class(config, device)
+    if config.policy == "quest":
+        effective_start_layer = max(start_layer, config.start_layer)
+        configured_end_layer = end_layer if config.end_layer == -1 else config.end_layer
+        effective_end_layer = min(end_layer, configured_end_layer)
+        policy = policy_class(
+            config,
+            device,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token_pool=req_to_token_pool,
+            start_layer=effective_start_layer,
+            end_layer=effective_end_layer,
+        )
+    else:
+        policy = policy_class(config, device)
     placement = HBMResidentPlacement(
         req_to_token=req_to_token_pool.req_to_token,
         page_size=config.page_size,

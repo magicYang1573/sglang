@@ -64,7 +64,7 @@ def test_parse_kv_sparsity_config_rejects_unknown_fields():
         parse_kv_sparsity_config(args)
 
 
-def test_validation_uses_resolved_fa3_default_and_disables_graphs(monkeypatch):
+def test_validation_selects_graph_backend_by_policy(monkeypatch):
     hf_text_config = SimpleNamespace(num_kv_shared_layers=0)
     hf_config = SimpleNamespace(
         architectures=["Qwen3ForCausalLM"],
@@ -115,14 +115,39 @@ def test_validation_uses_resolved_fa3_default_and_disables_graphs(monkeypatch):
 
     validate_kv_cache_sparsity(args)
 
-    assert args.cuda_graph_config[Phase.DECODE].backend == Backend.DISABLED
+    assert args.cuda_graph_config[Phase.DECODE].backend == Backend.BREAKABLE
     assert args.cuda_graph_config[Phase.PREFILL].backend == Backend.DISABLED
+
+    quest_args = SimpleNamespace(**vars(args))
+    quest_args.page_size = 2
+    quest_args.kv_cache_sparsity_config = (
+        '{"policy":"quest","page_size":2,"policy_config":'
+        '{"page_budget":64,"recent_pages":4}}'
+    )
+    quest_args.cuda_graph_config = CudaGraphConfig()
+    quest_args._cuda_graph_config_locked = set()
+    validate_kv_cache_sparsity(quest_args)
+
+    assert quest_args.cuda_graph_config[Phase.DECODE].backend == Backend.BREAKABLE
+    assert quest_args.cuda_graph_config[Phase.PREFILL].backend == Backend.DISABLED
+
+    locked_args = SimpleNamespace(**vars(args))
+    locked_args.cuda_graph_config = CudaGraphConfig()
+    locked_args.cuda_graph_config[Phase.DECODE].backend = Backend.FULL
+    locked_args._cuda_graph_config_locked = {(Phase.DECODE, "backend")}
+    with pytest.raises(ValueError, match="only Breakable CUDA Graph or eager"):
+        validate_kv_cache_sparsity(locked_args)
 
 
 def test_streaming_llm_rejects_unknown_policy_fields():
     config = KVSparsityConfig(policy_config={"recent_pages": 4, "typo": 1})
     with pytest.raises(ValueError, match="Unknown StreamingLLM policy field"):
         StreamingLLMPolicy(config, torch.device("cpu"))
+
+
+def test_streaming_llm_declares_cuda_graph_support():
+    policy = StreamingLLMPolicy(KVSparsityConfig(), torch.device("cpu"))
+    assert policy.capabilities.supports_cuda_graph
 
 
 def test_streaming_llm_selects_sink_and_recent_pages_without_host_reads():

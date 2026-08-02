@@ -79,6 +79,7 @@ class FlashAttentionVisibilityAdaptor(MetadataAdaptor):
         self._sparse_scheduler_metadata = None
         self._scheduler_metadata_prepared = False
         self._scheduler_metadata_builder = None
+        self._capture_active = False
 
     def bind_attention_backend(self, attention_backend: Any) -> None:
         builder = getattr(attention_backend, "_compute_scheduler_metadata", None)
@@ -98,13 +99,17 @@ class FlashAttentionVisibilityAdaptor(MetadataAdaptor):
         )
         if metadata is None or not all(hasattr(metadata, name) for name in required):
             raise TypeError("FA3 sparse visibility requires FlashAttention metadata")
-        self._dense_page_table = metadata.page_table.clone()
+        # Selection only overwrites a short prefix. Snapshot that prefix lazily
+        # in apply(), once its width is known, instead of cloning the full dense
+        # page table for every decode token.
+        self._dense_page_table = None
         self._dense_cache_seqlens = metadata.cache_seqlens_int32.clone()
         self._dense_cu_seqlens_k = metadata.cu_seqlens_k.clone()
         self._dense_max_seq_len_k = metadata.max_seq_len_k
         self._dense_scheduler_metadata = getattr(metadata, "scheduler_metadata", None)
         self._sparse_scheduler_metadata = None
         self._scheduler_metadata_prepared = False
+        self._capture_active = True
 
     def apply(
         self,
@@ -114,39 +119,69 @@ class FlashAttentionVisibilityAdaptor(MetadataAdaptor):
     ) -> Any:
         if result.granularity != Granularity.PAGE:
             raise ValueError("FA3 visibility adaptor requires page selections")
-        if self._dense_page_table is None:
+        if not self._capture_active:
             raise RuntimeError("capture_dense_metadata must be called before apply")
         # During warmup or short decode, no row is sparse and FA3 may publish a
         # page table narrower than the policy's fixed capacity. Truncating is
         # safe: if any row were sparse, its sequence would already be wider
         # than the retained capacity and so would the batch page table.
         visible_capacity = min(result.capacity, metadata.page_table.shape[1])
+        if self._dense_page_table is None:
+            self._dense_page_table = metadata.page_table[:, :visible_capacity].clone()
+        elif self._dense_page_table.shape[1] != visible_capacity:
+            raise RuntimeError("selection capacity changed within one decode forward")
 
-        physical_pages = self.placement.logical_to_physical_pages(
-            result.logical_indices[:, :visible_capacity],
-            forward_batch.req_pool_indices,
-        )
-        columns = torch.arange(
-            visible_capacity, device=physical_pages.device
-        ).unsqueeze(0)
-        valid = columns < result.valid_lengths.unsqueeze(1)
-        update = result.sparse_mask.unsqueeze(1) & valid
-
-        dense_prefix = self._dense_page_table[:, :visible_capacity]
-        metadata.page_table[:, :visible_capacity].copy_(
-            torch.where(update, physical_pages, dense_prefix)
-        )
-        metadata.cache_seqlens_int32.copy_(
-            torch.where(
-                result.sparse_mask,
-                result.visible_kv_lens.to(torch.int32),
-                self._dense_cache_seqlens,
+        kernel_applied = False
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if (
+            result.logical_indices.is_cuda
+            and torch.version.hip is None
+            and seq_lens is not None
+        ):
+            from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+                quest_update_flashattention_metadata_,
             )
-        )
-        metadata.cu_seqlens_k[0].zero_()
-        metadata.cu_seqlens_k[1:].copy_(
-            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-        )
+
+            quest_update_flashattention_metadata_(
+                selected_indices=result.logical_indices[:, :visible_capacity],
+                valid_lengths=result.valid_lengths,
+                sparse_mask=result.sparse_mask,
+                seq_lens=seq_lens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                req_to_token=self.placement.req_to_token,
+                page_table=metadata.page_table,
+                cache_seqlens_int32=metadata.cache_seqlens_int32,
+                cu_seqlens_k=metadata.cu_seqlens_k,
+                page_size=self.placement.page_size,
+                update_lengths=True,
+            )
+            kernel_applied = True
+
+        if not kernel_applied:
+            physical_pages = self.placement.logical_to_physical_pages(
+                result.logical_indices[:, :visible_capacity],
+                forward_batch.req_pool_indices,
+            )
+            columns = torch.arange(
+                visible_capacity, device=physical_pages.device
+            ).unsqueeze(0)
+            valid = columns < result.valid_lengths.unsqueeze(1)
+            update = result.sparse_mask.unsqueeze(1) & valid
+            dense_prefix = self._dense_page_table[:, :visible_capacity]
+            metadata.page_table[:, :visible_capacity].copy_(
+                torch.where(update, physical_pages, dense_prefix)
+            )
+            metadata.cache_seqlens_int32.copy_(
+                torch.where(
+                    result.sparse_mask,
+                    result.visible_kv_lens.to(torch.int32),
+                    self._dense_cache_seqlens,
+                )
+            )
+            metadata.cu_seqlens_k[0].zero_()
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
         sparse_max_seq_len_k = self._dense_max_seq_len_k
         if result.max_visible_kv_len is not None:
             sparse_max_seq_len_k = min(sparse_max_seq_len_k, result.max_visible_kv_len)
@@ -169,11 +204,15 @@ class FlashAttentionVisibilityAdaptor(MetadataAdaptor):
         return metadata
 
     def restore_dense_metadata(self, metadata: Any) -> None:
-        if self._dense_page_table is None:
+        if not self._capture_active:
             return
-        metadata.page_table.copy_(self._dense_page_table)
+        if self._dense_page_table is not None:
+            width = self._dense_page_table.shape[1]
+            metadata.page_table[:, :width].copy_(self._dense_page_table)
         metadata.cache_seqlens_int32.copy_(self._dense_cache_seqlens)
         metadata.cu_seqlens_k.copy_(self._dense_cu_seqlens_k)
         metadata.max_seq_len_k = self._dense_max_seq_len_k
         if hasattr(metadata, "scheduler_metadata"):
             metadata.scheduler_metadata = self._dense_scheduler_metadata
+        self._capture_active = False
+        self._dense_page_table = None

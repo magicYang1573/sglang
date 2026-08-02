@@ -29,7 +29,7 @@ import contextlib
 import inspect
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import torch
 import tqdm
@@ -436,11 +436,69 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(self, size, stream_idx=None, variant_label=None):
+    def _runtime_graph_extension(self):
+        return getattr(self.model_runner, "cuda_graph_runtime_extension", None)
+
+    def _runtime_graph_capture_variants(self):
+        extension = self._runtime_graph_extension()
+        get_variants = getattr(extension, "cuda_graph_capture_variants", None)
+        if get_variants is None:
+            return (None,)
+        variants = tuple(get_variants())
+        if not variants:
+            raise ValueError("CUDA Graph runtime extension returned no variants")
+        return variants
+
+    def _select_runtime_graph_variant(self, forward_batch: ForwardBatch):
+        extension = self._runtime_graph_extension()
+        select_variant = getattr(extension, "select_cuda_graph_variant", None)
+        if select_variant is None:
+            return True, None
+        is_supported, runtime_variant = select_variant(forward_batch)
+        return bool(is_supported), runtime_variant
+
+    def _select_captured_runtime_graph_variant(self, forward_batch: ForwardBatch):
+        is_supported, runtime_variant = self._select_runtime_graph_variant(
+            forward_batch
+        )
+        return (
+            is_supported and runtime_variant in self._runtime_graph_capture_variants(),
+            runtime_variant,
+        )
+
+    def _prepare_runtime_graph_capture(
+        self, forward_batch: ForwardBatch, runtime_variant: Any
+    ) -> None:
+        extension = self._runtime_graph_extension()
+        prepare = getattr(extension, "prepare_cuda_graph_capture", None)
+        if prepare is not None:
+            prepare(forward_batch, runtime_variant)
+
+    def _prepare_runtime_graph_replay(
+        self, forward_batch: ForwardBatch, runtime_variant: Any
+    ) -> None:
+        extension = self._runtime_graph_extension()
+        prepare = getattr(extension, "prepare_cuda_graph_replay", None)
+        if prepare is not None:
+            prepare(forward_batch, runtime_variant)
+
+    def _prepare_runtime_graph_capture_context(self, context: ForwardContext):
+        extension = self._runtime_graph_extension()
+        prepare = getattr(extension, "prepare_cuda_graph_capture_context", None)
+        return context if prepare is None else prepare(context)
+
+    def _make_graph_key(
+        self,
+        size,
+        stream_idx=None,
+        variant_label=None,
+        runtime_variant=None,
+    ):
         return ShapeKey(
             size=size,
             stream_idx=stream_idx,
             variant_label=variant_label,
+            runtime_variant=runtime_variant,
         )
 
     def _capture_graph_size(self, *, bs: int, num_tokens: int) -> int:
@@ -530,10 +588,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
+        is_runtime_variant_supported, runtime_variant = (
+            self._select_captured_runtime_graph_variant(forward_batch)
+        )
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
             variant_label=self._resolve_lora_variant(forward_batch),
+            runtime_variant=runtime_variant,
         )
 
         is_bs_supported = (
@@ -569,6 +631,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return (
             is_bs_supported
+            and is_runtime_variant_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and is_ngram_supported
@@ -578,6 +641,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not self.attn_backend.supports_ragged_verify_graph:
             return False
 
+        is_runtime_variant_supported, _ = self._select_captured_runtime_graph_variant(
+            forward_batch
+        )
         admission_tokens = ragged_layout.graph_num_tokens
         is_tokens_supported = admission_tokens <= self.capture_num_tokens[
             -1
@@ -599,6 +665,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         return (
             is_tokens_supported
+            and is_runtime_variant_supported
             and is_dp_supported
             and is_encoder_lens_supported
             and capture_hidden_mode_matches
@@ -643,6 +710,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         stream_idx: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        runtime_variant: Any = None,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -784,6 +852,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
+        self._prepare_runtime_graph_capture(forward_batch, runtime_variant)
 
         # Trip the coordinator so the hisparse code path is captured into the
         # graph; backends read it from self.model_runner.hisparse_coordinator.
@@ -852,18 +921,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.gpu_id,
             empty_cache=False,
         )
-        # Reverse so cuda graphs share memory better.
+        # Reverse so CUDA graphs share memory better. Runtime extensions may
+        # capture several stable context-capacity variants per batch shape.
+        capture_shapes = [
+            (bs, runtime_variant)
+            for bs in self.capture_bs
+            for runtime_variant in self._runtime_graph_capture_variants()
+        ]
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_shapes)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_shapes)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        for bs in capture_range:
+        for bs, runtime_variant in capture_range:
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -871,7 +946,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     empty_cache=False,
                 )
                 capture_range.set_description(
-                    f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
+                    "Capturing batches "
+                    f"({bs=} variant={runtime_variant!r} {avail_mem=:.2f} GB)"
                 )
 
             for variant_label, _variant_has_lora in lora_variants:
@@ -882,7 +958,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     num_tokens=bs * self.captured_req_width,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    self.capture_one_shape(
+                        bs,
+                        forward,
+                        stream_idx,
+                        variant_label,
+                        runtime_variant,
+                    )
 
     def capture_one_shape(
         self,
@@ -890,6 +972,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        runtime_variant: Any = None,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -901,13 +984,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+            bs,
+            stream_idx=stream_idx,
+            num_tokens=num_tokens,
+            runtime_variant=runtime_variant,
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        capture_context = self._prepare_runtime_graph_capture_context(
+            ForwardContext(attn_backend=attn_backend)
+        )
+        with forward_context(capture_context):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:
@@ -977,6 +1066,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self._capture_graph_size(bs=bs, num_tokens=num_tokens),
                     stream_idx,
                     variant_label,
+                    runtime_variant,
                 )
                 post_warmup_hook = getattr(
                     self.model_runner.attn_backend,
@@ -1045,8 +1135,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             variant_label = self._resolve_lora_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+            is_runtime_variant_supported, runtime_variant = (
+                self._select_captured_runtime_graph_variant(forward_batch)
+            )
+            if not is_runtime_variant_supported:
+                raise RuntimeError(
+                    "Unsupported CUDA Graph runtime variant reached replay"
+                )
+            self._prepare_runtime_graph_replay(forward_batch, runtime_variant)
             self._replay_graph_key = self._make_graph_key(
-                graph_size_key, stream_idx, variant_label
+                graph_size_key,
+                stream_idx,
+                variant_label,
+                runtime_variant,
             )
             return
 
@@ -1146,8 +1247,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
+        is_runtime_variant_supported, runtime_variant = (
+            self._select_captured_runtime_graph_variant(forward_batch)
+        )
+        if not is_runtime_variant_supported:
+            raise RuntimeError("Unsupported CUDA Graph runtime variant reached replay")
+        self._prepare_runtime_graph_replay(forward_batch, runtime_variant)
         self._replay_graph_key = self._make_graph_key(
-            graph_size_key, stream_idx, variant_label
+            graph_size_key,
+            stream_idx,
+            variant_label,
+            runtime_variant,
         )
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
