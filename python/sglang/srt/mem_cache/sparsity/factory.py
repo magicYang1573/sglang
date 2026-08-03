@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
 from sglang.srt.mem_cache.sparsity.backend.visibility_adaptor import (
     FlashAttentionVisibilityAdaptor,
     HBMResidentPlacement,
+    TritonVisibilityAdaptor,
 )
 from sglang.srt.mem_cache.sparsity.config import KVSparsityConfig
 from sglang.srt.mem_cache.sparsity.core.kv_sparsity_controller import (
@@ -210,8 +211,8 @@ def create_kv_sparsity_controller(
             f"Unknown KV sparsity policy {config.policy!r}; "
             f"available policies: {sorted(_KV_SPARSITY_POLICIES)}"
         )
-    if config.backend != "fa3":
-        raise ValueError("The initial KV sparsity runtime supports only FA3")
+    if config.backend not in {"fa3", "triton"}:
+        raise ValueError("KV sparsity supports only FA3 and Triton")
 
     if config.policy == "quest":
         effective_start_layer = max(start_layer, config.start_layer)
@@ -231,7 +232,10 @@ def create_kv_sparsity_controller(
         req_to_token=req_to_token_pool.req_to_token,
         page_size=config.page_size,
     )
-    adaptor = FlashAttentionVisibilityAdaptor(placement)
+    if config.backend == "fa3":
+        adaptor = FlashAttentionVisibilityAdaptor(placement)
+    else:
+        adaptor = TritonVisibilityAdaptor(placement)
     return KVSparsityController(
         config=config,
         policy=policy,

@@ -7,6 +7,7 @@ from sglang.srt.mem_cache.sparsity.backend.visibility_adaptor import (
     FlashAttentionVisibilityAdaptor,
     HBMResidentPlacement,
     MetadataAdaptor,
+    TritonVisibilityAdaptor,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "MetadataAdaptor",
     "HBMResidentPlacement",
     "FlashAttentionVisibilityAdaptor",
+    "TritonVisibilityAdaptor",
 ]

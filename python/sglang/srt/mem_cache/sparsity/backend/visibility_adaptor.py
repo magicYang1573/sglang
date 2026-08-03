@@ -249,3 +249,149 @@ class FlashAttentionVisibilityAdaptor(MetadataAdaptor):
             metadata.scheduler_metadata = self._dense_scheduler_metadata
         self._capture_active = False
         self._dense_page_table = None
+
+
+class TritonVisibilityAdaptor(MetadataAdaptor):
+    """Swap Triton decode metadata to compact selected-token buffers.
+
+    The dense backend-owned tensors remain untouched and are restored after the
+    configured sparse layer range.  Sparse buffers are reused across layers and
+    decode steps, so the hot path performs no host read or exact-size allocation.
+    """
+
+    def __init__(self, placement: HBMResidentPlacement):
+        self.placement = placement
+        self._num_kv_splits_builder = None
+        self._dense_kv_indptr = None
+        self._dense_kv_indices = None
+        self._dense_num_kv_splits = None
+        self._sparse_kv_indptr = None
+        self._sparse_kv_indices = None
+        self._sparse_num_kv_splits = None
+        self._capture_active = False
+
+    def bind_attention_backend(self, attention_backend: Any) -> None:
+        builder = getattr(attention_backend, "get_num_kv_splits", None)
+        if builder is None:
+            raise TypeError(
+                "Triton visibility requires an attention backend with "
+                "get_num_kv_splits support"
+            )
+        self._num_kv_splits_builder = builder
+
+    def capture_dense_metadata(self, metadata: Any) -> None:
+        required = ("kv_indptr", "kv_indices", "num_kv_splits")
+        if metadata is None or not all(hasattr(metadata, name) for name in required):
+            raise TypeError("Triton sparse visibility requires decode metadata")
+        if metadata.kv_indptr is None or metadata.kv_indices is None:
+            raise TypeError("Triton sparse visibility requires KV index metadata")
+        self._dense_kv_indptr = metadata.kv_indptr
+        self._dense_kv_indices = metadata.kv_indices
+        self._dense_num_kv_splits = metadata.num_kv_splits
+        if (
+            self._sparse_kv_indptr is None
+            or self._sparse_kv_indptr.numel() < metadata.kv_indptr.numel()
+        ):
+            self._sparse_kv_indptr = torch.empty_like(metadata.kv_indptr)
+        if (
+            self._sparse_kv_indices is None
+            or self._sparse_kv_indices.numel() < metadata.kv_indices.numel()
+        ):
+            self._sparse_kv_indices = torch.empty_like(metadata.kv_indices)
+        if metadata.num_kv_splits is not None and (
+            self._sparse_num_kv_splits is None
+            or self._sparse_num_kv_splits.numel() < metadata.num_kv_splits.numel()
+        ):
+            self._sparse_num_kv_splits = torch.empty_like(metadata.num_kv_splits)
+        self._capture_active = True
+
+    def apply(
+        self,
+        result: SelectionResult,
+        metadata: Any,
+        forward_batch: ForwardBatch,
+    ) -> Any:
+        if result.granularity != Granularity.PAGE:
+            raise ValueError("Triton visibility adaptor requires page selections")
+        if not self._capture_active:
+            raise RuntimeError("capture_dense_metadata must be called before apply")
+        if result.max_visible_kv_len is None:
+            raise ValueError("Triton visibility requires a static max_visible_kv_len")
+        seq_lens = forward_batch.seq_lens
+        batch_size = seq_lens.shape[0]
+        sparse_lengths = torch.where(
+            result.sparse_mask,
+            result.visible_kv_lens.to(seq_lens.dtype),
+            seq_lens,
+        ).to(torch.int32)
+        sparse_indptr = self._sparse_kv_indptr[: batch_size + 1]
+        sparse_indptr[0].zero_()
+        sparse_indptr[1:].copy_(torch.cumsum(sparse_lengths, dim=0, dtype=torch.int32))
+
+        if seq_lens.is_cuda and torch.version.hip is None:
+            from sglang.srt.mem_cache.sparsity.kernels.triton_visibility_metadata import (
+                fill_triton_visibility_indices_,
+            )
+
+            fill_triton_visibility_indices_(
+                selected_indices=result.logical_indices,
+                sparse_mask=result.sparse_mask,
+                seq_lens=seq_lens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                req_to_token=self.placement.req_to_token,
+                sparse_indptr=sparse_indptr,
+                output=self._sparse_kv_indices,
+                page_size=self.placement.page_size,
+                max_row_tokens=result.max_visible_kv_len,
+            )
+        else:
+            write_offset = 0
+            for row in range(batch_size):
+                seq_len = int(seq_lens[row])
+                req_idx = int(forward_batch.req_pool_indices[row])
+                if bool(result.sparse_mask[row]):
+                    valid_pages = int(result.valid_lengths[row])
+                    logical_tokens = []
+                    for page in result.logical_indices[row, :valid_pages].tolist():
+                        start = page * self.placement.page_size
+                        logical_tokens.extend(
+                            range(start, min(start + self.placement.page_size, seq_len))
+                        )
+                    logical_tokens = logical_tokens[: int(result.visible_kv_lens[row])]
+                    logical = torch.tensor(
+                        logical_tokens,
+                        dtype=torch.long,
+                        device=self.placement.req_to_token.device,
+                    )
+                else:
+                    logical = torch.arange(
+                        seq_len,
+                        dtype=torch.long,
+                        device=self.placement.req_to_token.device,
+                    )
+                physical = self.placement.req_to_token[req_idx, logical]
+                self._sparse_kv_indices[
+                    write_offset : write_offset + physical.numel()
+                ].copy_(physical)
+                write_offset += physical.numel()
+
+        metadata.kv_indptr = sparse_indptr
+        metadata.kv_indices = self._sparse_kv_indices
+        if self._dense_num_kv_splits is not None:
+            sparse_num_kv_splits = self._sparse_num_kv_splits[:batch_size]
+            self._num_kv_splits_builder(
+                sparse_num_kv_splits, sparse_lengths.clamp_min(1)
+            )
+            metadata.num_kv_splits = sparse_num_kv_splits
+        return metadata
+
+    def restore_dense_metadata(self, metadata: Any) -> None:
+        if not self._capture_active:
+            return
+        metadata.kv_indptr = self._dense_kv_indptr
+        metadata.kv_indices = self._dense_kv_indices
+        metadata.num_kv_splits = self._dense_num_kv_splits
+        self._dense_kv_indptr = None
+        self._dense_kv_indices = None
+        self._dense_num_kv_splits = None
+        self._capture_active = False

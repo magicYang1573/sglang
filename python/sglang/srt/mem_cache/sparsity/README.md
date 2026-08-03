@@ -5,16 +5,18 @@ post-hoc sparse attention. The initial runtime keeps every KV entry allocated
 in HBM and changes only the subset visible to attention. It does not free,
 compact, migrate, or swap KV-cache storage.
 
-## Initial supported path
+## Supported path
 
 - NVIDIA CUDA, decoder-only MHA/GQA text models
-- FA3 prefill and decode backends
-- eager prefill; StreamingLLM and Quest eager or Breakable CUDA Graph decode
+- FA3 or Triton prefill and decode backends (the configured sparsity backend
+  must match the attention backend)
+- eager prefill; FA3 supports eager or Breakable CUDA Graph decode, while
+  Triton currently supports eager decode
 - normal prefill followed by non-speculative decode
 - page-granular StreamingLLM-style sink + recent visibility
 - optimized per-layer Quest key bounding-box selection (requires `page_size >= 2`)
 
-Other backends, speculative decoding, local/hybrid attention, PD
+FlashInfer, speculative decoding, local/hybrid attention, PD
 disaggregation, DP/CP attention, physical eviction, and hierarchical placement
 are rejected explicitly.
 
@@ -24,7 +26,7 @@ locations:
 1. `SparsityPolicy` returns request-relative logical page indices.
 2. `KVSparsityController` applies request/step/layer lifecycle rules.
 3. `HBMResidentPlacement` translates logical pages through `req_to_token`.
-4. `FlashAttentionVisibilityAdaptor` rewrites and later restores FA3 metadata.
+4. A backend adaptor rewrites and later restores FA3 or Triton metadata.
 
 During prefill, the controller publishes lifecycle contexts without changing
 attention visibility. This lets a later KV-derived policy build auxiliary
@@ -96,6 +98,32 @@ The FA3 adaptor snapshots and restores only the selected page-table prefix.
 The framework-facing `SelectionResult`, controller lifecycle, placement, and
 adaptor interfaces are unchanged by these fast paths.
 
+The Triton adaptor preserves the same framework-facing interfaces. It expands
+logical pages directly into a reusable, compact physical-token index buffer
+with one fused Triton kernel, updates `kv_indptr` and split-K metadata, and
+restores the backend-owned dense tensors after the sparse layer range. It does
+not perform host synchronization or per-layer exact-size allocation. Triton
+KV sparsity currently uses eager decode because Triton's CUDA Graph metadata is
+planned into backend-owned fixed buffers before the sparsity controller runs.
+For example, change both backends in either launch example and explicitly use
+eager decode:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-4B \
+  --attention-backend triton \
+  --cuda-graph-backend-decode disabled \
+  --page-size 16 \
+  --enable-kv-cache-sparsity \
+  --kv-cache-sparsity-config '{
+    "policy": "quest",
+    "backend": "triton",
+    "page_size": 16,
+    "min_sparse_tokens": 2048,
+    "policy_config": {"page_budget": 64, "recent_pages": 4}
+  }'
+```
+
 Quest preallocates two KV-dtype bounding vectors per physical page and sparse
 layer. More context buckets reduce replay padding but increase graph capture
 time and memory, so production values should follow the request-length
@@ -131,8 +159,8 @@ python -m sglang.benchmark.serving \
 ```
 
 For either policy, set `min_sparse_tokens` above the tested context to measure
-the same CUDA Graph runtime with dense visibility. Explicitly lock decode to
-`disabled` only when an eager comparison is desired.
+the same runtime with dense visibility. For FA3, explicitly lock decode to
+`disabled` only when an eager comparison is desired; Triton is already eager.
 
 Report input/output throughput, inter-token latency, the exact sparse budget,
 GPU type, dtype, batch/concurrency, and whether prefix caching was warm. This

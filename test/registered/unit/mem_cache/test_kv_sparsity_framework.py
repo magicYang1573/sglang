@@ -10,6 +10,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.sparsity.backend.visibility_adaptor import (
     FlashAttentionVisibilityAdaptor,
     HBMResidentPlacement,
+    TritonVisibilityAdaptor,
 )
 from sglang.srt.mem_cache.sparsity.config import KVSparsityConfig
 from sglang.srt.mem_cache.sparsity.contracts import (
@@ -138,6 +139,25 @@ def test_validation_selects_graph_backend_by_policy(monkeypatch):
     with pytest.raises(ValueError, match="only Breakable CUDA Graph or eager"):
         validate_kv_cache_sparsity(locked_args)
 
+    triton_args = SimpleNamespace(**vars(args))
+    triton_args.kv_cache_sparsity_config = (
+        '{"policy":"streaming_llm","backend":"triton"}'
+    )
+    triton_args.cuda_graph_config = CudaGraphConfig()
+    triton_args._cuda_graph_config_locked = set()
+    triton_args._resolved_overrides = [("test", {"attention_backend": "triton"})]
+    validate_kv_cache_sparsity(triton_args)
+
+    assert triton_args.cuda_graph_config[Phase.DECODE].backend == Backend.DISABLED
+    assert triton_args.cuda_graph_config[Phase.PREFILL].backend == Backend.DISABLED
+
+    triton_locked_args = SimpleNamespace(**vars(triton_args))
+    triton_locked_args.cuda_graph_config = CudaGraphConfig()
+    triton_locked_args.cuda_graph_config[Phase.DECODE].backend = Backend.BREAKABLE
+    triton_locked_args._cuda_graph_config_locked = {(Phase.DECODE, "backend")}
+    with pytest.raises(ValueError, match="requires eager decode"):
+        validate_kv_cache_sparsity(triton_locked_args)
+
 
 def test_streaming_llm_rejects_unknown_policy_fields():
     config = KVSparsityConfig(policy_config={"recent_pages": 4, "typo": 1})
@@ -212,6 +232,65 @@ def test_streaming_llm_accounts_for_a_partial_final_page():
         result.logical_indices[1], torch.tensor([0, 2, 3], dtype=torch.int32)
     )
     assert result.visible_kv_lens[1].item() == 9
+
+
+def test_triton_visibility_adaptor_compacts_mixed_rows_and_restores_metadata():
+    req_to_token = torch.tensor(
+        [
+            [10, 11, 12, 13, 14, 15],
+            [20, 21, 22, 23, 24, 25],
+        ],
+        dtype=torch.int64,
+    )
+    adaptor = TritonVisibilityAdaptor(HBMResidentPlacement(req_to_token, page_size=2))
+
+    class FakeBackend:
+        @staticmethod
+        def get_num_kv_splits(output, lengths):
+            output.copy_(lengths)
+
+    adaptor.bind_attention_backend(FakeBackend())
+    dense_indptr = torch.tensor([0, 6, 11], dtype=torch.int32)
+    dense_indices = torch.tensor(
+        [10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 24], dtype=torch.int64
+    )
+    dense_splits = torch.ones(2, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        kv_indptr=dense_indptr,
+        kv_indices=dense_indices,
+        num_kv_splits=dense_splits,
+    )
+    forward_batch = SimpleNamespace(
+        seq_lens=torch.tensor([6, 5], dtype=torch.int32),
+        req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
+    )
+    result = SelectionResult(
+        granularity=Granularity.PAGE,
+        logical_indices=torch.tensor([[0, 2], [-1, -1]], dtype=torch.int32),
+        valid_lengths=torch.tensor([2, 0], dtype=torch.int32),
+        visible_kv_lens=torch.tensor([4, 0], dtype=torch.int32),
+        sparse_mask=torch.tensor([True, False]),
+        max_visible_kv_len=6,
+    )
+
+    adaptor.capture_dense_metadata(metadata)
+    adaptor.apply(result, metadata, forward_batch)
+
+    torch.testing.assert_close(
+        metadata.kv_indptr, torch.tensor([0, 4, 9], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        metadata.kv_indices[:9],
+        torch.tensor([10, 11, 14, 15, 20, 21, 22, 23, 24]),
+    )
+    torch.testing.assert_close(
+        metadata.num_kv_splits, torch.tensor([4, 5], dtype=torch.int32)
+    )
+
+    adaptor.restore_dense_metadata(metadata)
+    assert metadata.kv_indptr is dense_indptr
+    assert metadata.kv_indices is dense_indices
+    assert metadata.num_kv_splits is dense_splits
 
 
 def test_selection_result_rejects_mismatched_batch_shapes():

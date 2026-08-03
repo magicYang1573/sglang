@@ -35,7 +35,7 @@ def validate_kv_cache_sparsity(server_args: ServerArgs) -> None:
             "modes and cannot be enabled together"
         )
     if is_hip() or not is_cuda():
-        raise ValueError("The initial KV sparsity runtime requires NVIDIA CUDA FA3")
+        raise ValueError("KV sparsity requires NVIDIA CUDA")
     if envs.SGLANG_USE_HND_KVCACHE.get():
         raise ValueError("KV sparsity currently requires the NHD KV-cache layout")
 
@@ -44,17 +44,19 @@ def validate_kv_cache_sparsity(server_args: ServerArgs) -> None:
         raise ValueError("KV sparsity supports policy='streaming_llm' or 'quest'")
     if config.policy == "quest" and config.page_size < 2:
         raise ValueError("Quest KV sparsity requires --page-size >= 2")
-    if config.backend != "fa3":
-        raise ValueError("The initial KV sparsity runtime supports backend='fa3'")
+    if config.backend not in {"fa3", "triton"}:
+        raise ValueError("KV sparsity supports backend='fa3' or 'triton'")
 
     prefill_backend, decode_backend = attention_backends_of(view)
-    allowed_backends = {"fa3", "flashattention"}
+    expected_backends = (
+        {"fa3", "flashattention"} if config.backend == "fa3" else {"triton"}
+    )
     if (
-        prefill_backend not in allowed_backends
-        or decode_backend not in allowed_backends
+        prefill_backend not in expected_backends
+        or decode_backend not in expected_backends
     ):
         raise ValueError(
-            "KV sparsity requires FA3 for prefill and decode, but got "
+            f"KV sparsity backend={config.backend!r} does not match "
             f"prefill={prefill_backend!r}, decode={decode_backend!r}"
         )
 
@@ -112,7 +114,14 @@ def validate_kv_cache_sparsity(server_args: ServerArgs) -> None:
     prefill_config.backend = Backend.DISABLED
 
     decode_config = server_args.cuda_graph_config.decode
-    if (Phase.DECODE, "backend") in locked:
+    if config.backend == "triton":
+        if (
+            Phase.DECODE,
+            "backend",
+        ) in locked and decode_config.backend != Backend.DISABLED:
+            raise ValueError("Triton KV sparsity currently requires eager decode")
+        decode_config.backend = Backend.DISABLED
+    elif (Phase.DECODE, "backend") in locked:
         if decode_config.backend not in (Backend.BREAKABLE, Backend.DISABLED):
             raise ValueError(
                 f"{config.policy} KV sparsity supports only Breakable CUDA Graph "
@@ -121,7 +130,8 @@ def validate_kv_cache_sparsity(server_args: ServerArgs) -> None:
     else:
         decode_config.backend = Backend.BREAKABLE
     logger.info(
-        "Enabled HBM-resident %s visibility with FA3 and decode backend=%s",
+        "Enabled HBM-resident %s visibility with %s and decode backend=%s",
         config.policy,
+        config.backend,
         decode_config.backend,
     )
