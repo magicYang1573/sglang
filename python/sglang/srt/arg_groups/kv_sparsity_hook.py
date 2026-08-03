@@ -40,10 +40,12 @@ def validate_kv_cache_sparsity(server_args: ServerArgs) -> None:
         raise ValueError("KV sparsity currently requires the NHD KV-cache layout")
 
     config = parse_kv_sparsity_config(server_args)
-    if config.policy not in {"streaming_llm", "quest"}:
-        raise ValueError("KV sparsity supports policy='streaming_llm' or 'quest'")
-    if config.policy == "quest" and config.page_size < 2:
-        raise ValueError("Quest KV sparsity requires --page-size >= 2")
+    if config.policy not in {"streaming_llm", "quest", "chunkkv"}:
+        raise ValueError(
+            "KV sparsity supports policy='streaming_llm', 'quest', or 'chunkkv'"
+        )
+    if config.policy in {"quest", "chunkkv"} and config.page_size < 2:
+        raise ValueError(f"{config.policy} KV sparsity requires --page-size >= 2")
     if config.backend not in {"fa3", "triton"}:
         raise ValueError("KV sparsity supports backend='fa3' or 'triton'")
 

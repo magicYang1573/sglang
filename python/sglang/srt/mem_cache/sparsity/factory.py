@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
 )
+from sglang.srt.mem_cache.sparsity.policies.chunkkv import ChunkKVPolicy
 from sglang.srt.mem_cache.sparsity.policies.quest import QuestPolicy
 from sglang.srt.mem_cache.sparsity.policies.streaming_llm import StreamingLLMPolicy
 
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 _KV_SPARSITY_POLICIES = {
     "streaming_llm": StreamingLLMPolicy,
     "quest": QuestPolicy,
+    "chunkkv": ChunkKVPolicy,
 }
 _KV_SPARSITY_BACKEND_ALIASES = {
     "flashattention": "fa3",
@@ -214,7 +216,7 @@ def create_kv_sparsity_controller(
     if config.backend not in {"fa3", "triton"}:
         raise ValueError("KV sparsity supports only FA3 and Triton")
 
-    if config.policy == "quest":
+    if config.policy in {"quest", "chunkkv"}:
         effective_start_layer = max(start_layer, config.start_layer)
         configured_end_layer = end_layer if config.end_layer == -1 else config.end_layer
         effective_end_layer = min(end_layer, configured_end_layer)

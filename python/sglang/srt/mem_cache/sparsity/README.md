@@ -15,6 +15,8 @@ compact, migrate, or swap KV-cache storage.
 - normal prefill followed by non-speculative decode
 - page-granular StreamingLLM-style sink + recent visibility
 - optimized per-layer Quest key bounding-box selection (requires `page_size >= 2`)
+- optimized ChunkKV final-prefill scoring with cached semantic + recent decode
+  visibility (requires `page_size >= 2`)
 
 FlashInfer, speculative decoding, local/hybrid attention, PD
 disaggregation, DP/CP attention, physical eviction, and hierarchical placement
@@ -128,6 +130,45 @@ Quest preallocates two KV-dtype bounding vectors per physical page and sparse
 layer. More context buckets reduce replay padding but increase graph capture
 time and memory, so production values should follow the request-length
 distribution rather than copying the example unchanged.
+
+ChunkKV uses the final prefill chunk's last `obs_window` query vectors. It
+averages observation and GQA-group query heads before the QK product (an exact
+linear reordering of the reference score), sums token scores within each page,
+and accumulates scores across sparse layers. Only the top semantic history
+pages are cached; decode appends the current recent pages with a fixed-width
+fused selection and performs no QK re-scoring. The implementation supports
+ordinary chunked prefill by scoring only rows for which `seq_lens` has reached
+`orig_seq_lens`. Prefix caching can shorten the available observation-query
+window, so quality experiments should disable radix cache for controlled
+comparisons.
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-4B \
+  --attention-backend fa3 \
+  --page-size 16 \
+  --disable-radix-cache \
+  --enable-kv-cache-sparsity \
+  --kv-cache-sparsity-config '{
+    "policy": "chunkkv",
+    "backend": "fa3",
+    "page_size": 16,
+    "min_sparse_tokens": 2048,
+    "policy_config": {
+      "page_budget": 640,
+      "recent_pages": 4,
+      "obs_window": 32
+    }
+  }'
+```
+
+`page_budget` is the total decode-visible budget; `recent_pages` is reserved
+inside it and the remainder is selected semantically. On NVIDIA CUDA, fused
+kernels reduce packed observation queries, score pages directly from
+`req_to_token` without materializing the QK matrix, and build the decode
+selection. FA3 supports Breakable CUDA Graph decode; Triton uses the PR3 eager
+adaptor. This PR4 mode is visibility-only: it neither evicts unselected KV nor
+exports/imports ChunkKV state for PD disaggregation.
 
 ## Validation
 
