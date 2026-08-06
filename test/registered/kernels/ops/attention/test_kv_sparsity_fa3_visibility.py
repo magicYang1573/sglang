@@ -16,6 +16,13 @@ from sglang.srt.mem_cache.sparsity.contracts import (
     SelectionContext,
     SelectionResult,
 )
+from sglang.srt.mem_cache.sparsity.kernels.quest_finalize import (
+    quest_finalize_selected_pages,
+)
+from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+    quest_finalize_to_flashattention_metadata_,
+    quest_update_flashattention_metadata_,
+)
 from sglang.srt.mem_cache.sparsity.kernels.quest_score import quest_page_scores
 from sglang.srt.mem_cache.sparsity.policies.quest import QuestPolicy
 from sglang.srt.mem_cache.sparsity.policies.streaming_llm import (
@@ -30,6 +37,84 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
     torch.cuda.is_available() and _is_fa3_supported(), "FA3 requires a supported GPU"
 )
 class TestKVSparsityFA3Visibility(unittest.TestCase):
+    def test_quest_direct_finalize_metadata_matches_separate_kernels(self):
+        device = torch.device("cuda")
+        page_size = 2
+        topk_scores = torch.tensor(
+            [[5.0, 4.0], [-float("inf"), -float("inf")], [3.0, -float("inf")]],
+            device=device,
+        )
+        topk_indices = torch.tensor(
+            [[0, 2], [0, 1], [0, 1]], dtype=torch.int64, device=device
+        )
+        k_per_req = torch.tensor([2, 0, 1], dtype=torch.int32, device=device)
+        recent_indices = torch.tensor(
+            [[3], [2], [2]], dtype=torch.int32, device=device
+        )
+        recent_valid = torch.tensor([[True], [False], [True]], device=device)
+        sparse_mask = torch.tensor([True, False, True], device=device)
+        seq_lens = torch.tensor([7, 6, 5], dtype=torch.int32, device=device)
+        req_pool_indices = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
+        req_to_token = torch.arange(24, dtype=torch.int32, device=device).view(3, 8)
+
+        selected, valid_lengths = quest_finalize_selected_pages(
+            topk_scores,
+            topk_indices,
+            k_per_req,
+            recent_indices,
+            recent_valid,
+        )
+        visible_lens = torch.tensor([5, 0, 3], dtype=torch.int32, device=device)
+        reference_table = torch.full((3, 4), -7, dtype=torch.int32, device=device)
+        reference_cache_lens = seq_lens.clone()
+        reference_cu_lens = torch.zeros(4, dtype=torch.int32, device=device)
+        quest_update_flashattention_metadata_(
+            selected,
+            valid_lengths,
+            sparse_mask,
+            seq_lens,
+            req_pool_indices,
+            req_to_token,
+            reference_table,
+            reference_cache_lens,
+            reference_cu_lens,
+            page_size,
+            update_lengths=True,
+        )
+
+        direct_selected = torch.empty_like(selected)
+        direct_valid_lengths = torch.empty_like(valid_lengths)
+        direct_visible_lens = torch.empty_like(visible_lens)
+        direct_table = torch.full_like(reference_table, -7)
+        direct_cache_lens = seq_lens.clone()
+        direct_cu_lens = torch.zeros_like(reference_cu_lens)
+        quest_finalize_to_flashattention_metadata_(
+            topk_scores,
+            topk_indices,
+            k_per_req,
+            recent_indices,
+            recent_valid,
+            direct_selected,
+            direct_valid_lengths,
+            direct_visible_lens,
+            sparse_mask,
+            seq_lens,
+            req_pool_indices,
+            req_to_token,
+            direct_table,
+            direct_cache_lens,
+            direct_cu_lens,
+            page_size,
+            update_lengths=True,
+        )
+
+        torch.testing.assert_close(direct_selected, selected)
+        torch.testing.assert_close(direct_valid_lengths, valid_lengths)
+        torch.testing.assert_close(direct_visible_lens, visible_lens)
+        torch.testing.assert_close(direct_table, reference_table)
+        torch.testing.assert_close(direct_cache_lens, reference_cache_lens)
+        torch.testing.assert_close(direct_cu_lens, reference_cu_lens)
+
     def test_streaming_llm_fused_selection_matches_page_semantics(self):
         device = torch.device("cuda")
         policy = StreamingLLMPolicy(

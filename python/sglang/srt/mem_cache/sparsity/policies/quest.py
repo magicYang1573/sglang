@@ -37,6 +37,22 @@ class _QuestForwardPlan:
     recent_valid: torch.Tensor
 
 
+@dataclass(frozen=True, kw_only=True)
+class _QuestFA3SelectionResult(SelectionResult):
+    """Deferred exact Quest selection consumed by the fused FA3 adaptor path.
+
+    The public ``SelectionResult`` tensors keep their original shapes and
+    meanings.  They are filled on the same CUDA stream when the adaptor maps
+    the exact top-k/recent union directly into the FA3 page table.
+    """
+
+    topk_scores: torch.Tensor
+    topk_indices: torch.Tensor
+    k_per_req: torch.Tensor
+    recent_indices: torch.Tensor
+    recent_valid: torch.Tensor
+
+
 class QuestPolicy(SparsityPolicy):
     """Select pages using Quest key bounding-box upper bounds.
 
@@ -409,6 +425,47 @@ class QuestPolicy(SparsityPolicy):
             torch.full_like(plan.total_pages, topk_count, dtype=torch.int32),
             torch.zeros_like(plan.total_pages, dtype=torch.int32),
         )
+        direct_fa3 = (
+            self.config.backend == "fa3"
+            and scores.is_cuda
+            and torch.version.hip is None
+            and context.metadata is not None
+            and all(
+                hasattr(context.metadata, name)
+                for name in (
+                    "page_table",
+                    "cache_seqlens_int32",
+                    "cu_seqlens_k",
+                )
+            )
+        )
+        if direct_fa3:
+            output_width = topk_count + plan.recent_pages.shape[1]
+            return _QuestFA3SelectionResult(
+                granularity=Granularity.PAGE,
+                logical_indices=torch.empty(
+                    (scores.shape[0], output_width),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                valid_lengths=torch.empty(
+                    scores.shape[0], dtype=torch.int32, device=self.device
+                ),
+                visible_kv_lens=torch.empty(
+                    scores.shape[0], dtype=torch.int32, device=self.device
+                ),
+                sparse_mask=plan.sparse_mask,
+                layer_id=layer_id,
+                max_visible_kv_len=max(
+                    self.page_budget * self.page_size,
+                    max(self.config.min_sparse_tokens - 1, 1),
+                ),
+                topk_scores=topk_scores.contiguous(),
+                topk_indices=topk_pages.contiguous(),
+                k_per_req=k_per_req.contiguous(),
+                recent_indices=plan.recent_pages.contiguous(),
+                recent_valid=plan.recent_valid.contiguous(),
+            )
         if scores.is_cuda and torch.version.hip is None:
             from sglang.srt.mem_cache.sparsity.kernels.quest_finalize import (
                 quest_finalize_selected_pages,

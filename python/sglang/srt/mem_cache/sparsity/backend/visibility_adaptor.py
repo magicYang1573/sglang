@@ -133,7 +133,40 @@ class FlashAttentionVisibilityAdaptor(MetadataAdaptor):
 
         kernel_applied = False
         seq_lens = getattr(forward_batch, "seq_lens", None)
+        from sglang.srt.mem_cache.sparsity.policies.quest import (
+            _QuestFA3SelectionResult,
+        )
+
         if (
+            isinstance(result, _QuestFA3SelectionResult)
+            and seq_lens is not None
+            and visible_capacity == result.capacity
+        ):
+            from sglang.srt.mem_cache.sparsity.kernels.quest_flashattention_metadata import (
+                quest_finalize_to_flashattention_metadata_,
+            )
+
+            quest_finalize_to_flashattention_metadata_(
+                topk_scores=result.topk_scores,
+                topk_indices=result.topk_indices,
+                k_per_req=result.k_per_req,
+                recent_indices=result.recent_indices,
+                recent_valid=result.recent_valid,
+                selected_output=result.logical_indices,
+                valid_lengths=result.valid_lengths,
+                visible_kv_lens=result.visible_kv_lens,
+                sparse_mask=result.sparse_mask,
+                seq_lens=seq_lens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                req_to_token=self.placement.req_to_token,
+                page_table=metadata.page_table,
+                cache_seqlens_int32=metadata.cache_seqlens_int32,
+                cu_seqlens_k=metadata.cu_seqlens_k,
+                page_size=self.placement.page_size,
+                update_lengths=True,
+            )
+            kernel_applied = True
+        elif (
             result.logical_indices.is_cuda
             and torch.version.hip is None
             and seq_lens is not None
