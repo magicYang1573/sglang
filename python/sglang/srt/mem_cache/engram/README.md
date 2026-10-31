@@ -10,12 +10,13 @@ host KV pool.
 The current backend, `MooncakeEngramStorage`, uses Mooncake EngramStore to own
 local host snapshots and read rows on the caller's CUDA stream. Enable it with
 `--enable-hi-engram local`. Omitting this option preserves each model's native
-implementation. `remote` is a reserved mode and fails when the Engram component is constructed:
-Mooncake's remote table API does not yet support CUDA stream/graph lookup.
+implementation. `--enable-hi-engram remote` selects node-sharded CPU tables
+with DeepEP GPU-initiated RDMA reads.
 
 ## Model integration
 
-Currently supported: **Qwen4-Exp**, including Qwen3.8-Flash-Next PLE N-gram tables.
+Supported adapters: **Qwen4-Exp** (including Qwen3.8-Flash-Next PLE N-gram tables)
+and **DeepSeek V4.1 Engram**.
 Additional models can use the same byte-row storage contract.
 
 For vocab-parallel tables, `HiCacheVocabParallelEmbedding` preserves checkpoint
@@ -82,3 +83,58 @@ artifacts outside the SGLang source tree.
 Compare native and HiCache execution in fresh processes with identical inputs,
 TP/EP, host offloading, KV capacity and graph settings. Check output tokens and
 logprobs under controlled scheduling; measure latency and throughput separately.
+
+## Node-sharded remote configuration
+
+Use the Mooncake `feat/engram-sharded-deepep` branch together with this branch;
+the base PR's local-only wheel does not implement `populate_shard_and_sync`. Configure its
+optional DeepEP/DeepJIT/NCCL build dependencies before startup.
+
+For two nodes with eight GPU callers each, append these options to the otherwise
+unchanged model launch configuration (set `shard_id` to 1 on the second node):
+
+```bash
+--enable-hi-engram remote \
+--hi-engram-config '{"local_dir":"/dev/shm/sglang-engram","shard_id":0,"num_shards":2,"num_callers":8,"master_addr":"http://master-host:8080/metadata","session_id":"unique-model-deployment","max_lookup_rows":786432,"rdma_device":"mlx5_bond_{local_rank}"}'
+```
+
+A storage shard is **one node**, not a TP/DP/CP rank. The adapter divides complete
+hash heads across nodes, loads only the node's physical row range, and passes
+the head descriptors and packed CPU rows into EngramStore initialization. Local
+caller processes share the final CPU allocation. Checkpoint parameter copies
+are released after publication; startup can temporarily hold additional copies.
+`caller_id` defaults to the CUDA device index and must be dense in
+`[0,num_callers)` on each node. Override it when visible-device numbering differs.
+The `rdma_device` template expands `{local_rank}` to the current CUDA device.
+Both nodes must provide the same caller IDs, layouts, capacities and session ID.
+
+DeepSeek retains its original `row_start/rows` **computational** ownership and
+CP/DP ID/result collectives. Its weight loader separately uses the **storage**
+head range; `_owned_rows` still masks every row outside the computational range.
+Qwen retains its vocabulary shard mask, collectives, scales and prefetch. Its
+checkpoint shard loader uses the storage range only when remote mode is active.
+A request can therefore select rows owned by its computational rank while the
+corresponding bytes live partly on this node and partly on another node.
+
+The SGLang storage interface keeps `initialize(rows)` in both modes. Its local
+path calls `EngramStore.populate`; the remote path calls
+`EngramStore.populate_shard_and_sync` with only the node-owned tables and shard
+metadata. The latter encapsulates bootstrap, local sharing, peer discovery and
+readiness waits. The lookup interface is unchanged. Qwen publishes
+on its first eager lookup; DeepSeek publishes in `finish_load`. Both must finish
+initialization before CUDA graph capture. Remote lookups require CUDA inputs;
+local mode retains the CPU lookup overload. Engram weights are immutable after
+publication. This change does not add a storage-aware model collective or change
+CP/DP scheduling.
+
+`max_lookup_rows` counts all submitted IDs (including masks), not request batch
+size. Include speculative draft positions, CP/DP gathered IDs and graph padding
+when sizing it. `timeout` defaults to 300 seconds. EngramStore selects its
+read layout internally: fewer than 1024 tokens per lookup use the flattened
+layout; 1024 or more use the native layout. No layout or QP options are exposed.
+
+Validation for this branch consists of adapter placement/loading checks, packed
+FP8 dequantization against the native gather kernel, and Mooncake's real two-node
+RDMA/CUDA-graph tests. Full-model remote accuracy and serving throughput have not
+been measured on this branch. The historical local results above do not validate
+remote inference.
