@@ -36,6 +36,7 @@ not the per-rank group membership logic.
 
 from __future__ import annotations
 
+import os
 import sys
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
@@ -50,6 +51,43 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+def test_configure_nccl_ib_hca_for_local_rank(monkeypatch):
+    monkeypatch.setenv(
+        "SGLANG_NCCL_IB_HCA_BY_LOCAL_RANK", "=mlx5_0;=mlx5_0;=mlx5_1;=mlx5_1"
+    )
+    monkeypatch.setenv("NCCL_IB_HCA", "=all_devices")
+    monkeypatch.setenv("NCCL_CUMEM_ENABLE", "0")
+
+    parallel_state._configure_nccl_ib_hca_for_local_rank(2)
+
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_1"
+    assert os.environ["NCCL_CUMEM_ENABLE"] == "1"
+
+
+def test_configure_nccl_ib_hca_without_mapping_keeps_environment(monkeypatch):
+    monkeypatch.delenv("SGLANG_NCCL_IB_HCA_BY_LOCAL_RANK", raising=False)
+    monkeypatch.setenv("NCCL_IB_HCA", "=all_devices")
+    monkeypatch.setenv("NCCL_CUMEM_ENABLE", "0")
+
+    parallel_state._configure_nccl_ib_hca_for_local_rank(2)
+
+    assert os.environ["NCCL_IB_HCA"] == "=all_devices"
+    assert os.environ["NCCL_CUMEM_ENABLE"] == "0"
+
+
+@pytest.mark.parametrize(
+    ("mapping", "local_rank"),
+    [("=mlx5_0;", 0), ("=mlx5_0", -1), ("=mlx5_0", 1)],
+)
+def test_configure_nccl_ib_hca_rejects_invalid_mapping(
+    monkeypatch, mapping, local_rank
+):
+    monkeypatch.setenv("SGLANG_NCCL_IB_HCA_BY_LOCAL_RANK", mapping)
+
+    with pytest.raises(ValueError):
+        parallel_state._configure_nccl_ib_hca_for_local_rank(local_rank)
 
 
 @pytest.mark.parametrize("rank", range(4))
