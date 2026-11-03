@@ -2465,6 +2465,33 @@ def _create_global_tcp_store(
         )
 
 
+def _configure_nccl_ib_hca_for_local_rank(local_rank: int) -> None:
+    """Select one preconfigured HCA before this worker creates its first NCCL comm."""
+    mapping = os.environ.get("SGLANG_NCCL_IB_HCA_BY_LOCAL_RANK")
+    if mapping is None:
+        return
+
+    hcas = [hca.strip() for hca in mapping.split(";")]
+    if any(not hca for hca in hcas):
+        raise ValueError(
+            "SGLANG_NCCL_IB_HCA_BY_LOCAL_RANK contains an empty HCA entry"
+        )
+    if local_rank < 0 or local_rank >= len(hcas):
+        raise ValueError(
+            "SGLANG_NCCL_IB_HCA_BY_LOCAL_RANK has "
+            f"{len(hcas)} entries but local rank is {local_rank}"
+        )
+
+    os.environ["NCCL_IB_HCA"] = hcas[local_rank]
+    # NCCL GIN device communicators and registered windows require cuMem.
+    os.environ["NCCL_CUMEM_ENABLE"] = "1"
+    logger.info(
+        "Set NCCL_IB_HCA=%s and NCCL_CUMEM_ENABLE=1 for local rank %d",
+        hcas[local_rank],
+        local_rank,
+    )
+
+
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -2496,6 +2523,16 @@ def init_distributed_environment(
             timeout = timedelta(seconds=timeout)
 
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
+
+        if backend == "nccl":
+            hca_local_rank = local_rank
+            if hca_local_rank == -1:
+                hca_local_rank = (
+                    int(os.environ.get("LOCAL_RANK", "0"))
+                    if distributed_init_method == "env://"
+                    else rank
+                )
+            _configure_nccl_ib_hca_for_local_rank(hca_local_rank)
 
         if backend == "mooncake":
             from mooncake.pg import MooncakeBackendOptions

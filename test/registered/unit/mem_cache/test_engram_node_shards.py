@@ -15,6 +15,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 from sglang.srt.layers.engram import EngramEmbedding
 from sglang.srt.mem_cache.engram import create_storage
 from sglang.srt.mem_cache.engram.deepseek import _dequant
+from sglang.srt.mem_cache.storage.mooncake_engram import _select_rdma_device
 
 
 def options(shard):
@@ -27,6 +28,26 @@ def options(shard):
             max_lookup_rows=4096,
         )
     )
+
+
+def test_select_rdma_device_supports_template_and_local_rank_list():
+    assert _select_rdma_device("mlx5_bond_{local_rank}", 2) == "mlx5_bond_2"
+    assert (
+        _select_rdma_device(
+            ["mlx5_bond_0", "mlx5_bond_0", "mlx5_bond_1", "mlx5_bond_1"],
+            3,
+        )
+        == "mlx5_bond_1"
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "local_rank"),
+    [(["mlx5_bond_0"], 1), ([""], 0), (42, 0)],
+)
+def test_select_rdma_device_rejects_invalid_mapping(config, local_rank):
+    with pytest.raises((TypeError, ValueError)):
+        _select_rdma_device(config, local_rank)
 
 
 def test_head_placement_and_compute_partition_are_independent():

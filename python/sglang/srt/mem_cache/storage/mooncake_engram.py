@@ -10,6 +10,21 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheEngramStorage
 logger = logging.getLogger(__name__)
 
 
+def _select_rdma_device(config, local_rank: int) -> str:
+    if isinstance(config, str):
+        return config.format(local_rank=local_rank)
+    if not isinstance(config, (list, tuple)):
+        raise TypeError("rdma_device must be a string or local-rank device list")
+    if local_rank < 0 or local_rank >= len(config):
+        raise ValueError(
+            f"rdma_device has {len(config)} entries but local rank is {local_rank}"
+        )
+    device = config[local_rank]
+    if not isinstance(device, str) or not device:
+        raise ValueError(f"rdma_device entry {local_rank} must be a non-empty string")
+    return device.format(local_rank=local_rank)
+
+
 class MooncakeEngramStorage(HiCacheEngramStorage):
     def __init__(
         self, *, local_dir: str, remote=None, head_bounds=None, namespace=None
@@ -99,10 +114,11 @@ class MooncakeEngramStorage(HiCacheEngramStorage):
             persistent=False,
         )
         options = dict(self.remote)
-        options.setdefault("caller_id", torch.cuda.current_device())
+        local_rank = torch.cuda.current_device()
+        options.setdefault("caller_id", local_rank)
         if "rdma_device" in options:
-            options["rdma_device"] = options["rdma_device"].format(
-                local_rank=torch.cuda.current_device()
+            options["rdma_device"] = _select_rdma_device(
+                options["rdma_device"], local_rank
             )
         try:
             store.populate_shard_and_sync(local, table_owners=self._owners, **options)
